@@ -69,6 +69,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   registerCommands(tg.bot, deps);
 
+  // Don't crash on errors — log and continue
+  tg.bot.catch((err) => {
+    log.error("Unhandled bot error", { message: err.message, name: err.name });
+  });
+
   /** Send the last few lines of each pane's output as the first message in its topic. */
   async function seedTopics(
     newMap: Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>,
