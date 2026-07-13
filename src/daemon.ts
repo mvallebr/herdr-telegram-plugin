@@ -68,7 +68,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply("✅ Chat authorized. Reconciling tabs...");
     const newMap = await reconcile(chatId, tg);
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
-    await ctx.reply("Reconciliation complete. Send a message in any topic.");
+    const rawMappings: DaemonState["thread_mappings"] = {};
+    for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
+    saveState(statePath, { ...state, thread_mappings: rawMappings });
+    await ctx.reply(`Reconciliation complete: ${newMap.size} topics mapped. Send a message in any topic.`);
   });
 
   // Handle plain text (routed via thread_id)
