@@ -21,11 +21,13 @@ export function resolveOrphanTopics(
 
 export async function reconcile(
   chatId: number,
-  tg: TelegramClient
+  tg: TelegramClient,
+  existingMappings: Map<number, ThreadMapping> = new Map()
 ): Promise<Map<number, ThreadMapping>> {
   const panes = getAgents();
   const map = new Map<number, ThreadMapping>();
   const created: string[] = [];
+  const deleted: string[] = [];
   const failed: string[] = [];
 
   // Try to list existing topics first (works in supergroups with forum).
@@ -37,6 +39,29 @@ export async function reconcile(
     // getForumTopics not supported in this chat — proceed to try createForumTopic
   }
 
+  // Deduplicate: for each pane, if multiple existing topics share its name,
+  // keep the one that's already mapped (or the first), delete the rest.
+  for (const pane of panes) {
+    const labelLower = pane.label.toLowerCase();
+    const matches = topics.filter((t) => t.name.toLowerCase() === labelLower);
+    if (matches.length > 1) {
+      // Prefer the one that's already mapped; otherwise keep the first.
+      const preferred =
+        matches.find((m) => existingMappings.has(m.message_thread_id)) ??
+        matches[0];
+      const toDelete = matches.filter((m) => m.message_thread_id !== preferred.message_thread_id);
+      for (const dup of toDelete) {
+        try {
+          await tg.deleteForumTopic(chatId, dup.message_thread_id);
+          deleted.push(`${dup.name} (#${dup.message_thread_id})`);
+          topics = topics.filter((t) => t.message_thread_id !== dup.message_thread_id);
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  }
+
   for (const pane of panes) {
     let threadId = matchTopic(pane, topics);
     if (!threadId) {
@@ -44,7 +69,7 @@ export async function reconcile(
         threadId = await tg.createForumTopic(chatId, pane.label);
         topics.push({ message_thread_id: threadId, name: pane.label });
         created.push(pane.label);
-      } catch (err: any) {
+      } catch {
         // Can't auto-create in this chat — user will bind manually with /bind
         failed.push(pane.label);
         continue;
@@ -59,7 +84,7 @@ export async function reconcile(
   }
 
   // Stash diagnostics so the daemon can report them
-  (reconcile as any).lastResult = { created, failed, total: panes.length };
+  (reconcile as any).lastResult = { created, deleted, failed, total: panes.length };
 
   return map;
 }

@@ -72,22 +72,17 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     state = updatePairing(statePath, chatId);
     deps.chatId = chatId;
     await ctx.reply("✅ Chat authorized. Reconciling tabs...");
-    const newMap = await reconcile(chatId, tg);
+    const newMap = await reconcile(chatId, tg, deps.map);
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
     saveState(statePath, { ...state, thread_mappings: rawMappings });
-    const result = (reconcile as any).lastResult as { created: string[]; failed: string[]; total: number } | undefined;
-    if (result && result.failed.length > 0) {
-      await ctx.reply(
-        `Reconciliation: ${newMap.size} panes mapped.\n` +
-        `Auto-created ${result.created.length} topics.\n` +
-        `Could not auto-create: ${result.failed.join(", ")}\n` +
-        `For those, create a thread via Telegram UI and use /bind <pane-label>.`
-      );
-    } else {
-      await ctx.reply(`Reconciliation complete: ${newMap.size} topics mapped. Send a message in any topic.`);
-    }
+    const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+    const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+    if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
+    if (result?.created.length) parts.push(`Auto-created: ${result.created.join(", ")}`);
+    if (result?.failed.length) parts.push(`Could not create (bind manually with /bind): ${result.failed.join(", ")}`);
+    await ctx.reply(parts.join("\n"));
   });
 
   // Handle plain text (routed via thread_id)
@@ -209,22 +204,17 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     }
     const chatId = state.authorized_chat_id;
     await ctx.reply("Reconciling...");
-    const newMap = await reconcile(chatId, tg);
+    const newMap = await reconcile(chatId, tg, deps.map);
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
     saveState(statePath, { ...state, thread_mappings: rawMappings });
-    const result = (reconcile as any).lastResult as { created: string[]; failed: string[]; total: number } | undefined;
-    if (result && result.failed.length > 0) {
-      await ctx.reply(
-        `Reconciled: ${newMap.size} panes mapped.\n` +
-        `Auto-created ${result.created.length} topics.\n` +
-        `Could not auto-create: ${result.failed.join(", ")}\n` +
-        `For those, create a thread via Telegram UI and use /bind <pane-label>.`
-      );
-    } else {
-      await ctx.reply(`Reconciled: ${newMap.size} topics mapped.`);
-    }
+    const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+    const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+    if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
+    if (result?.created.length) parts.push(`Auto-created: ${result.created.join(", ")}`);
+    if (result?.failed.length) parts.push(`Could not create (bind manually with /bind): ${result.failed.join(", ")}`);
+    await ctx.reply(parts.join("\n"));
   });
 
   tg.start();
