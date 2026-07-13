@@ -3,16 +3,16 @@ import {
   shouldThrottle,
   formatElapsed,
   cleanPaneOutput,
-  diffFromBaseline,
+  extractResponseSince,
   runAgentTurn,
   type WaitLoopDeps,
 } from "../src/wait-loop.js";
 
 function makeFakeTg() {
   return {
-    sent: [] as Array<{ chatId: number; threadId: number; text: string }>,
-    async sendMessage(chatId: number, threadId: number, text: string) {
-      this.sent.push({ chatId, threadId, text });
+    sent: [] as Array<{ chatId: number; threadId: number; text: string; opts?: any }>,
+    async sendMessage(chatId: number, threadId: number, text: string, opts?: any) {
+      this.sent.push({ chatId, threadId, text, opts });
       return this.sent.length;
     },
   };
@@ -24,6 +24,7 @@ const dummyCfg = {
   waitTimeoutS: 1,
   throttleMs: 100,
   maxTotalWaitS: 30,
+  maxProgressUpdates: -1, // unlimited for tests
 };
 
 describe("shouldThrottle", () => {
@@ -75,8 +76,8 @@ real output`;
     expect(out).toContain("real output");
   });
 
-  it("filters separator lines", () => {
-    const input = `─ something nice ───────────────────────────────────────
+  it("filters lines containing long separator runs", () => {
+    const input = `─ something nice ──────────────────────
 real output`;
     const out = cleanPaneOutput(input);
     expect(out).not.toContain("─");
@@ -92,192 +93,215 @@ real output`;
   });
 });
 
-describe("diffFromBaseline", () => {
-  it("returns current when baseline is empty", () => {
-    expect(diffFromBaseline("", "hello\nworld")).toBe("hello\nworld");
+describe("extractResponseSince", () => {
+  it("returns lines after user input anchor", () => {
+    const content = "old\n qual a hora?\nresponse line\nmore";
+    expect(extractResponseSince(content, "qual a hora?")).toBe("response line\nmore");
   });
 
-  it("returns empty when current equals baseline", () => {
-    expect(diffFromBaseline("hello\nworld", "hello\nworld")).toBe("");
+  it("uses last non-blank line of user input as anchor", () => {
+    const content = "before\n hello world\nagent says hi";
+    expect(extractResponseSince(content, "hello\nworld")).toBe("agent says hi");
   });
 
-  it("returns only the new lines appended at the end", () => {
-    const baseline = "old line 1\nold line 2";
-    const current = "old line 1\nold line 2\nnew line 3\nnew line 4";
-    expect(diffFromBaseline(baseline, current)).toBe("new line 3\nnew line 4");
+  it("returns empty when anchor not found", () => {
+    expect(extractResponseSince("some pane\ntext", "not in pane")).toBe("");
   });
 
-  it("returns full current when current is a strict subset of baseline (heavy scroll)", () => {
-    const baseline = "a\nb\nc\nd";
-    const current = "a\nb";
-    // Heavy scroll case: we can't reliably determine what's new, so return current.
-    expect(diffFromBaseline(baseline, current)).toBe("a\nb");
+  it("trims trailing separators, status bars, and empty lines", () => {
+    const sep20 = "─".repeat(20);
+    const content = `old\noi\nresponse text\n\n${sep20}\n~/foo · cost`;
+    expect(extractResponseSince(content, "oi")).toBe("response text");
+  });
+
+  it("trims trailing shell prompts", () => {
+    const content = "before\n query\nresult line\n~/cod · main $";
+    expect(extractResponseSince(content, "query")).toBe("result line");
   });
 });
 
-describe("runAgentTurn (with mocked deps)", () => {
-  it("captures baseline BEFORE sendText", async () => {
-    const baseline = "old content before send";
-    const afterAgent = "old content before send\nagent response line";
-    const sendTextOrder: string[] = [];
-    let readCalls = 0;
+describe("runAgentTurn (content-based polling)", () => {
+  function makeFakeClock(startMs = 0) {
+    let now = startMs;
+    return {
+      now: () => now,
+      advance: (ms: number) => { now += ms; },
+      set: (ms: number) => { now = ms; },
+    };
+  }
 
+  const USER_INPUT = "hi";
+
+  it("sends text then waits for pane to change", async () => {
+    const order: string[] = [];
+    let readCalls = 0;
+    const base = "old content";
+
+    const clock = makeFakeClock(0);
     const deps: Partial<WaitLoopDeps> = {
-      sendText: () => {
-        sendTextOrder.push("sendText");
-      },
+      sendText: () => order.push("sendText"),
       readPane: () => {
         readCalls++;
         if (readCalls === 1) {
-          sendTextOrder.push("readPane:baseline");
-          return baseline;
+          order.push("readPane:postSend");
+          return base + "\n" + USER_INPUT;
         }
-        return afterAgent;
+        return base + "\n" + USER_INPUT + "\nagent response line";
       },
-      waitIdle: () => ({ status: "idle" as const }),
+      sleep: async () => { clock.advance(100); },
+      now: clock.now,
     };
     const tg = makeFakeTg();
-    await runAgentTurn("w1:pX", 1, "hi", dummyCfg, tg as any, 100, {
+    await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
       deps,
       maxOutputLines: 50,
+      pollIntervalMs: 100,
+      stabilityWindowMs: 100,
     });
-    // Baseline must be read BEFORE sendText is called
-    expect(sendTextOrder).toEqual(["readPane:baseline", "sendText"]);
-    // The Telegram message should contain only the agent's response, NOT the baseline
-    const sent = tg.sent[0].text;
+    expect(order[0]).toBe("sendText");
+    expect(order[1]).toBe("readPane:postSend");
+    const sent = tg.sent[tg.sent.length - 1].text;
     expect(sent).toContain("agent response line");
-    expect(sent).not.toContain("old content before send");
+    expect(sent).not.toContain("old content");
   });
 
-  it("sends only the new response when waitIdle returns idle immediately (done status)", async () => {
-    const baseline = "line1\nline2\nline3";
-    const afterSend = "line1\nline2\nline3\nagent: hello";
-    let readCalls = 0;
+  it("waits for pane to stabilize before sending final response", async () => {
+    const prefix = "old\n" + USER_INPUT; // post-send snapshot
+    let readIdx = 0;
+    const panes = [
+      prefix,                                 // post-send snapshot
+      prefix,                                 // Phase 1 iter 1 (no change)
+      prefix + "\nresponse starting",         // Phase 1 iter 2 (changed→break)
+      prefix + "\nresponse starting\nmore",   // Phase 2 iter 1 (changed→progress)
+      prefix + "\nresponse starting\nmore",   // Phase 2 iter 2 (stable)
+      prefix + "\nresponse starting\nmore",   // Phase 2 iter 3 (stable→break by time)
+    ];
+
+    const clock = makeFakeClock(0);
     const deps: Partial<WaitLoopDeps> = {
       sendText: () => {},
-      readPane: () => {
-        readCalls++;
-        return readCalls === 1 ? baseline : afterSend;
-      },
-      waitIdle: () => ({ status: "idle" as const }),
+      readPane: () => panes[Math.min(readIdx++, panes.length - 1)],
+      sleep: async () => { clock.advance(10); },
+      now: clock.now,
     };
     const tg = makeFakeTg();
-    await runAgentTurn("w1:pX", 1, "hi", dummyCfg, tg as any, 100, {
+    await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
       deps,
       maxOutputLines: 50,
+      pollIntervalMs: 10,
+      stabilityWindowMs: 50,
     });
-    const sent = tg.sent[0].text;
-    expect(sent).toContain("agent: hello");
-    expect(sent).not.toContain("line1");
+    expect(readIdx).toBeGreaterThanOrEqual(4);
+    const finalSent = tg.sent[tg.sent.length - 1].text;
+    expect(finalSent).toContain("more");
+    expect(finalSent).not.toContain("old"); // prefix content stripped by anchor
+  });
+
+  it("sends Working progress updates while pane is still changing", async () => {
+    const prefix = "old\n" + USER_INPUT;
+    let readIdx = 0;
+    const panes = [
+      prefix,
+      prefix + "\nstep 1",
+      prefix + "\nstep 1\nstep 2",
+      prefix + "\nstep 1\nstep 2\nstep 3 final",
+      prefix + "\nstep 1\nstep 2\nstep 3 final",
+    ];
+    const clock = makeFakeClock(0);
+    const deps: Partial<WaitLoopDeps> = {
+      sendText: () => {},
+      readPane: () => panes[Math.min(readIdx++, panes.length - 1)],
+      sleep: async () => { clock.advance(10); },
+      now: clock.now,
+    };
+    const tg = makeFakeTg();
+    await runAgentTurn("w1:pX", 1, USER_INPUT, { ...dummyCfg, throttleMs: 0 }, tg as any, 100, {
+      deps,
+      maxOutputLines: 50,
+      pollIntervalMs: 10,
+      stabilityWindowMs: 50,
+    });
+    expect(tg.sent.length).toBeGreaterThan(1);
+    expect(tg.sent.some((m) => m.text.includes("Working"))).toBe(true);
+    expect(tg.sent.some((m) => m.text.includes("step 3 final"))).toBe(true);
+  });
+
+  it("warns if pane never changes (no response)", async () => {
+    const prefix = "stuck pane\n" + USER_INPUT;
+    const clock = makeFakeClock(0);
+    const deps: Partial<WaitLoopDeps> = {
+      sendText: () => {},
+      readPane: () => prefix,
+      sleep: async () => { clock.advance(100); },
+      now: clock.now,
+    };
+    const tg = makeFakeTg();
+    await runAgentTurn("w1:pX", 1, USER_INPUT, { ...dummyCfg, maxTotalWaitS: 1 }, tg as any, 100, {
+      deps,
+      maxOutputLines: 50,
+      pollIntervalMs: 100,
+      stabilityWindowMs: 100,
+    });
+    expect(tg.sent.length).toBeGreaterThan(0);
+    expect(tg.sent[tg.sent.length - 1].text).toContain("No response");
   });
 
   it("truncates responses over 3900 chars", async () => {
-    const baseline = "";
-    // Long but each line is short (<300 chars); 50 lines of 100 chars = 5000 chars total
     const longLine = "x".repeat(100);
-    const longResponse = Array(50).fill(longLine).join("\n");
-    let readCalls = 0;
+    const longResponse = USER_INPUT + "\n" + Array(170).fill(longLine).join("\n");
+    const prefix = USER_INPUT; // post-send snapshot has only the typed text
+    let readIdx = 0;
+    const panes = [prefix, longResponse, longResponse];
+    const clock = makeFakeClock(0);
     const deps: Partial<WaitLoopDeps> = {
       sendText: () => {},
-      readPane: () => {
-        readCalls++;
-        return readCalls === 1 ? baseline : longResponse;
-      },
-      waitIdle: () => ({ status: "idle" as const }),
+      readPane: () => panes[Math.min(readIdx++, panes.length - 1)],
+      sleep: async () => { clock.advance(10); },
+      now: clock.now,
     };
     const tg = makeFakeTg();
-    await runAgentTurn("w1:pX", 1, "hi", dummyCfg, tg as any, 100, {
+    await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
       deps,
       maxOutputLines: 100,
+      pollIntervalMs: 10,
+      stabilityWindowMs: 50,
     });
-    const sent = tg.sent[0].text;
+    const sent = tg.sent[tg.sent.length - 1].text;
     expect(sent).toContain("... (truncated");
-    // The actual response payload should be < 4000 chars
     expect(sent.length).toBeLessThan(4200);
   });
 
   it("strips context-mode banner before sending", async () => {
-    const baseline = "old content";
+    const prefix = "old content\n" + USER_INPUT;
     const paneContent = `old content
+${USER_INPUT}
 agent output
 context-mode active. Hierarchy: ctx_batch_execute
 <session_state source="compaction">
 <session_mode>implement</session_mode>
 </session_state>
 more agent output`;
-    let readCalls = 0;
+    let readIdx = 0;
+    const panes = [prefix, paneContent, paneContent];
+    const clock = makeFakeClock(0);
     const deps: Partial<WaitLoopDeps> = {
       sendText: () => {},
-      readPane: () => {
-        readCalls++;
-        return readCalls === 1 ? baseline : paneContent;
-      },
-      waitIdle: () => ({ status: "idle" as const }),
+      readPane: () => panes[Math.min(readIdx++, panes.length - 1)],
+      sleep: async () => { clock.advance(10); },
+      now: clock.now,
     };
     const tg = makeFakeTg();
-    await runAgentTurn("w1:pX", 1, "hi", dummyCfg, tg as any, 100, {
+    await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
       deps,
       maxOutputLines: 50,
+      pollIntervalMs: 10,
+      stabilityWindowMs: 50,
     });
-    const sent = tg.sent[0].text;
+    const sent = tg.sent[tg.sent.length - 1].text;
     expect(sent).not.toContain("context-mode active");
     expect(sent).not.toContain("<session_state");
     expect(sent).toContain("agent output");
     expect(sent).toContain("more agent output");
     expect(sent).not.toContain("old content");
-  });
-
-  it("sends Working message on timeout (not throttled)", async () => {
-    const baseline = "";
-    const paneContent = "still working...";
-    const deps: Partial<WaitLoopDeps> = {
-      sendText: () => {},
-      readPane: () => paneContent,
-      waitIdle: () => ({ status: "timeout" as const }),
-    };
-    const tg = makeFakeTg();
-    // Use maxTotalWaitS=2 so the loop terminates after ~2 timeouts
-    await runAgentTurn("w1:pX", 1, "hi", { ...dummyCfg, maxTotalWaitS: 2 }, tg as any, 100, {
-      deps,
-      maxOutputLines: 50,
-    });
-    expect(tg.sent.length).toBeGreaterThan(0);
-    expect(tg.sent[0].text).toContain("Working");
-  });
-
-  it("sends Blocked message and stops on blocked status", async () => {
-    const baseline = "";
-    const paneContent = "approval needed";
-    const deps: Partial<WaitLoopDeps> = {
-      sendText: () => {},
-      readPane: () => paneContent,
-      waitIdle: () => ({ status: "blocked" as const }),
-    };
-    const tg = makeFakeTg();
-    await runAgentTurn("w1:pX", 1, "hi", dummyCfg, tg as any, 100, {
-      deps,
-      maxOutputLines: 50,
-    });
-    expect(tg.sent[0].text).toContain("Blocked");
-    expect(tg.sent[0].text).toContain("approval needed");
-  });
-
-  it("sends timeout message when maxTotalWaitS is exceeded", async () => {
-    const deps: Partial<WaitLoopDeps> = {
-      sendText: () => {},
-      readPane: () => "x",
-      waitIdle: () => ({ status: "timeout" as const }),
-    };
-    const tg = makeFakeTg();
-    await runAgentTurn(
-      "w1:pX",
-      1,
-      "hi",
-      { ...dummyCfg, maxTotalWaitS: 0 },
-      tg as any,
-      100,
-      { deps, maxOutputLines: 50 }
-    );
-    expect(tg.sent[0].text).toContain("Tempo limite excedido");
   });
 });

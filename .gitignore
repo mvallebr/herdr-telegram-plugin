@@ -3,3 +3,5 @@ node_modules/
 .env
 *.log
 .pi-subagents/
+docs/.vitepress/dist
+docs/.vitepress/cache
