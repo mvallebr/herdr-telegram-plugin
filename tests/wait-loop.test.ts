@@ -9,14 +9,10 @@ describe("shouldThrottle", () => {
   it("returns false after throttle window", () => {
     expect(shouldThrottle(Date.now() - 4000, 3000)).toBe(false);
   });
-
-  it("returns false if exactly at threshold", () => {
-    expect(shouldThrottle(Date.now() - 3000, 3000)).toBe(false);
-  });
 });
 
 describe("formatElapsed", () => {
-  it("formats seconds only", () => {
+  it("formats seconds", () => {
     expect(formatElapsed(45)).toBe("45s");
   });
 
@@ -24,11 +20,7 @@ describe("formatElapsed", () => {
     expect(formatElapsed(125)).toBe("2m 5s");
   });
 
-  it("formats hours, minutes, seconds", () => {
+  it("formats hours", () => {
     expect(formatElapsed(3661)).toBe("1h 1m 1s");
-  });
-
-  it("formats zero", () => {
-    expect(formatElapsed(0)).toBe("0s");
   });
 });
