@@ -39,6 +39,31 @@ export function cleanPaneOutput(content: string): string {
 }
 
 /**
+ * Strip trailing status-bar / prompt lines that refresh independently of
+ * the agent's output (e.g. pi cost/token display, shell prompt).  Used to
+ * avoid resetting the stability timer when only the status bar changes.
+ */
+function stripStatusBar(content: string): string {
+  const lines = content.split("\n");
+  // Drop trailing lines that look like shell prompts or pi status bars
+  while (lines.length > 0) {
+    const last = lines[lines.length - 1];
+    if (
+      last.trim() === "" ||
+      /^[─━═]{20,}/.test(last.trim()) ||
+      /^.{3,} · /.test(last.trim()) ||
+      /^Model: /.test(last.trim()) ||
+      /^\S+\s+\S+\s+[^\s]+\$/.test(last.trim())
+    ) {
+      lines.pop();
+    } else {
+      break;
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
  * Extract the agent's response from the pane content by anchoring on the
  * user's last input line. More robust than baseline-diff because it doesn't
  * depend on exact line-matching against a pre-send snapshot (which breaks
@@ -229,22 +254,32 @@ export async function runAgentTurn(
       continue;
     }
     if (current !== lastContent) {
-      // Pane changed — reset stability timer
-      lastContent = current;
-      lastChangeAt = deps.now();
-      // Send a progress update (throttled)
-      const elapsedMs = deps.now() - startTime;
-      if (deps.now() - lastProgressSentAt > cfg.throttleMs) {
-        const clean = cleanPaneOutput(current);
-        const soFar = extractResponseSince(clean, text);
-        const truncated = soFar.length > 2000
-          ? soFar.slice(0, 2000) + "..."
-          : soFar;
-        const elapsed = Math.floor(elapsedMs / 1000);
-        await sendMsg(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, {
-          disable_notification: true,
-        });
-        lastProgressSentAt = deps.now();
+      // Pane changed — but ignore status-bar-only refreshes (pi cost/token
+      // display updates every ~2s) that don't reflect real agent output.
+      const stableCurrent = stripStatusBar(current);
+      const stableLast = stripStatusBar(lastContent);
+      if (stableCurrent !== stableLast) {
+        // Real content changed — reset stability timer
+        lastContent = current;
+        lastChangeAt = deps.now();
+        // Send a progress update (throttled)
+        const elapsedMs = deps.now() - startTime;
+        if (deps.now() - lastProgressSentAt > cfg.throttleMs) {
+          const clean = cleanPaneOutput(current);
+          const soFar = extractResponseSince(clean, text);
+          const truncated = soFar.length > 2000
+            ? soFar.slice(0, 2000) + "..."
+            : soFar;
+          const elapsed = Math.floor(elapsedMs / 1000);
+          await sendMsg(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, {
+            disable_notification: true,
+          });
+          lastProgressSentAt = deps.now();
+        }
+      } else {
+        // Only status bar changed — update lastContent silently so
+        // the next raw compare doesn't re-enter this branch either.
+        lastContent = current;
       }
       continue;
     }
