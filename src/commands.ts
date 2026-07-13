@@ -33,6 +33,8 @@ export interface CommandDeps {
   chatId: number;
   startTime: number;
   saveMappings: () => void;
+  /** Bot-created topic registry (for dedup). Mutated in-place by reconcile. */
+  knownTopics?: Record<number, { name: string; created_at: string }>;
 }
 
 export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
@@ -179,13 +181,10 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     const wasBound = deps.map.has(threadId);
     try {
       await ctx.api.deleteForumTopic(ctx.chat.id, threadId);
-      if (wasBound) {
-        deps.map.delete(threadId);
-        deps.saveMappings();
-        await ctx.reply(`Deleted bound topic #${threadId} and removed mapping.`);
-      } else {
-        await ctx.reply(`Deleted topic #${threadId}.`);
-      }
+      deps.map.delete(threadId);
+      if (deps.knownTopics) delete deps.knownTopics[threadId];
+      deps.saveMappings();
+      await ctx.reply(`Deleted topic #${threadId}.${wasBound ? " (was bound)" : ""}`);
     } catch (err: any) {
       await ctx.reply(`Failed to delete #${threadId}: ${err.message}`);
     }
