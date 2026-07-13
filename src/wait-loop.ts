@@ -48,7 +48,9 @@ export async function runAgentTurn(
           !l.startsWith("<session_state") &&
           !l.startsWith("<session_mode") &&
           !l.startsWith("</session_state>") &&
-          !l.match(/^ctx_\w+ >/)
+          !l.match(/^ctx_\w+ >/) &&
+          !l.match(/^[─━═]{20,}/) &&
+          l.length < 300
         )
         .join("\n");
       const truncated = clean.length > 3900
@@ -69,7 +71,9 @@ export async function runAgentTurn(
           !l.startsWith("<session_state") &&
           !l.startsWith("<session_mode") &&
           !l.startsWith("</session_state>") &&
-          !l.match(/^ctx_\w+ >/)
+          !l.match(/^ctx_\w+ >/) &&
+          !l.match(/^[─━═]{20,}/) &&
+          l.length < 300
         )
         .join("\n");
       const truncated = clean.length > 2000
