@@ -41,20 +41,32 @@ export function parseAgentList(raw: string, tabLabels?: Map<string, string>): Pa
 }
 
 export function getAgents(): PaneInfo[] {
-  // Fetch tab labels first
+  // Fetch tab labels first, preserving order (some agents on same host share a tab)
   let tabLabels = new Map<string, string>();
+  const tabOrder: string[] = [];
   try {
     const tabRaw = execHerdrJson(["tab", "list"]);
     const tabs = JSON.parse(tabRaw);
     const tabItems: any[] = tabs?.result?.tabs ?? [];
     for (const t of tabItems) {
-      if (t.tab_id && t.label) tabLabels.set(String(t.tab_id), String(t.label));
+      if (t.tab_id && t.label) {
+        tabLabels.set(String(t.tab_id), String(t.label));
+        tabOrder.push(String(t.tab_id));
+      }
     }
   } catch {
     // Tab list failed — fall back to cwd dirnames
   }
   const raw = execHerdrJson(["agent", "list"]);
-  return parseAgentList(raw, tabLabels);
+  const agents = parseAgentList(raw, tabLabels);
+  // Sort by tab order from herdr
+  const orderMap = new Map(tabOrder.map((id, i) => [id, i]));
+  agents.sort((a, b) => {
+    const ai = orderMap.get(a.tab_id) ?? 9999;
+    const bi = orderMap.get(b.tab_id) ?? 9999;
+    return ai - bi;
+  });
+  return agents;
 }
 
 export function buildSendTextArgs(paneId: string, text: string): string[] {
