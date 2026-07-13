@@ -180,7 +180,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
     await runAgentTurn(
       mapping.pane_id, threadId,
-      "Give me a concise summary of what we've been working on in this session. Include: original goal, progress made, blockers, and next steps.",
+      "Give me a concise summary of what we've been working on in this session. Keep it under 200 words. Include: original goal, progress made, blockers, and next steps.",
       cfg, tg, state.authorized_chat_id!
     );
   });
