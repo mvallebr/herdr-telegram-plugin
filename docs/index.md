@@ -2,45 +2,52 @@
 layout: home
 
 hero:
-  name: herdr-telegram-plugin
-  text: Remote control herdr agents from Telegram
-  tagline: Send messages to forum topics and the agent responds directly in the chat
+  name: "herdr-telegram-plugin"
+  text: "Remote control herdr agents from Telegram"
+  tagline: "Each agent tab gets its own forum topic. Send a message, get the response back — no LLM in the path."
+  image:
+    src: /logo.svg
+    alt: herdr-telegram-plugin
   actions:
     - theme: brand
-      text: Get Started
-      link: /getting-started/installation
+      text: Start Tutorial →
+      link: /tutorial/
     - theme: alt
       text: View on GitHub
       link: https://github.com/mvallebr/herdr-telegram-plugin
 
 features:
-  - icon: 💬
-    title: Forum Topic Mapping
-    details: Each herdr agent tab gets its own Telegram forum topic. Conversations stay organized.
+  - icon: 🧵
+    title: One topic per agent
+    details: The watcher syncs herdr tabs to Telegram forum topics automatically. New agent? New topic appears in seconds.
   - icon: ⚡
-    title: Real-time Response
-    details: Content-based polling with stability detection ensures you get the full response, not fragments.
-  - icon: 🔧
-    title: Commands
-    details: /digest, /bind, /pair, /unpair — control everything from the chat.
+    title: Content-based polling
+    details: Wait loop detects when the agent finishes responding using stability detection — no fragile status checks. Status bar refreshes are filtered out.
+  - icon: 🎯
+    title: Anchor-based extraction
+    details: Response is extracted by anchoring on the user's input line. Survives pane scrolling, separator bars, and context-mode banners.
   - icon: 🛡️
-    title: Safe by Default
-    details: Pairing requires explicit authorization. Rate-limited progress updates. Timeout protection.
+    title: Safe by default
+    details: /pair requires explicit authorization. Progress updates are throttled and capped. Stuck models don't loop forever.
 ---
 
-## 30-second Quickstart
+## Make it yours
 
-```bash
-# 1. Install
-git clone https://github.com/mvallebr/herdr-telegram-plugin
-npm install && npm run build
-
-# 2. Configure
-echo '[telegram]' > ~/.config/herdr-telegram/config.toml
-echo 'bot_token = "YOUR_BOT_TOKEN"' >> ~/.config/herdr-telegram/config.toml
-
-# 3. Run
-node dist/index.js --daemon
+```toml
+# ~/.config/herdr-telegram/config.toml
+[telegram]
+bot_token = "..."           # from @BotFather
+throttle_ms = 60000         # min between ⏳ Working updates
+max_progress_updates = 120  # updates before timeout (-1 = never)
 ```
 
-Then open Telegram, find your bot, and send `/pair`. The watcher automatically creates a topic for each herdr tab. Type a message in any topic — the agent responds.
+| What | How |
+|---|---|
+| Ask an agent a question | Just type in its topic |
+| Get a work summary | `/digest` |
+| Add a new agent tab in herdr | Topic appears automatically (15s) |
+| Rename a tab | Topic name updates |
+| Close a tab | Topic is deleted |
+| Bind a topic manually | `/bind <label>` |
+
+Ready? → [Start the tutorial](/tutorial/)
