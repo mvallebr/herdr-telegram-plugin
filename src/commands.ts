@@ -43,6 +43,8 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/agents — list agents with status and bound threads",
         "/bind <pane-label> — bind this thread to a pane (use in a new thread)",
         "/unbind — unbind this thread",
+        "/cleanup — list bound vs unbound topics (delete duplicates in Telegram UI)",
+        "/unpair — reset pairing (re-authorize with /pair)",
         "/status — bridge uptime and connection info",
         "/interrupt — send Ctrl+C to this thread's agent",
         "/trust — send 'trust, always allow' to this thread's agent",

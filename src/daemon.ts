@@ -97,6 +97,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     const chatId = ctx.chat.id;
     if (chatId !== state.authorized_chat_id) return;
 
+    const text = ctx.message.text;
+    // Commands are handled by their own handlers — don't fall through to the picker.
+    if (!text || text.startsWith("/")) return;
+
     const threadId = ctx.message?.message_thread_id;
     if (!threadId) {
       // Message in main chat (no thread) — ignore or prompt to use a thread
@@ -118,9 +122,6 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       );
       return;
     }
-
-    const text = ctx.message.text;
-    if (!text || text.startsWith("/")) return; // commands handled separately
 
     await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
   });
@@ -147,6 +148,38 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     deps.saveMappings();
     await ctx.answerCallbackQuery({ text: `Bound to ${pane.label}` });
     await ctx.editMessageText(`Bound this thread to ${pane.label} (${pane.agent}). Send a message to start.`);
+  });
+
+  // Cleanup duplicates (list unbound topics so user can delete manually)
+  tg.bot.command("cleanup", async (ctx) => {
+    if (!isPaired(state) || !state.authorized_chat_id) {
+      await ctx.reply("Not paired.");
+      return;
+    }
+    const chatId = state.authorized_chat_id;
+    let topics: { message_thread_id: number; name: string }[] = [];
+    try {
+      topics = await tg.getForumTopics(chatId);
+    } catch (e: any) {
+      await ctx.reply(`Cannot list topics (${e.message}). Delete duplicates manually in Telegram UI.`);
+      return;
+    }
+    const boundIds = new Set(deps.map.keys());
+    const bound: string[] = [];
+    const unbound: string[] = [];
+    for (const t of topics) {
+      const line = `#${t.message_thread_id} "${t.name}"`;
+      if (boundIds.has(t.message_thread_id)) bound.push(line);
+      else unbound.push(line);
+    }
+    const lines = [
+      `Bound: ${bound.length}`,
+      ...bound,
+      "",
+      `Unbound (delete these manually): ${unbound.length}`,
+      ...unbound,
+    ];
+    await ctx.reply(lines.join("\n"));
   });
 
   // Unpair (reset state)
