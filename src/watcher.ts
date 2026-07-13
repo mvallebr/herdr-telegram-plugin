@@ -180,6 +180,13 @@ export async function healthCheckTopics(
           };
           state.thread_mappings[entry.thread_id] = mapping;
           deps.map.set(entry.thread_id, mapping);
+          log.info("watcher: re-bound existing topic to deps.map", {
+            tabId,
+            threadId: entry.thread_id,
+            label: entry.label,
+          });
+        } else {
+          log.warn("watcher: pane not found for known tab", { tabId });
         }
       }
     } catch (err: any) {
