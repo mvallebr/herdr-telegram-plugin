@@ -1,0 +1,20 @@
+{
+  "name": "herdr-telegram-plugin",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Telegram bot companion for herdr — remote control agents via forum topics",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "grammy": "^1.44.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  }
+}
