@@ -80,18 +80,30 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
           await ctx.reply("Not paired.");
           return;
         }
+        // Delete all bot-created topics before resetting state
+        const kt = state.known_topics ?? {};
+        const tids = Object.keys(kt).map(Number);
+        let deleted = 0;
+        for (const tid of tids) {
+          try {
+            await ctx.api.deleteForumTopic(ctx.chat.id, tid);
+            deleted++;
+          } catch {
+            // skip — topic may already be gone
+          }
+        }
         saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {} });
         state = loadState(statePath);
         state.known_topics = {};
         deps.map.clear();
         deps.chatId = 0;
         deps.knownTopics = state.known_topics;
-        await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
+        await ctx.reply(`Unpaired. Deleted ${deleted} topic(s). Send /pair to re-authorize.`);
       } catch (err: any) {
         log.error("unpair failed", { error: err.message });
         await ctx.reply("Unpair failed: " + err.message);
       }
-      return; // consume this message — don't pass to other handlers
+      return;
     }
     // /pair — handle here too for reliability
     if (text.startsWith("/pair")) {
