@@ -1,6 +1,6 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
-import { getAgents, sendText, readPane } from "./herdr-client.js";
+import { getAgents, sendText } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
@@ -92,10 +92,6 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     if (!mapping) { await ctx.reply("No pane for this topic."); return; }
     sendText(mapping.pane_id, "trust, always allow");
     await ctx.reply(`Trusted ${mapping.label}`);
-  });
-
-  bot.command("digest", async (ctx) => {
-    await ctx.reply("Use /digest inside a bound thread.");
   });
 
   bot.command("bind", async (ctx) => {
