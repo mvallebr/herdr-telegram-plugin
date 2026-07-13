@@ -273,6 +273,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
     const mapping = findMapping(threadId, deps.map);
     if (!mapping) {
+      log.info("message:text: thread not bound", {
+        threadId,
+        chatId,
+        knownMappings: Array.from(deps.map.keys()),
+      });
       const panes = getAgents();
       const buttons = panes.map((p) => [
         { text: `${p.label} (${p.agent})`, callback_data: `bind:${p.pane_id}:${threadId}` },
