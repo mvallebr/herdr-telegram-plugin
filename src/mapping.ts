@@ -26,6 +26,8 @@ export async function reconcile(
   knownTopics: Record<number, { name: string; created_at: string }> = {}
 ): Promise<Map<number, ThreadMapping>> {
   const panes = getAgents();
+  // Telegram appends topics to the bottom, so reverse to get the right visual order
+  panes.reverse();
   const map = new Map<number, ThreadMapping>();
   const created: string[] = [];
   const deleted: string[] = [];
