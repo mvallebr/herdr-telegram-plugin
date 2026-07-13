@@ -1,0 +1,37 @@
+{
+  "runId": "92b577e5",
+  "agent": "reviewer",
+  "task": "Review Task 3 (config + state).\n\nREAD:\n1. Brief: /home/mvallebr/git/herdr-telegram-plugin/.superpowers/sdd/task-3-brief.md\n2. Diff: /home/mvallebr/git/herdr-telegram-plugin/.superpowers/sdd/review-4d63e9b..19f60a9.diff\n\nGLOBAL CONSTRAINTS:\n- config.ts: loadConfig(configDir?) returns Config { botToken, chatId, throttleMs, waitTimeoutS, maxTotalWaitS }\n- state.ts: loadState(stateDir?) returns DaemonState, saveState(stateDir?, state) void\n- Config file: ~/.config/herdr-telegram/config.toml\n- State file: ~/.local/state/herdr-telegram/state.json\n\nDELIVER: spec compliance (✅/❌), code quality (Approved/Issues), issues with severity.",
+  "exitCode": 0,
+  "usage": {
+    "input": 17746,
+    "output": 4978,
+    "cacheRead": 49152,
+    "cacheWrite": 0,
+    "cost": 0.048914184000000006,
+    "turns": 6
+  },
+  "model": "opencode-go/deepseek-v4-pro:high",
+  "attemptedModels": [
+    "opencode-go/deepseek-v4-pro:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "opencode-go/deepseek-v4-pro:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 17746,
+        "output": 4978,
+        "cacheRead": 49152,
+        "cacheWrite": 0,
+        "cost": 0.048914184000000006,
+        "turns": 6
+      }
+    }
+  ],
+  "durationMs": 103117,
+  "toolCount": 10,
+  "transcriptPath": "/home/mvallebr/git/herdr-telegram-plugin/.pi-subagents/artifacts/92b577e5_reviewer_0_transcript.jsonl",
+  "timestamp": 1783962538836
+}

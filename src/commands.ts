@@ -1,10 +1,10 @@
-import { Bot, type Context } from "grammy";
+import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
 import { getAgents, sendText } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
-import { loadState } from "./state.js";
+import { loadState, saveState } from "./state.js";
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
@@ -32,6 +32,7 @@ export interface CommandDeps {
   stateDir: string;
   chatId: number;
   startTime: number;
+  saveMappings: () => void;
 }
 
 export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
@@ -39,13 +40,15 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     await ctx.reply(
       [
         "/help — this message",
-        "/agents — list agents with status and topic IDs",
+        "/agents — list agents with status and bound threads",
+        "/bind <pane-label> — bind this thread to a pane (use in a new thread)",
+        "/unbind — unbind this thread",
         "/status — bridge uptime and connection info",
-        "/interrupt — send Ctrl+C to this topic's agent",
-        "/trust — send 'trust, always allow' to this topic's agent",
+        "/interrupt — send Ctrl+C to this thread's agent",
+        "/trust — send 'trust, always allow' to this thread's agent",
         "/digest — today's activity (coming soon)",
         "",
-        "Plain text in any topic is sent to that topic's pane.",
+        "Plain text in any thread is sent to that thread's pane.",
       ].join("\n")
     );
   });
@@ -88,5 +91,66 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
 
   bot.command("digest", async (ctx) => {
     await ctx.reply("Digest coming soon. Use /agents for current status.");
+  });
+
+  bot.command("bind", async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply(
+        "Send /bind inside a thread (tap + or New Thread in the chat first)."
+      );
+      return;
+    }
+    const arg = (ctx.match ?? "").trim();
+    const panes = getAgents();
+
+    if (!arg) {
+      const available = panes
+        .map((p) => `- ${p.label} (${p.agent}, ${p.status})`)
+        .join("\n");
+      await ctx.reply(
+        `Usage: /bind <pane-label>\n\nAvailable panes:\n${available}\n\nExample: /bind analisedefiis`
+      );
+      return;
+    }
+
+    const pane = panes.find(
+      (p) =>
+        p.label.toLowerCase() === arg.toLowerCase() ||
+        p.pane_id.toLowerCase() === arg.toLowerCase()
+    );
+    if (!pane) {
+      await ctx.reply(
+        `Pane "${arg}" not found. Use /bind with no args to see available panes.`
+      );
+      return;
+    }
+
+    deps.map.set(threadId, {
+      pane_id: pane.pane_id,
+      label: pane.label,
+      agent: pane.agent,
+      created_at: new Date().toISOString(),
+    });
+    deps.saveMappings();
+    await ctx.reply(
+      `Bound this thread to ${pane.label} (${pane.agent}). Send a message to start.`
+    );
+  });
+
+  bot.command("unbind", async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply("Send /unbind inside a thread.");
+      return;
+    }
+    const mapping = deps.map.get(threadId);
+    if (!mapping) {
+      await ctx.reply("This thread is not bound.");
+      return;
+    }
+    deps.map.delete(threadId);
+    deps.saveMappings();
+    await ctx.reply(`Unbound thread from ${mapping.label}.`);
   });
 }

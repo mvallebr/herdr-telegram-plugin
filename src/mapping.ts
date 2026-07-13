@@ -24,22 +24,43 @@ export async function reconcile(
   tg: TelegramClient
 ): Promise<Map<number, ThreadMapping>> {
   const panes = getAgents();
-  const topics = await tg.getForumTopics(chatId);
   const map = new Map<number, ThreadMapping>();
 
-  for (const pane of panes) {
-    let threadId = matchTopic(pane, topics);
-    if (!threadId) {
-      threadId = await tg.createForumTopic(chatId, pane.label);
-      topics.push({ message_thread_id: threadId, name: pane.label });
+  // Detect whether the chat supports forum topics
+  let useForum = false;
+  let topics: TopicInfo[] = [];
+  try {
+    const chat = await tg.bot.api.getChat(chatId);
+    useForum = chat.type === "supergroup" && Boolean((chat as any).is_forum);
+    if (useForum) {
+      topics = await tg.getForumTopics(chatId);
     }
-    map.set(threadId, {
-      pane_id: pane.pane_id,
-      label: pane.label,
-      agent: pane.agent,
-      created_at: new Date().toISOString(),
-    });
+  } catch {
+    // ignore: fall back to manual binding via /bind
   }
+
+  if (useForum) {
+    for (const pane of panes) {
+      let threadId = matchTopic(pane, topics);
+      if (!threadId) {
+        try {
+          threadId = await tg.createForumTopic(chatId, pane.label);
+          topics.push({ message_thread_id: threadId, name: pane.label });
+        } catch {
+          // forum topic creation failed; user must bind manually
+          continue;
+        }
+      }
+      map.set(threadId, {
+        pane_id: pane.pane_id,
+        label: pane.label,
+        agent: pane.agent,
+        created_at: new Date().toISOString(),
+      });
+    }
+  }
+  // For private chats (or groups without forum), we return an empty map.
+  // The user creates threads via Telegram UI and binds them with /bind.
 
   return map;
 }

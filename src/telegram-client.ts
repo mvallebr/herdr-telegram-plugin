@@ -52,37 +52,37 @@ export class TelegramClient {
 
     try {
       const chat = await this.bot.api.getChat(chatId);
-      if (!chat.is_forum) {
-        errors.push(
-          "Topics are not enabled. Enable them in Group Settings → Topics."
-        );
-        return errors;
+      const chatType = chat.type;
+      // Allow private chats, groups, and supergroups (with or without topics).
+      // Only supergroups with is_forum require admin + can_manage_topics.
+      // Private chats only need the chat to be reachable.
+      if (chatType === "supergroup" && chat.is_forum) {
+        try {
+          const me = await this.bot.api.getMe();
+          const member = await this.bot.api.getChatMember(chatId, me.id);
+          if (!["creator", "administrator"].includes(member.status)) {
+            errors.push(
+              "Bot is not an administrator. Promote via Group Settings → Administrators → Add Administrator."
+            );
+            return errors;
+          }
+          if (member.status === "administrator" && !(member as any).can_manage_topics) {
+            errors.push(
+              "Bot lacks 'Manage Topics' permission. Enable in Group Settings → Administrators → @yourbot → Manage Topics."
+            );
+          }
+        } catch (err: any) {
+          errors.push(`Cannot check bot permissions. ${err.message}`);
+        }
+      } else if (chatType === "group") {
+        // Legacy group (no forum) — bot just needs to be reachable.
+        // No admin requirement; user already started the bot.
       }
+      // private / channel: no extra checks
     } catch (err: any) {
       errors.push(
-        `Cannot access chat. Make sure the bot has been added to the group. (${err.message})`
+        `Cannot access chat. Make sure the bot has been added. (${err.message})`
       );
-      return errors;
-    }
-
-    try {
-      const me = await this.bot.api.getMe();
-      const member = await this.bot.api.getChatMember(chatId, me.id);
-
-      if (!["creator", "administrator"].includes(member.status)) {
-        errors.push(
-          "Bot is not an administrator. Promote via Group Settings → Administrators → Add Administrator."
-        );
-        return errors;
-      }
-
-      if (member.status === "administrator" && !(member as any).can_manage_topics) {
-        errors.push(
-          "Bot lacks 'Manage Topics' permission. Enable in Group Settings → Administrators → @yourbot → Manage Topics."
-        );
-      }
-    } catch (err: any) {
-      errors.push(`Cannot check bot permissions. ${err.message}`);
     }
 
     return errors;
