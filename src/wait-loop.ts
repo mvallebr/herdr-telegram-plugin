@@ -39,20 +39,29 @@ export async function runAgentTurn(
 
     if (result.status === "idle") {
       const content = readPane(paneId, 200);
-      await tg.sendMessage(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${content}`);
+      const truncated = content.length > 3900
+        ? content.slice(0, 3900) + `\n\n... (truncated, ${content.length} chars total)`
+        : content;
+      await tg.sendMessage(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${truncated}`);
       break;
     }
 
     if (result.status === "timeout") {
       if (shouldThrottle(lastSent, cfg.throttleMs)) continue;
       const content = readPane(paneId, 15);
-      await tg.sendMessage(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${content}`, { disable_notification: true });
+      const truncated = content.length > 2000
+        ? content.slice(0, 2000) + "..."
+        : content;
+      await tg.sendMessage(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, { disable_notification: true });
       lastSent = Date.now();
     }
 
     if (result.status === "blocked") {
       const content = readPane(paneId, 30);
-      await tg.sendMessage(chatId, threadId, `⚠️ Blocked (tool approval):\n\n${content}`);
+      const truncated = content.length > 2000
+        ? content.slice(0, 2000) + "..."
+        : content;
+      await tg.sendMessage(chatId, threadId, `⚠️ Blocked (tool approval):\n\n${truncated}`);
       break;
     }
   }
