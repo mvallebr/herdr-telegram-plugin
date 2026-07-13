@@ -35,6 +35,8 @@ export interface CommandDeps {
   saveMappings: () => void;
   /** Bot-created topic registry (for dedup). Mutated in-place by reconcile. */
   knownTopics?: Record<number, { name: string; created_at: string }>;
+  /** Stops the tab watcher (called on /unpair). */
+  stopWatcher?: () => void;
 }
 
 export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {

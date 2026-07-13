@@ -7,6 +7,7 @@ import { getAgents, readPane } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
+import { startWatcher } from "./watcher.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 
@@ -49,6 +50,21 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   // Persist initial mapping (reconcile mutated state.known_topics in-place)
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
+  // Seed known_tabs from initial reconcile so the watcher has a baseline
+  state.known_tabs = state.known_tabs ?? {};
+  if (isPaired(state)) {
+    const panes = getAgents();
+    for (const pane of panes) {
+      // Find existing thread_id by pane_id
+      let threadId: number | undefined;
+      for (const [tid, m] of map.entries()) {
+        if (m.pane_id === pane.pane_id) { threadId = tid; break; }
+      }
+      if (threadId && !state.known_tabs[pane.tab_id]) {
+        state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
+      }
+    }
+  }
   saveState(statePath, {
     ...state,
     thread_mappings: rawMappings,
@@ -115,12 +131,14 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
             // skip — topic may already be gone
           }
         }
-        saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {} });
+        saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {}, known_tabs: {} });
         state = loadState(statePath);
         state.known_topics = {};
+        state.known_tabs = {};
         deps.map.clear();
         deps.chatId = 0;
         deps.knownTopics = state.known_topics;
+        deps.stopWatcher?.();
         await ctx.reply(`Unpaired. Deleted ${deleted} topic(s). Send /pair to re-authorize.`);
       } catch (err: any) {
         log.error("unpair failed", { error: err.message });
@@ -333,6 +351,28 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   tg.start();
   log.info("Daemon started", { paired: isPaired(state), panes: map.size });
+
+  // Watcher controller — used to stop the watcher on /unpair
+  const watcherController = new AbortController();
+
+  // Start the tab watcher: detects new/closed/renamed herdr tabs every 30s
+  // and syncs Telegram topics accordingly.
+  const saveStateCallback = () => {
+    const raw: DaemonState["thread_mappings"] = {};
+    for (const [tid, m] of deps.map.entries()) raw[tid] = m;
+    saveState(statePath, { ...state, thread_mappings: raw });
+  };
+  if (isPaired(state) && state.authorized_chat_id) {
+    startWatcher(
+      state.authorized_chat_id,
+      tg,
+      state,
+      saveStateCallback,
+      30_000,
+      watcherController.signal
+    );
+  }
+  deps.stopWatcher = () => watcherController.abort();
 
   return {
     stop: () => tg.bot.stop(),

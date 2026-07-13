@@ -8,11 +8,21 @@ export function loadState(stateDir?: string): DaemonState {
   const filePath = path.join(dir, "state.json");
 
   if (!fs.existsSync(filePath)) {
-    return { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {} };
+    return {
+      authorized_chat_id: null,
+      paired_at: null,
+      thread_mappings: {},
+      known_topics: {},
+      known_tabs: {},
+    };
   }
 
   const raw = fs.readFileSync(filePath, "utf8");
-  return JSON.parse(raw) as DaemonState;
+  const parsed = JSON.parse(raw) as DaemonState;
+  // Backfill new fields for older state files
+  if (!parsed.known_topics) parsed.known_topics = {};
+  if (!parsed.known_tabs) parsed.known_tabs = {};
+  return parsed;
 }
 
 export function saveState(stateDir: string | undefined, state: DaemonState): void {

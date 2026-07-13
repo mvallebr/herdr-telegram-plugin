@@ -23,6 +23,8 @@ describe("loadState / saveState", () => {
       authorized_chat_id: -100,
       paired_at: "2026-01-01T00:00:00Z",
       thread_mappings: { "140": { pane_id: "w1:pZ", label: "Echo", agent: "pi", created_at: "..." } },
+      known_topics: {},
+      known_tabs: {},
     };
     saveState(tmpDir, orig);
     const loaded = loadState(tmpDir);
