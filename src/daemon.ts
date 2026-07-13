@@ -19,6 +19,9 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   );
 
   let state = loadState(statePath);
+  // Ensure known_topics is always initialized so in-place mutations persist
+  state.known_topics = state.known_topics ?? {};
+
   const tg = new TelegramClient(cfg.botToken);
 
   // Re-validate existing pairing
@@ -39,17 +42,16 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
         state.authorized_chat_id!,
         tg,
         new Map(), // no existing mappings on cold start
-        state.known_topics ?? {}
+        state.known_topics!
       )
     : new Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>();
 
-  // Persist initial mapping (and any newly tracked known_topics)
+  // Persist initial mapping (reconcile mutated state.known_topics in-place)
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
   saveState(statePath, {
     ...state,
     thread_mappings: rawMappings,
-    known_topics: state.known_topics ?? {},
   });
 
   const deps: CommandDeps = {
@@ -57,20 +59,75 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     stateDir: statePath,
     chatId: state.authorized_chat_id ?? 0,
     startTime: Date.now(),
+    knownTopics: state.known_topics,
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of deps.map.entries()) raw[tid] = m;
-      saveState(statePath, {
-        ...state,
-        thread_mappings: raw,
-        known_topics: state.known_topics ?? {},
-      });
+      saveState(statePath, { ...state, thread_mappings: raw });
     },
   };
 
   registerCommands(tg.bot, deps);
 
-  // Pairing flow
+  // Catch-all message handler (highest priority) for commands that must always work
+  tg.bot.on("message", async (ctx, next) => {
+    const text = ctx.message?.text ?? "";
+    // /unpair — must work even if grammy command matching is flaky
+    if (text.startsWith("/unpair")) {
+      log.info("unpair caught via message handler", { chatId: ctx.chat.id });
+      try {
+        if (!isPaired(state)) {
+          await ctx.reply("Not paired.");
+          return;
+        }
+        saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {} });
+        state = loadState(statePath);
+        state.known_topics = {};
+        deps.map.clear();
+        deps.chatId = 0;
+        deps.knownTopics = state.known_topics;
+        await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
+      } catch (err: any) {
+        log.error("unpair failed", { error: err.message });
+        await ctx.reply("Unpair failed: " + err.message);
+      }
+      return; // consume this message — don't pass to other handlers
+    }
+    // /pair — handle here too for reliability
+    if (text.startsWith("/pair")) {
+      if (isPaired(state)) {
+        await ctx.reply("Already paired. Send /unpair first to re-pair with a different chat.");
+        return;
+      }
+      const chatId = ctx.chat.id;
+      const errors = await tg.validatePermissions(chatId);
+      if (errors.length > 0) {
+        await ctx.reply("Cannot pair:\n" + errors.map(e => "- " + e).join("\n"));
+        return;
+      }
+      state = updatePairing(statePath, chatId);
+      state.known_topics = state.known_topics ?? {};
+      deps.chatId = chatId;
+      deps.knownTopics = state.known_topics;
+      await ctx.reply("✅ Chat authorized. Reconciling tabs...");
+      const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
+      for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
+      const rawMappings: DaemonState["thread_mappings"] = {};
+      for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
+      saveState(statePath, { ...state, thread_mappings: rawMappings });
+      const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+      const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+      if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
+      if (result?.created.length) parts.push(`Auto-created: ${result.created.join(", ")}`);
+      if (result?.failed.length) parts.push(`Could not create (bind manually with /bind): ${result.failed.join(", ")}`);
+      await ctx.reply(parts.join("\n"));
+      return;
+    }
+    // Pass through to other handlers (command, message:text, etc.)
+    await next();
+  });
+
+  // Pairing flow (grammy command handler — kept for when grammy works)
   tg.bot.command("pair", async (ctx) => {
     if (isPaired(state)) {
       await ctx.reply("Already paired. Send /unpair first to re-pair with a different chat.");
@@ -83,9 +140,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       return;
     }
     state = updatePairing(statePath, chatId);
+    state.known_topics = state.known_topics ?? {};
     deps.chatId = chatId;
     await ctx.reply("✅ Chat authorized. Reconciling tabs...");
-    const newMap = await reconcile(chatId, tg, deps.map);
+    const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
@@ -158,55 +216,37 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.editMessageText(`Bound this thread to ${pane.label} (${pane.agent}). Send a message to start.`);
   });
 
-  // Cleanup duplicates (list unbound topics so user can delete manually)
+  // Cleanup: show all known topics (bot-created + bound) so user can delete manually
   tg.bot.command("cleanup", async (ctx) => {
     if (!isPaired(state) || !state.authorized_chat_id) {
       await ctx.reply("Not paired.");
       return;
     }
-    const chatId = state.authorized_chat_id;
-    let topics: { message_thread_id: number; name: string }[] = [];
-    try {
-      topics = await tg.getForumTopics(chatId);
-    } catch (e: any) {
-      await ctx.reply(`Cannot list topics (${e.message}). Delete duplicates manually in Telegram UI.`);
-      return;
-    }
     const boundIds = new Set(deps.map.keys());
-    const bound: string[] = [];
-    const unbound: string[] = [];
-    for (const t of topics) {
-      const line = `#${t.message_thread_id} "${t.name}"`;
-      if (boundIds.has(t.message_thread_id)) bound.push(line);
-      else unbound.push(line);
-    }
-    const lines = [
-      `Bound: ${bound.length}`,
-      ...bound,
-      "",
-      `Unbound (delete these manually): ${unbound.length}`,
-      ...unbound,
-    ];
-    await ctx.reply(lines.join("\n"));
-  });
-
-  // Unpair (reset state)
-  tg.bot.command("unpair", async (ctx) => {
-    log.info("unpair command received", { from: ctx.chat?.id });
-    try {
-      if (!isPaired(state)) {
-        await ctx.reply("Not paired.");
-        return;
+    const kt = state.known_topics ?? {};
+    const lines: string[] = [];
+    // Show known (bot-created) topics
+    if (Object.keys(kt).length > 0) {
+      lines.push("📋 Bot-created topics (from known_topics):");
+      for (const [tid, info] of Object.entries(kt)) {
+        const bid = Number(tid);
+        const marker = boundIds.has(bid) ? "🔗" : "  ";
+        lines.push(`  ${marker} #${tid} "${info.name}"`);
       }
-      saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {} });
-      state = loadState(statePath);
-      deps.map.clear();
-      deps.chatId = 0;
-      await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
-    } catch (err: any) {
-      log.error("unpair failed", { error: err.message });
-      await ctx.reply("Unpair failed: " + err.message);
     }
+    // Show bound topics (in case some were bound via /bind, not bot-created)
+    if (deps.map.size > 0) {
+      if (lines.length > 0) lines.push("");
+      lines.push("🔗 Bound mappings:");
+      for (const [tid, m] of deps.map.entries()) {
+        lines.push(`  #${tid} → ${m.label} (${m.agent})`);
+      }
+    }
+    if (lines.length === 0) {
+      lines.push("No topics tracked.");
+    }
+    lines.push("", "Use /delete <id> to remove a topic.");
+    await ctx.reply(lines.join("\n"));
   });
 
   // Re-reconcile (re-create topics for any unmapped panes)
@@ -217,15 +257,12 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     }
     const chatId = state.authorized_chat_id;
     await ctx.reply("Reconciling...");
-    const newMap = await reconcile(chatId, tg, deps.map, state.known_topics ?? {});
+    state.known_topics = state.known_topics ?? {};
+    const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
-    saveState(statePath, {
-      ...state,
-      thread_mappings: rawMappings,
-      known_topics: state.known_topics ?? {},
-    });
+    saveState(statePath, { ...state, thread_mappings: rawMappings });
     const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
     const parts = [`Reconciled: ${newMap.size} panes mapped.`];
     if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
