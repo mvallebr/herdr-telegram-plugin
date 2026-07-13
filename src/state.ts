@@ -8,7 +8,7 @@ export function loadState(stateDir?: string): DaemonState {
   const filePath = path.join(dir, "state.json");
 
   if (!fs.existsSync(filePath)) {
-    return { authorized_chat_id: null, paired_at: null, thread_mappings: {} };
+    return { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {} };
   }
 
   const raw = fs.readFileSync(filePath, "utf8");

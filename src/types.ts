@@ -23,4 +23,7 @@ export interface DaemonState {
   authorized_chat_id: number | null;
   paired_at: string | null;
   thread_mappings: Record<number, ThreadMapping>;
+  /** Topics the bot has ever created in this chat. Maps thread_id -> { name, created_at }.
+   *  Used for dedup because getForumTopics returns 404 in private chats. */
+  known_topics?: Record<number, { name: string; created_at: string }>;
 }
