@@ -132,6 +132,13 @@ export function startWatcher(
     try {
       const result = await syncTabs(chatId, tg, state);
       if (result.changed) saveState();
+      // Log every tick at debug level so we can verify it's actually running
+      log.debug("watcher: tick", {
+        added: result.added.length,
+        removed: result.removed.length,
+        renamed: result.renamed.length,
+        knownTabs: Object.keys(state.known_tabs ?? {}).length,
+      });
     } catch (err: any) {
       log.error("watcher: sync error", { error: err.message });
     }
