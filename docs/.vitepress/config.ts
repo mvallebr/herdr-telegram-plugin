@@ -5,7 +5,6 @@ export default defineConfig({
   description: "Telegram bot companion for herdr — remote control agents via forum topics",
   lang: "en-US",
   base: "/herdr-telegram-plugin/",
-  srcExclude: ["superpowers/**"],
   themeConfig: {
     nav: [
       { text: "Home", link: "/" },
