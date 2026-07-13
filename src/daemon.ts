@@ -368,7 +368,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       tg,
       state,
       saveStateCallback,
-      30_000,
+      15_000,
       watcherController.signal
     );
   }

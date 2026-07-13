@@ -211,7 +211,7 @@ export function startWatcher(
   abortSignal?: AbortSignal
 ): void {
   let tickCount = 0;
-  const HEALTH_CHECK_EVERY = 5; // every 5 ticks (5 * 30s = 2.5min)
+  const HEALTH_CHECK_EVERY = 2; // every 2 ticks (2 * 30s = 1min)
   const tick = async () => {
     try {
       tickCount++;
