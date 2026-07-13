@@ -166,6 +166,22 @@ export async function healthCheckTopics(
     try {
       // Silent ping — no user-visible notification, but fails if thread was deleted.
       await tg.sendChatAction(chatId, entry.thread_id);
+      // Topic exists — make sure deps.map is in sync (it may have been recreated
+      // by a previous watcher run that updated state but not in-memory map).
+      if (deps && !deps.map.has(entry.thread_id)) {
+        const panes = getAgents();
+        const pane = panes.find((p) => p.tab_id === tabId);
+        if (pane) {
+          const mapping = {
+            pane_id: pane.pane_id,
+            label: entry.label,
+            agent: pane.agent,
+            created_at: new Date().toISOString(),
+          };
+          state.thread_mappings[entry.thread_id] = mapping;
+          deps.map.set(entry.thread_id, mapping);
+        }
+      }
     } catch (err: any) {
       if (err.message?.includes("TOPIC_ID_INVALID")) {
         // Topic was deleted — recreate it. We need the pane info to seed.
@@ -231,7 +247,9 @@ export function startWatcher(
       if (result.changed) saveState();
       // Health check less frequently: pings every known topic to detect deleted ones
       let recreated: string[] = [];
+      let healthCheckRan = false;
       if (tickCount % HEALTH_CHECK_EVERY === 0) {
+        healthCheckRan = true;
         const hc = await healthCheckTopics(chatId, tg, state, deps);
         recreated = hc.recreated;
         if (recreated.length > 0) saveState();
@@ -242,6 +260,7 @@ export function startWatcher(
         removed: result.removed.length,
         renamed: result.renamed.length,
         recreated: recreated.length,
+        healthCheckRan,
         knownTabs: Object.keys(state.known_tabs ?? {}).length,
       });
     } catch (err: any) {

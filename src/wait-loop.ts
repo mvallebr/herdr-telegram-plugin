@@ -41,7 +41,12 @@ export async function runAgentTurn(
     if (result.status === "idle") {
       const content = readPane(paneId, maxOutputLines);
       // Strip common noise from final output
-      const clean = content
+      // First remove the multi-line context-mode banner block (if present)
+      let clean = content.replace(
+        /\n*context-mode active\.[\s\S]*?<\/session_state>\n*/g,
+        "\n"
+      );
+      clean = clean
         .split("\n")
         .filter((l: string) =>
           !l.includes("context-mode active") &&
@@ -64,7 +69,11 @@ export async function runAgentTurn(
       if (shouldThrottle(lastSent, cfg.throttleMs)) continue;
       const content = readPane(paneId, 15);
       // Strip common noise from progress updates
-      const clean = content
+      let clean = content.replace(
+        /\n*context-mode active\.[\s\S]*?<\/session_state>\n*/g,
+        "\n"
+      );
+      clean = clean
         .split("\n")
         .filter((l: string) =>
           !l.includes("context-mode active") &&
