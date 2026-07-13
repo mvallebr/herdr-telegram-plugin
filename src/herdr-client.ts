@@ -70,7 +70,7 @@ export function getAgents(): PaneInfo[] {
 }
 
 export function buildSendTextArgs(paneId: string, text: string): string[] {
-  return ["pane", "send-text", paneId, text];
+  return ["pane", "run", paneId, text];
 }
 
 export function sendText(paneId: string, text: string): void {
