@@ -184,6 +184,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   // Digest: ask the current pane's agent for a summary
   tg.bot.command("digest", async (ctx) => {
+    log.info("digest: command FIRED", {
+      hasMessage: !!ctx.message,
+      hasReply: typeof ctx.reply === "function",
+    });
     log.info("digest: command received", {
       threadId: ctx.message?.message_thread_id,
       chatId: ctx.chat.id,
