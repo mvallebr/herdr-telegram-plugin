@@ -18,26 +18,43 @@ function execHerdr(args: string[]): void {
   execSync([herdrBin(), ...args].join(" "), { encoding: "utf8", timeout: 30_000 });
 }
 
-export function parseAgentList(raw: string): PaneInfo[] {
+export function parseAgentList(raw: string, tabLabels?: Map<string, string>): PaneInfo[] {
   try {
     const parsed = JSON.parse(raw);
     const agents: any[] = parsed?.result?.agents ?? [];
-    return agents.map((a: any) => ({
-      pane_id: String(a.pane_id),
-      label: a.foreground_cwd?.split("/").pop() ?? "?",
-      agent: a.agent ?? "?",
-      tab_id: String(a.tab_id),
-      workspace_id: String(a.workspace_id),
-      status: String(a.agent_status || "unknown") as PaneInfo["status"],
-    }));
+    return agents.map((a: any) => {
+      const tabId = String(a.tab_id);
+      // Prefer tab label from herdr tab list, fall back to cwd dirname
+      const label = tabLabels?.get(tabId) ?? a.foreground_cwd?.split("/").pop() ?? "?";
+      return {
+        pane_id: String(a.pane_id),
+        label,
+        agent: a.agent ?? "?",
+        tab_id: tabId,
+        workspace_id: String(a.workspace_id),
+        status: String(a.agent_status || "unknown") as PaneInfo["status"],
+      };
+    });
   } catch {
     return [];
   }
 }
 
 export function getAgents(): PaneInfo[] {
+  // Fetch tab labels first
+  let tabLabels = new Map<string, string>();
+  try {
+    const tabRaw = execHerdrJson(["tab", "list"]);
+    const tabs = JSON.parse(tabRaw);
+    const tabItems: any[] = tabs?.result?.tabs ?? [];
+    for (const t of tabItems) {
+      if (t.tab_id && t.label) tabLabels.set(String(t.tab_id), String(t.label));
+    }
+  } catch {
+    // Tab list failed — fall back to cwd dirnames
+  }
   const raw = execHerdrJson(["agent", "list"]);
-  return parseAgentList(raw);
+  return parseAgentList(raw, tabLabels);
 }
 
 export function buildSendTextArgs(paneId: string, text: string): string[] {
