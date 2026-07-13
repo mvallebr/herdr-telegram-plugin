@@ -98,10 +98,32 @@ export async function syncTabs(
         if (mapping) mapping.label = pane.label;
         renamed.push(`${pane.label} (tab ${pane.tab_id})`);
       } catch (err: any) {
-        log.warn("watcher: failed to rename topic", {
-          pane: pane.label,
-          error: err.message,
-        });
+        // If topic was deleted (manually or otherwise), recreate it
+        if (err.message?.includes("TOPIC_ID_INVALID")) {
+          try {
+            const newThreadId = await tg.createForumTopic(chatId, pane.label);
+            knownTabs[pane.tab_id] = { label: pane.label, thread_id: newThreadId };
+            state.thread_mappings[newThreadId] = {
+              pane_id: pane.pane_id,
+              label: pane.label,
+              agent: pane.agent,
+              created_at: new Date().toISOString(),
+            };
+            // Drop the stale thread_id mapping
+            delete state.thread_mappings[existing.thread_id];
+            added.push(`${pane.label} (recreated, tab ${pane.tab_id})`);
+          } catch (err2: any) {
+            log.warn("watcher: failed to recreate topic", {
+              pane: pane.label,
+              error: err2.message,
+            });
+          }
+        } else {
+          log.warn("watcher: failed to rename topic", {
+            pane: pane.label,
+            error: err.message,
+          });
+        }
       }
     }
   }
