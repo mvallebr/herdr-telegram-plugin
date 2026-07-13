@@ -9,7 +9,11 @@ export class TelegramClient {
   }
 
   start(): void {
-    this.bot.start();
+    this.bot.start({
+      onStart: () => {
+        // grammy logging is handled by our logger
+      },
+    });
   }
 
   async createForumTopic(chatId: number, name: string): Promise<number> {
