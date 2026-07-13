@@ -1,3 +1,0 @@
-Task 1 implementation complete with `DONE_WITH_CONCERNS`. The scaffold is in place (commit `8f0fbea`), and I've documented a brief defect: `npm run build` cannot pass with empty `src/` due to TypeScript's TS18003. Lockfile needed to be added (not in brief) since herdr's `[[build]]` uses `npm ci`. Task 2 will resolve the TS18003 issue once real `.ts` files exist.
-
-Report written to `/home/mvallebr/git/human_infra/.superpowers/sdd/task-1-report.md`.
