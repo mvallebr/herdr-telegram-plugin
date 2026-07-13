@@ -184,15 +184,21 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   // Unpair (reset state)
   tg.bot.command("unpair", async (ctx) => {
-    if (!isPaired(state)) {
-      await ctx.reply("Not paired.");
-      return;
+    log.info("unpair command received", { from: ctx.chat?.id });
+    try {
+      if (!isPaired(state)) {
+        await ctx.reply("Not paired.");
+        return;
+      }
+      saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {} });
+      state = loadState(statePath);
+      deps.map.clear();
+      deps.chatId = 0;
+      await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
+    } catch (err: any) {
+      log.error("unpair failed", { error: err.message });
+      await ctx.reply("Unpair failed: " + err.message);
     }
-    saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {} });
-    state = loadState(statePath);
-    deps.map.clear();
-    deps.chatId = 0;
-    await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
   });
 
   // Re-reconcile (re-create topics for any unmapped panes)
