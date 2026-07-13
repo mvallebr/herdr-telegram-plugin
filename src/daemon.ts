@@ -3,7 +3,7 @@ import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping } from "./mapping.js";
 import { runAgentTurn } from "./wait-loop.js";
-import { getAgents } from "./herdr-client.js";
+import { getAgents, readPane } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -69,6 +69,24 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   registerCommands(tg.bot, deps);
 
+  /** Send the last few lines of each pane's output as the first message in its topic. */
+  async function seedTopics(
+    newMap: Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>,
+    chatId: number
+  ): Promise<void> {
+    for (const [threadId, mapping] of newMap.entries()) {
+      try {
+        const output = readPane(mapping.pane_id, 5);
+        if (output.trim()) {
+          const truncated = output.length > 2000 ? output.slice(-2000) : output;
+          await tg.sendMessage(chatId, threadId, `📋 *${mapping.label}*\n\n\`\`\`\n${truncated}\n\`\`\``);
+        }
+      } catch {
+        // Pane may be busy or unreadable — skip
+      }
+    }
+  }
+
   // Catch-all message handler (highest priority) for commands that must always work
   tg.bot.on("message", async (ctx, next) => {
     const text = ctx.message?.text ?? "";
@@ -127,6 +145,8 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       const rawMappings: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
       saveState(statePath, { ...state, thread_mappings: rawMappings });
+      // Seed topics with last output (fire-and-forget — don't block reply)
+      seedTopics(newMap, chatId).catch(() => {});
       const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
       const parts = [`Reconciled: ${newMap.size} panes mapped.`];
       if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
@@ -275,6 +295,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
     saveState(statePath, { ...state, thread_mappings: rawMappings });
+    seedTopics(newMap, chatId).catch(() => {});
     const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
     const parts = [`Reconciled: ${newMap.size} panes mapped.`];
     if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);
