@@ -36,7 +36,7 @@ describe("parseAgentList", () => {
 describe("buildSendTextArgs", () => {
   it("builds correct args tuple", () => {
     expect(buildSendTextArgs("w1:pZ", "hello world")).toEqual([
-      "pane", "send-text", "w1:pZ", "hello world",
+      "pane", "run", "w1:pZ", "hello world",
     ]);
   });
 });
