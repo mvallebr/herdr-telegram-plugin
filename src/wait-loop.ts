@@ -40,9 +40,20 @@ export async function runAgentTurn(
 
     if (result.status === "idle") {
       const content = readPane(paneId, maxOutputLines);
-      const truncated = content.length > 3900
-        ? content.slice(0, 3900) + `\n\n... (truncated, ${content.length} chars total)`
-        : content;
+      // Strip common noise from final output
+      const clean = content
+        .split("\n")
+        .filter((l: string) =>
+          !l.includes("context-mode active") &&
+          !l.startsWith("<session_state") &&
+          !l.startsWith("<session_mode") &&
+          !l.startsWith("</session_state>") &&
+          !l.match(/^ctx_\w+ >/)
+        )
+        .join("\n");
+      const truncated = clean.length > 3900
+        ? clean.slice(0, 3900) + `\n\n... (truncated, ${content.length} chars total)`
+        : clean;
       await tg.sendMessage(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${truncated}`);
       break;
     }
@@ -50,9 +61,20 @@ export async function runAgentTurn(
     if (result.status === "timeout") {
       if (shouldThrottle(lastSent, cfg.throttleMs)) continue;
       const content = readPane(paneId, 15);
-      const truncated = content.length > 2000
-        ? content.slice(0, 2000) + "..."
-        : content;
+      // Strip common noise from progress updates
+      const clean = content
+        .split("\n")
+        .filter((l: string) =>
+          !l.includes("context-mode active") &&
+          !l.startsWith("<session_state") &&
+          !l.startsWith("<session_mode") &&
+          !l.startsWith("</session_state>") &&
+          !l.match(/^ctx_\w+ >/)
+        )
+        .join("\n");
+      const truncated = clean.length > 2000
+        ? clean.slice(0, 2000) + "..."
+        : clean;
       await tg.sendMessage(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, { disable_notification: true });
       lastSent = Date.now();
     }
