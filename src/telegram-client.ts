@@ -52,9 +52,7 @@ export class TelegramClient {
 
     try {
       const chat = await this.bot.api.getChat(chatId);
-      // DEBUG: dump full chat object to stderr when is_forum is falsy
       if (!chat.is_forum) {
-        console.error("[DEBUG] getChat response:", JSON.stringify({ type: chat.type, is_forum: chat.is_forum, keys: Object.keys(chat) }));
         errors.push(
           "Topics are not enabled. Enable them in Group Settings → Topics."
         );
