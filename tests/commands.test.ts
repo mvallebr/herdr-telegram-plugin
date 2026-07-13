@@ -25,6 +25,6 @@ describe("formatStatus", () => {
       panesCount: 3,
     });
     expect(result).toContain("10s");
-    expect(result).toContain("3 agent");
+    expect(result).toContain("panes: 3");
   });
 });
