@@ -1,4 +1,4 @@
-import type { DaemonState, PaneInfo } from "./types.js";
+import type { DaemonState, PaneInfo, ThreadMapping } from "./types.js";
 import type { TelegramClient } from "./telegram-client.js";
 import { getAgents, readPane } from "./herdr-client.js";
 import { createLogger } from "./logger.js";
@@ -219,7 +219,8 @@ export function startWatcher(
   state: DaemonState,
   saveState: () => void,
   intervalMs: number = 30_000,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  deps?: { map: Map<number, ThreadMapping> }
 ): void {
   let tickCount = 0;
   const HEALTH_CHECK_EVERY = 2; // every 2 ticks (2 * 30s = 1min)
