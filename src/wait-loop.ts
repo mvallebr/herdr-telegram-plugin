@@ -216,6 +216,7 @@ export async function runAgentTurn(
   let lastChangeAt = deps.now();
   let sawChange = false;
   let lastProgressSentAt = 0;
+  let progressCount = 0;
 
   // Phase 1: wait for the pane to start changing from the post-send snapshot.
   // The agent needs to pick up the input — this can take a few seconds.
@@ -265,16 +266,24 @@ export async function runAgentTurn(
         // Send a progress update (throttled)
         const elapsedMs = deps.now() - startTime;
         if (deps.now() - lastProgressSentAt > cfg.throttleMs) {
+          progressCount++;
+          const limited = cfg.maxProgressUpdates > 0 && progressCount >= cfg.maxProgressUpdates;
           const clean = cleanPaneOutput(current);
           const soFar = extractResponseSince(clean, text);
-          const truncated = soFar.length > 2000
+          // On the last allowed update, include a "giving up" prefix
+          const prefix = limited ? "⚠️ Agent didn't respond in time.\n\n" : "";
+          const body = soFar.length > 2000
             ? soFar.slice(0, 2000) + "..."
             : soFar;
+          const truncated = limited
+            ? `${prefix}${body}\n\nTry /digest for a summary.`
+            : body;
           const elapsed = Math.floor(elapsedMs / 1000);
           await sendMsg(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, {
             disable_notification: true,
           });
           lastProgressSentAt = deps.now();
+          if (limited) return;
         }
       } else {
         // Only status bar changed — update lastContent silently so

@@ -24,6 +24,7 @@ describe("loadConfig", () => {
     expect(cfg.botToken).toBe("test-token-123");
     expect(cfg.chatId).toBeNull();
     expect(cfg.throttleMs).toBe(60_000);
+    expect(cfg.maxProgressUpdates).toBe(60);
   });
 
   it("prefers env var over file", () => {

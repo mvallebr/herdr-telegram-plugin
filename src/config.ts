@@ -8,6 +8,8 @@ export interface Config {
   throttleMs: number;
   waitTimeoutS: number;
   maxTotalWaitS: number;
+  /** Max Working progress updates before giving up (-1 = unlimited). Default 60. */
+  maxProgressUpdates: number;
 }
 
 function parseTomlLine(line: string): [string, string] | null {
@@ -30,6 +32,7 @@ export function loadConfig(configDir?: string): Config {
   let fileThrottleMs = 60_000;
   let fileWaitTimeoutS = 300;
   let fileMaxTotalWaitS = 1800;
+  let fileMaxProgressUpdates = 60;
 
   if (fs.existsSync(filePath)) {
     const lines = fs.readFileSync(filePath, "utf8").split("\n");
@@ -47,6 +50,7 @@ export function loadConfig(configDir?: string): Config {
         else if (kv[0] === "throttle_ms") fileThrottleMs = parseInt(kv[1], 10);
         else if (kv[0] === "wait_timeout_s") fileWaitTimeoutS = parseInt(kv[1], 10);
         else if (kv[0] === "max_total_wait_s") fileMaxTotalWaitS = parseInt(kv[1], 10);
+        else if (kv[0] === "max_progress_updates") fileMaxProgressUpdates = parseInt(kv[1], 10);
       } else if (kv[0] === "bot_token") {
         fileBotToken = kv[1];
       }
@@ -71,5 +75,6 @@ export function loadConfig(configDir?: string): Config {
     throttleMs: fileThrottleMs,
     waitTimeoutS: fileWaitTimeoutS,
     maxTotalWaitS: fileMaxTotalWaitS,
+    maxProgressUpdates: fileMaxProgressUpdates,
   };
 }

@@ -24,6 +24,7 @@ const dummyCfg = {
   waitTimeoutS: 1,
   throttleMs: 100,
   maxTotalWaitS: 30,
+  maxProgressUpdates: -1, // unlimited for tests
 };
 
 describe("shouldThrottle", () => {
