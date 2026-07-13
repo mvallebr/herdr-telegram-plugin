@@ -369,7 +369,8 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       state,
       saveStateCallback,
       15_000,
-      watcherController.signal
+      watcherController.signal,
+      deps
     );
   }
   deps.stopWatcher = () => watcherController.abort();
