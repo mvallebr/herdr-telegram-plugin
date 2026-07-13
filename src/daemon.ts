@@ -35,13 +35,22 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   }
 
   const map = isPaired(state) && state.authorized_chat_id
-    ? await reconcile(state.authorized_chat_id!, tg)
+    ? await reconcile(
+        state.authorized_chat_id!,
+        tg,
+        new Map(), // no existing mappings on cold start
+        state.known_topics ?? {}
+      )
     : new Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>();
 
-  // Persist initial mapping
+  // Persist initial mapping (and any newly tracked known_topics)
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
-  saveState(statePath, { ...state, thread_mappings: rawMappings });
+  saveState(statePath, {
+    ...state,
+    thread_mappings: rawMappings,
+    known_topics: state.known_topics ?? {},
+  });
 
   const deps: CommandDeps = {
     map,
@@ -51,7 +60,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of deps.map.entries()) raw[tid] = m;
-      saveState(statePath, { ...state, thread_mappings: raw });
+      saveState(statePath, {
+        ...state,
+        thread_mappings: raw,
+        known_topics: state.known_topics ?? {},
+      });
     },
   };
 
@@ -204,11 +217,15 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     }
     const chatId = state.authorized_chat_id;
     await ctx.reply("Reconciling...");
-    const newMap = await reconcile(chatId, tg, deps.map);
+    const newMap = await reconcile(chatId, tg, deps.map, state.known_topics ?? {});
     for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
-    saveState(statePath, { ...state, thread_mappings: rawMappings });
+    saveState(statePath, {
+      ...state,
+      thread_mappings: rawMappings,
+      known_topics: state.known_topics ?? {},
+    });
     const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
     const parts = [`Reconciled: ${newMap.size} panes mapped.`];
     if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} duplicate(s): ${result.deleted.join(", ")}`);

@@ -43,7 +43,8 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/agents — list agents with status and bound threads",
         "/bind <pane-label> — bind this thread to a pane (use in a new thread)",
         "/unbind — unbind this thread",
-        "/cleanup — list bound vs unbound topics (delete duplicates in Telegram UI)",
+        "/topics — list bound topic ids (use /delete <id> to remove)",
+        "/delete <id> — delete a forum topic by its thread id",
         "/unpair — reset pairing (re-authorize with /pair)",
         "/status — bridge uptime and connection info",
         "/interrupt — send Ctrl+C to this thread's agent",
@@ -154,5 +155,39 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     deps.map.delete(threadId);
     deps.saveMappings();
     await ctx.reply(`Unbound thread from ${mapping.label}.`);
+  });
+
+  bot.command("topics", async (ctx) => {
+    if (deps.map.size === 0) {
+      await ctx.reply("No bound topics.");
+      return;
+    }
+    const lines: string[] = ["Bound topics:"];
+    for (const [tid, m] of deps.map.entries()) {
+      lines.push(`  #${tid} → ${m.label} (${m.agent})`);
+    }
+    await ctx.reply(lines.join("\n") + "\n\nUse /delete <id> to remove a topic by id.");
+  });
+
+  bot.command("delete", async (ctx) => {
+    const arg = (ctx.match ?? "").trim();
+    const threadId = parseInt(arg, 10);
+    if (!threadId || isNaN(threadId)) {
+      await ctx.reply("Usage: /delete <thread_id>\n\nGet thread ids from /topics or Telegram UI (long-press a topic to see its id).");
+      return;
+    }
+    const wasBound = deps.map.has(threadId);
+    try {
+      await ctx.api.deleteForumTopic(ctx.chat.id, threadId);
+      if (wasBound) {
+        deps.map.delete(threadId);
+        deps.saveMappings();
+        await ctx.reply(`Deleted bound topic #${threadId} and removed mapping.`);
+      } else {
+        await ctx.reply(`Deleted topic #${threadId}.`);
+      }
+    } catch (err: any) {
+      await ctx.reply(`Failed to delete #${threadId}: ${err.message}`);
+    }
   });
 }
