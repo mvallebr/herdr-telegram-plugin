@@ -52,10 +52,6 @@ export class TelegramClient {
 
     try {
       const chat = await this.bot.api.getChat(chatId);
-      if (chat.type !== "supergroup") {
-        errors.push("Chat must be a supergroup");
-        return errors;
-      }
       if (!(chat as any).is_forum) {
         errors.push(
           "Topics are not enabled. Enable them in Group Settings → Topics."
