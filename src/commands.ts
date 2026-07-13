@@ -95,32 +95,7 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
   });
 
   bot.command("digest", async (ctx) => {
-    const panes = getAgents();
-    if (panes.length === 0) {
-      await ctx.reply("No agents active.");
-      return;
-    }
-    const icons: Record<string, string> = {
-      working: "🔵", idle: "🟢", blocked: "🔴", unknown: "⚪",
-    };
-    const lines: string[] = [`📊 *Digest* — ${panes.length} agents\n`];
-    for (const p of panes) {
-      const icon = icons[p.status] ?? "⚪";
-      let output = "";
-      try {
-        output = readPane(p.pane_id, 8).trim();
-      } catch {
-        output = "(could not read pane)";
-      }
-      lines.push(`${icon} *${p.label}* (${p.agent}) — ${p.status}`);
-      if (output) {
-        const truncated = output.length > 400 ? output.slice(0, 400) + "..." : output;
-        lines.push("```");
-        lines.push(truncated);
-        lines.push("```");
-      }
-    }
-    await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
+    await ctx.reply("Use /digest inside a bound thread.");
   });
 
   bot.command("bind", async (ctx) => {
