@@ -60,7 +60,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   // Pairing flow
   tg.bot.command("pair", async (ctx) => {
     if (isPaired(state)) {
-      await ctx.reply("Already paired. Delete state.json to re-pair.");
+      await ctx.reply("Already paired. Send /unpair first to re-pair with a different chat.");
       return;
     }
     const chatId = ctx.chat.id;
@@ -147,6 +147,45 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     deps.saveMappings();
     await ctx.answerCallbackQuery({ text: `Bound to ${pane.label}` });
     await ctx.editMessageText(`Bound this thread to ${pane.label} (${pane.agent}). Send a message to start.`);
+  });
+
+  // Unpair (reset state)
+  tg.bot.command("unpair", async (ctx) => {
+    if (!isPaired(state)) {
+      await ctx.reply("Not paired.");
+      return;
+    }
+    saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {} });
+    state = loadState(statePath);
+    deps.map.clear();
+    deps.chatId = 0;
+    await ctx.reply("Unpaired. Send /pair to re-authorize this chat.");
+  });
+
+  // Re-reconcile (re-create topics for any unmapped panes)
+  tg.bot.command("reconcile", async (ctx) => {
+    if (!isPaired(state) || !state.authorized_chat_id) {
+      await ctx.reply("Not paired.");
+      return;
+    }
+    const chatId = state.authorized_chat_id;
+    await ctx.reply("Reconciling...");
+    const newMap = await reconcile(chatId, tg);
+    for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
+    const rawMappings: DaemonState["thread_mappings"] = {};
+    for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
+    saveState(statePath, { ...state, thread_mappings: rawMappings });
+    const result = (reconcile as any).lastResult as { created: string[]; failed: string[]; total: number } | undefined;
+    if (result && result.failed.length > 0) {
+      await ctx.reply(
+        `Reconciled: ${newMap.size} panes mapped.\n` +
+        `Auto-created ${result.created.length} topics.\n` +
+        `Could not auto-create: ${result.failed.join(", ")}\n` +
+        `For those, create a thread via Telegram UI and use /bind <pane-label>.`
+      );
+    } else {
+      await ctx.reply(`Reconciled: ${newMap.size} topics mapped.`);
+    }
   });
 
   tg.start();
