@@ -42,7 +42,8 @@ export function loadConfig(configDir?: string): Config {
       const kv = parseTomlLine(line);
       if (!kv) continue;
       if (inTelegram) {
-        if (kv[0] === "chat_id") fileChatId = parseInt(kv[1], 10);
+        if (kv[0] === "bot_token") fileBotToken = kv[1];
+        else if (kv[0] === "chat_id") fileChatId = parseInt(kv[1], 10);
         else if (kv[0] === "throttle_ms") fileThrottleMs = parseInt(kv[1], 10);
         else if (kv[0] === "wait_timeout_s") fileWaitTimeoutS = parseInt(kv[1], 10);
         else if (kv[0] === "max_total_wait_s") fileMaxTotalWaitS = parseInt(kv[1], 10);
