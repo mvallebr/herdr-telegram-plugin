@@ -21,7 +21,8 @@ export async function runAgentTurn(
   text: string,
   cfg: Config,
   tg: TelegramClient,
-  chatId: number
+  chatId: number,
+  maxOutputLines: number = 200
 ): Promise<void> {
   sendText(paneId, text);
 
@@ -38,7 +39,7 @@ export async function runAgentTurn(
     const result = waitIdle(paneId, cfg.waitTimeoutS);
 
     if (result.status === "idle") {
-      const content = readPane(paneId, 200);
+      const content = readPane(paneId, maxOutputLines);
       const truncated = content.length > 3900
         ? content.slice(0, 3900) + `\n\n... (truncated, ${content.length} chars total)`
         : content;
