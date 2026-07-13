@@ -184,6 +184,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   // Digest: ask the current pane's agent for a summary
   tg.bot.command("digest", async (ctx) => {
+    log.info("digest: command received", {
+      threadId: ctx.message?.message_thread_id,
+      chatId: ctx.chat.id,
+    });
     if (!isPaired(state) || !state.authorized_chat_id) {
       await ctx.reply("Not paired.");
       return;
@@ -194,6 +198,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       return;
     }
     const mapping = findMapping(threadId, deps.map);
+    log.info("digest: mapping", {
+      threadId,
+      found: !!mapping,
+      label: mapping?.label,
+    });
     if (!mapping) return; // unbound thread — ignore
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
     await runAgentTurn(
@@ -235,6 +244,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   // Handle plain text (routed via thread_id)
   tg.bot.on("message:text", async (ctx) => {
+    log.info("message:text received", {
+      threadId: ctx.message?.message_thread_id,
+      chatId: ctx.chat.id,
+      text: ctx.message.text?.slice(0, 50),
+    });
     if (!isPaired(state) || !state.authorized_chat_id) return;
 
     const chatId = ctx.chat.id;
