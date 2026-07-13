@@ -27,7 +27,7 @@ export function loadConfig(configDir?: string): Config {
 
   let fileBotToken = "";
   let fileChatId: number | null = null;
-  let fileThrottleMs = 3000;
+  let fileThrottleMs = 60_000;
   let fileWaitTimeoutS = 300;
   let fileMaxTotalWaitS = 1800;
 

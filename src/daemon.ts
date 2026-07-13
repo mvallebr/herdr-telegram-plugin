@@ -211,7 +211,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
     await runAgentTurn(
       mapping.pane_id, threadId,
-      "Keep it under 1000 characters. In one short paragraph, summarize what we've been working on: original goal, progress, blockers, next steps.",
+      "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
       cfg, tg, state.authorized_chat_id!,
       50 // read only last 50 lines to avoid stale context-mode banners
     );

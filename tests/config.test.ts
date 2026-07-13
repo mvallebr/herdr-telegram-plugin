@@ -23,7 +23,7 @@ describe("loadConfig", () => {
     const cfg = loadConfig(tmpDir);
     expect(cfg.botToken).toBe("test-token-123");
     expect(cfg.chatId).toBeNull();
-    expect(cfg.throttleMs).toBe(3000);
+    expect(cfg.throttleMs).toBe(60_000);
   });
 
   it("prefers env var over file", () => {
