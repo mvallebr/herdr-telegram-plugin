@@ -1,4 +1,4 @@
-import { execSync, spawn, type ChildProcess } from "node:child_process";
+import { execSync, spawnSync, spawn, type ChildProcess } from "node:child_process";
 import type { PaneInfo } from "./types.js";
 
 const DEFAULT_HERDR_BIN = "herdr";
@@ -8,14 +8,24 @@ export function herdrBin(): string {
 }
 
 function execHerdrJson(args: string[]): string {
-  return execSync([herdrBin(), ...args].join(" "), {
+  const result = spawnSync(herdrBin(), args, {
     encoding: "utf8",
     timeout: 30_000,
-  }).trim();
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr.trim() || `herdr exited with ${result.status}`);
+  return result.stdout.trim();
 }
 
 function execHerdr(args: string[]): void {
-  execSync([herdrBin(), ...args].join(" "), { encoding: "utf8", timeout: 30_000 });
+  const result = spawnSync(herdrBin(), args, {
+    encoding: "utf8",
+    timeout: 30_000,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr.trim() || `herdr exited with ${result.status}`);
 }
 
 export function parseAgentList(raw: string, tabLabels?: Map<string, string>): PaneInfo[] {
