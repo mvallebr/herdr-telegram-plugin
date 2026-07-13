@@ -159,6 +159,27 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await next();
   });
 
+  // Digest: ask the current pane's agent for a summary
+  tg.bot.command("digest", async (ctx) => {
+    if (!isPaired(state) || !state.authorized_chat_id) {
+      await ctx.reply("Not paired.");
+      return;
+    }
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply("Use /digest inside a thread to ask that pane's agent for a summary.");
+      return;
+    }
+    const mapping = findMapping(threadId, deps.map);
+    if (!mapping) return; // unbound thread — ignore
+    await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
+    await runAgentTurn(
+      mapping.pane_id, threadId,
+      "Give me a concise summary of what we've been working on in this session. Include: original goal, progress made, blockers, and next steps.",
+      cfg, tg, state.authorized_chat_id!
+    );
+  });
+
   // Pairing flow (grammy command handler — kept for when grammy works)
   tg.bot.command("pair", async (ctx) => {
     if (isPaired(state)) {
