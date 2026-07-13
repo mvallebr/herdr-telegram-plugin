@@ -1,6 +1,6 @@
 import type { Config } from "./config.js";
 import type { TelegramClient } from "./telegram-client.js";
-import { sendText, waitIdle, readPane } from "./herdr-client.js";
+import { sendText, readPane } from "./herdr-client.js";
 
 export function shouldThrottle(lastSentAt: number, throttleMs: number): boolean {
   return Date.now() - lastSentAt < throttleMs;
@@ -32,96 +32,71 @@ export function cleanPaneOutput(content: string): string {
         !l.startsWith("</session_state>") &&
         !l.match(/^ctx_\w+ >/) &&
         !l.match(/^[─━═]{20,}/) &&
-        // Lines that contain a long run of separator chars anywhere
         !l.match(/[─━═]{20,}/) &&
         l.length < 300
     )
     .join("\n");
 }
 
-/** Given the baseline content (before sending text) and the current pane content,
- *  return only the lines that are new (the agent's response).
- *  This handles the case where the pane is in "done" status and waitIdle returns
- *  immediately — without this, we'd send the entire pane history.
- *
- *  Strategy: find the longest suffix of `baseline` that appears as a contiguous
- *  block in `current`. The lines AFTER that block in current are the new content.
- *
- *  Edge cases:
- *  - baseline empty → return current
- *  - baseline === current → return ""
- *  - baseline is a prefix of current: suffix of baseline = entire baseline, appears at
- *    start of current. Return current[baseline.length:].
- *  - pane scrolled past baseline entirely: no match → return current.
+/**
+ * Extract the agent's response from the pane content by anchoring on the
+ * user's last input line. More robust than baseline-diff because it doesn't
+ * depend on exact line-matching against a pre-send snapshot (which breaks
+ * when the pane scrolls or separators are cleaned).
  */
-export function diffFromBaseline(
-  baseline: string,
-  current: string
+export function extractResponseSince(
+  content: string,
+  userInput: string
 ): string {
-  if (!baseline) return current;
-  if (baseline === current) return "";
-  const baselineLines = baseline.split("\n");
-  const currentLines = current.split("\n");
+  const lines = content.split("\n");
 
-  // Try the longest suffix of baselineLines first; shrink until it appears in currentLines.
-  for (let len = baselineLines.length; len >= 1; len--) {
-    const suffix = baselineLines.slice(baselineLines.length - len);
-    // Find `suffix` as a contiguous block in currentLines, scanning from the start.
-    for (let start = 0; start <= currentLines.length - len; start++) {
-      let match = true;
-      for (let k = 0; k < len; k++) {
-        if (currentLines[start + k] !== suffix[k]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        // Pick the LAST match (latest in current) — that's where new content begins.
-        // Continue scanning for a later match at the same or shorter suffix length.
-        // We actually want the LAST occurrence overall, so keep going.
-        // Optimization: keep track of best match and continue.
-        // For simplicity here, we do a full scan; for typical input (≤200 lines) this is fast.
-      }
+  // Use the last non-blank line of the user's input as the anchor.
+  const userLines = userInput.split("\n").filter((l) => l.trim().length > 0);
+  const anchor = userLines.length > 0 ? userLines[userLines.length - 1] : userInput;
+
+  // Find the LAST line in the pane that contains the anchor text.
+  let anchorIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].includes(anchor)) {
+      anchorIdx = i;
+      break;
     }
   }
-  // Refined scan: find the LAST occurrence of the longest matching suffix in current.
-  let bestStart = -1;
-  let bestLen = 0;
-  for (let len = baselineLines.length; len >= 1; len--) {
-    const suffix = baselineLines.slice(baselineLines.length - len);
-    for (let start = currentLines.length - len; start >= 0; start--) {
-      let match = true;
-      for (let k = 0; k < len; k++) {
-        if (currentLines[start + k] !== suffix[k]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) {
-        if (len > bestLen || (len === bestLen && start > bestStart)) {
-          bestStart = start;
-          bestLen = len;
-        }
-        break; // found the latest match for this length; try shorter
-      }
+  if (anchorIdx < 0) return "";
+
+  let after = lines.slice(anchorIdx + 1);
+
+  // Trim trailing noise: empty lines, separator runs, status-bar refreshes
+  while (after.length > 0) {
+    const last = after[after.length - 1];
+    if (
+      last.trim() === "" ||
+      /^[─━═]{20,}/.test(last.trim()) ||
+      /^.{3,} · /.test(last.trim()) ||            // status bar (any 3+ chars then middle-dot then space)
+      /^Model: /.test(last.trim())                 // "Model: deepseek-v4-flash" etc.
+    ) {
+      after.pop();
+    } else {
+      break;
     }
   }
-  if (bestStart < 0) return current;
-  // Everything in current BEFORE the matched block (bestStart..bestStart+bestLen) is "old".
-  // Everything in current AFTER the matched block is "new".
-  // But the prefix [0..bestStart-1] may also contain interleaved old lines (they're not new).
-  // For simplicity, return the suffix AFTER the match. This assumes no interleaving.
-  return currentLines.slice(bestStart + bestLen).join("\n");
+
+  // Trim leading blank lines
+  while (after.length > 0 && after[0].trim() === "") {
+    after.shift();
+  }
+
+  return after.join("\n");
+}
+
+/** Sleep for ms milliseconds. Exposed for tests. */
+export function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 export interface WaitLoopDeps {
   /** Send text to the pane (text + Enter). */
   sendText: (paneId: string, text: string) => void;
-  /** Wait for the pane to become idle. Returns the status observed. */
-  waitIdle: (
-    paneId: string,
-    timeoutS: number
-  ) => { status: "idle" | "blocked" | "timeout" };
   /** Read recent output from the pane. */
   readPane: (paneId: string, lines: number) => string;
   /** Send a message to Telegram. */
@@ -131,26 +106,45 @@ export interface WaitLoopDeps {
     text: string,
     opts?: { disable_notification?: boolean }
   ) => Promise<number>;
+  /** Sleep for ms milliseconds. */
+  sleep: (ms: number) => Promise<void>;
+  /** Now in ms (override for tests). */
+  now: () => number;
 }
 
 export const defaultWaitLoopDeps: WaitLoopDeps = {
   sendText,
-  waitIdle,
   readPane,
-  // sendMessage is provided per-call from the TelegramClient passed to runAgentTurn.
-  // The default below is a no-op so calling without overrides fails loudly if used.
   sendMessage: async () => {
     throw new Error("sendMessage not provided — pass a TelegramClient to runAgentTurn");
   },
+  sleep,
+  now: () => Date.now(),
 };
 
 export interface RunAgentTurnOptions {
-  /** Lines to read from the pane at idle (default 200). */
+  /** Lines to read from the pane (default 200). */
   maxOutputLines?: number;
+  /** How often to poll the pane for changes (ms, default 1000). */
+  pollIntervalMs?: number;
+  /** How long the pane must be stable (no changes) before considering the
+   *  response complete (ms, default 3000). */
+  stabilityWindowMs?: number;
   /** Override the dependencies (for testing). */
   deps?: Partial<WaitLoopDeps>;
 }
 
+/**
+ * Send text to an agent pane, wait for it to finish responding, and post the
+ * response back to Telegram.
+ *
+ * Strategy: send the text, then poll the pane periodically. The response is
+ * considered complete when the pane content has been stable (unchanged) for
+ * `stabilityWindowMs` AND we've seen at least one change from the initial
+ * post-send snapshot. The response is extracted by anchoring on the user's
+ * last input line instead of computing a line-level diff from a baseline.
+ * This avoids relying on herdr's (sometimes inaccurate) agent_status field.
+ */
 export async function runAgentTurn(
   paneId: string,
   threadId: number,
@@ -164,7 +158,6 @@ export async function runAgentTurn(
     typeof maxOutputLinesOrOptions === "number"
       ? { maxOutputLines: maxOutputLinesOrOptions }
       : maxOutputLinesOrOptions;
-  // Build sendMessage: use deps override if provided, otherwise call tg.sendMessage.
   const tgSendMessage = async (
     c: number,
     t: number,
@@ -174,63 +167,105 @@ export async function runAgentTurn(
   const sendMsg = opts.deps?.sendMessage ?? tgSendMessage;
   const deps: WaitLoopDeps = {
     sendText: opts.deps?.sendText ?? sendText,
-    waitIdle: opts.deps?.waitIdle ?? waitIdle,
     readPane: opts.deps?.readPane ?? readPane,
     sendMessage: sendMsg,
+    sleep: opts.deps?.sleep ?? sleep,
+    now: opts.deps?.now ?? defaultWaitLoopDeps.now,
   };
   const maxOutputLines = opts.maxOutputLines ?? 200;
+  const pollIntervalMs = opts.pollIntervalMs ?? 1000;
+  const stabilityWindowMs = opts.stabilityWindowMs ?? 3000;
 
-  // Capture baseline pane content BEFORE sending — we'll diff against this
-  // so we only return the agent's NEW response (not the entire pane history).
-  let baseline = "";
-  try {
-    baseline = deps.readPane(paneId, maxOutputLines);
-  } catch {
-    // Pane might not be readable — proceed without baseline
-  }
   deps.sendText(paneId, text);
 
-  let lastSent = 0;
-  const startTime = Date.now();
+  const startTime = deps.now();
 
-  while (true) {
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    if (elapsed >= cfg.maxTotalWaitS) {
-      await sendMsg(chatId, threadId, `⏳ Tempo limite excedido (${formatElapsed(elapsed)})`);
+  // Capture first snapshot AFTER sending text (the "before agent responds" state).
+  let lastContent = "";
+  try {
+    lastContent = deps.readPane(paneId, maxOutputLines);
+  } catch {
+    // Pane might not be readable — proceed with empty snapshot
+  }
+
+  let lastChangeAt = deps.now();
+  let sawChange = false;
+  let lastProgressSentAt = 0;
+
+  // Phase 1: wait for the pane to start changing from the post-send snapshot.
+  // The agent needs to pick up the input — this can take a few seconds.
+  while (deps.now() - startTime < cfg.maxTotalWaitS * 1000) {
+    await deps.sleep(pollIntervalMs);
+    let current = "";
+    try {
+      current = deps.readPane(paneId, maxOutputLines);
+    } catch {
+      continue;
+    }
+    if (current !== lastContent) {
+      sawChange = true;
+      lastContent = current;
+      lastChangeAt = deps.now();
       break;
     }
+    // Still no change — check timeout
+    if (deps.now() - startTime > cfg.maxTotalWaitS * 1000) break;
+  }
 
-    const result = deps.waitIdle(paneId, cfg.waitTimeoutS);
+  if (!sawChange) {
+    // No change at all — maybe the pane didn't pick up the input.
+    const elapsed = Math.floor((deps.now() - startTime) / 1000);
+    await sendMsg(chatId, threadId, `⚠️ No response from pane after ${formatElapsed(elapsed)}.`);
+    return;
+  }
 
-    if (result.status === "idle") {
-      const content = deps.readPane(paneId, maxOutputLines);
-      const clean = cleanPaneOutput(content);
-      const responseText = diffFromBaseline(baseline, clean);
-      const truncated = responseText.length > 3900
-        ? responseText.slice(0, 3900) + `\n\n... (truncated, ${responseText.length} chars total)`
-        : responseText;
-      await sendMsg(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${truncated}`);
-      break;
+  // Phase 2: wait for the pane to stabilize (no changes for stabilityWindowMs).
+  while (deps.now() - startTime < cfg.maxTotalWaitS * 1000) {
+    await deps.sleep(pollIntervalMs);
+    let current = "";
+    try {
+      current = deps.readPane(paneId, maxOutputLines);
+    } catch {
+      continue;
     }
-
-    if (result.status === "timeout") {
-      if (shouldThrottle(lastSent, cfg.throttleMs)) continue;
-      const content = deps.readPane(paneId, 15);
-      const clean = cleanPaneOutput(content);
-      const truncated = clean.length > 2000
-        ? clean.slice(0, 2000) + "..."
-        : clean;
-      await sendMsg(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, { disable_notification: true });
-      lastSent = Date.now();
+    if (current !== lastContent) {
+      // Pane changed — reset stability timer
+      lastContent = current;
+      lastChangeAt = deps.now();
+      // Send a progress update (throttled)
+      const elapsedMs = deps.now() - startTime;
+      if (deps.now() - lastProgressSentAt > cfg.throttleMs) {
+        const clean = cleanPaneOutput(current);
+        const soFar = extractResponseSince(clean, text);
+        const truncated = soFar.length > 2000
+          ? soFar.slice(0, 2000) + "..."
+          : soFar;
+        const elapsed = Math.floor(elapsedMs / 1000);
+        await sendMsg(chatId, threadId, `⏳ Working (${formatElapsed(elapsed)}):\n\n${truncated}`, {
+          disable_notification: true,
+        });
+        lastProgressSentAt = deps.now();
+      }
+      continue;
     }
-
-    if (result.status === "blocked") {
-      const content = deps.readPane(paneId, 30);
-      const truncated = content.length > 2000
-        ? content.slice(0, 2000) + "..."
-        : content;
-      await sendMsg(chatId, threadId, `⚠️ Blocked (tool approval):\n\n${truncated}`);
+    // Pane stable — check if stability window has elapsed
+    if (deps.now() - lastChangeAt >= stabilityWindowMs) {
       break;
     }
   }
+
+  // Phase 3: read final content, extract response, send to Telegram.
+  let finalContent = lastContent;
+  try {
+    finalContent = deps.readPane(paneId, maxOutputLines);
+  } catch {
+    // Use lastContent
+  }
+  const clean = cleanPaneOutput(finalContent);
+  const responseText = extractResponseSince(clean, text);
+  const truncated = responseText.length > 3900
+    ? responseText.slice(0, 3900) + `\n\n... (truncated, ${responseText.length} chars total)`
+    : responseText;
+  const elapsed = Math.floor((deps.now() - startTime) / 1000);
+  await sendMsg(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${truncated}`);
 }
