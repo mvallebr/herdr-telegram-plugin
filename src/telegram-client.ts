@@ -42,6 +42,12 @@ export class TelegramClient {
     }
   }
 
+  async sendChatAction(chatId: number, threadId: number): Promise<void> {
+    // Use 'typing' action; silent (no user-visible notification) and fails
+    // with TOPIC_ID_INVALID if the thread was deleted.
+    await this.bot.api.sendChatAction(chatId, "typing", { message_thread_id: threadId });
+  }
+
   async sendMessage(
     chatId: number,
     threadId: number,

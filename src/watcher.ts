@@ -164,8 +164,8 @@ export async function healthCheckTopics(
 
   for (const [tabId, entry] of Object.entries(knownTabs)) {
     try {
-      // Edit with same name — no-op for valid topics, but reveals stale ones.
-      await tg.editForumTopic(chatId, entry.thread_id, entry.label);
+      // Silent ping — no user-visible notification, but fails if thread was deleted.
+      await tg.sendChatAction(chatId, entry.thread_id);
     } catch (err: any) {
       if (err.message?.includes("TOPIC_ID_INVALID")) {
         // Topic was deleted — recreate it. We need the pane info to seed.
