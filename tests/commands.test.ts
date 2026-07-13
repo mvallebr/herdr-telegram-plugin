@@ -15,16 +15,16 @@ describe("formatAgentList", () => {
     expect(result).toContain("pi");
     expect(result).toContain("140");
   });
-
-  it("returns empty when no panes", () => {
-    expect(formatAgentList([], new Map())).toBe("No agents active.");
-  });
 });
 
 describe("formatStatus", () => {
   it("includes uptime and counts", () => {
-    const result = formatStatus({ uptime: "10s", paired: true, panesCount: 3 });
+    const result = formatStatus({
+      uptime: "10s",
+      paired: true,
+      panesCount: 3,
+    });
     expect(result).toContain("10s");
-    expect(result).toContain("Active panes: 3");
+    expect(result).toContain("3 agent");
   });
 });

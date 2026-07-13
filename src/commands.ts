@@ -73,7 +73,7 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     if (!threadId) return;
     const mapping = findMapping(threadId, deps.map);
     if (!mapping) { await ctx.reply("No pane for this topic."); return; }
-    sendText(mapping.pane_id, "\x03");
+    sendText(mapping.pane_id, "\x03"); // Ctrl+C
     await ctx.reply(`Interrupted ${mapping.label}`);
   });
 
