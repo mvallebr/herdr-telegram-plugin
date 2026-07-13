@@ -1,0 +1,28 @@
+id = "herdr-telegram-plugin"
+name = "Herdr Telegram Bridge"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Control your herdr agents from Telegram via forum topics. Zero-LLM bridge."
+platforms = ["linux"]
+
+[[build]]
+command = ["npm", "ci"]
+platforms = ["linux"]
+
+[[build]]
+command = ["npm", "run", "build"]
+platforms = ["linux"]
+
+[[actions]]
+id = "bootstrap"
+title = "Bootstrap daemon"
+command = ["node", "dist/index.js", "--daemon"]
+
+[[actions]]
+id = "status"
+title = "Daemon status"
+command = ["node", "dist/index.js", "--status"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["node", "dist/plugin.js"]
