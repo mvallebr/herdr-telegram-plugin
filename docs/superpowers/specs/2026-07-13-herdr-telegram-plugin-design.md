@@ -175,6 +175,25 @@ User may delete this file to force re-pairing.
 - Delete `state.json`, restart daemon, repeat pairing flow.
 - OR send `/pair` in the new group; daemon prompts for confirmation in old group first (anti-hijack).
 
+### 6.1 Permission validation at pairing
+
+When `/pair` is received, the plugin **must validate** the chat environment before authorizing. Telegram is opaque about permissions until you call the API and observe the response, so validation is explicit:
+
+**Checks performed** (in order, fail-fast):
+
+1. **`getChat(chat_id)`** → verify `chat.type === "supergroup"` and `chat.is_forum === true`.
+   - Failure: respond with link to Telegram docs explaining how to enable Topics in group settings.
+
+2. **`getChatMember(chat_id, bot_info.user_id)`** → verify `member.status` is `"creator"` or `"administrator"`.
+   - Failure: respond "Bot precisa ser administrador do grupo. Promova via Group Settings → Administrators → Add Administrator → @yourbot".
+
+3. **If administrator (not creator)**: verify `member.can_manage_topics === true`.
+   - Failure: respond "Bot é admin mas sem permissão `Manage Topics`. Ative em Group Settings → Administrators → @yourbot → Manage Topics".
+
+**On full success**: persist `chat.id`, send pairing confirmation, trigger reconciliation (§7).
+
+**Validation is also re-run on daemon startup** (in case permissions were revoked while daemon was running). If a previously-valid pairing becomes invalid, daemon sends a single warning message and enters read-only mode (responds to `/status` and `/help` only — no topic creation, no message routing).
+
 ## 7. Mapping Reconciliation
 
 On daemon startup and after pairing:
@@ -252,7 +271,9 @@ loop:
 | herdr not running | Retry subprocess with backoff (1s, 2s, 4s, max 30s). Log. Continue. |
 | Pane disappeared during wait | Send "⚠️ Pane <label> sumiu durante execução", end wait loop. |
 | Telegram 429 (rate limit) | Honor `retry_after` from response. Log. |
-| Bot demoted from admin | Log error. Continue (bot can still read messages but can't create topics). |
+| Bot demoted from admin | Trigger validation re-run (§6.1). If invalid: enter read-only mode, single warning message. |
+| `can_manage_topics` revoked | Trigger validation re-run. Same as above. |
+| Topics disabled in group (`chat.is_forum` flipped to false) | Trigger validation re-run. Read-only mode + warning. |
 | Mapping conflict (same label, two panes) | Create both topics with suffix `-2` for the second. Log. |
 
 ## 9. Commands
@@ -331,7 +352,7 @@ platforms = ["linux", "macos", "windows"]
 ## 12. Security
 
 - **Single chat_id whitelist**: only authorized chat can interact. Updates from other chats ignored.
-- **Pairing requires bot admin + Topics**: validates environment before authorizing.
+- **Pairing requires bot admin + Topics + can_manage_topics**: validated explicitly (§6.1).
 - **No secrets in repo**: config file is `~/.config/herdr-telegram/config.toml` (user-local, never committed).
 - **Token in env or config**: not in code, not in logs (logger redacts).
 - **No third-party data egress**: plugin talks only to `api.telegram.org` and `herdr` CLI.
