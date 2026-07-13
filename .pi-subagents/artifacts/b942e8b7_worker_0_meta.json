@@ -1,0 +1,39 @@
+{
+  "runId": "b942e8b7",
+  "agent": "worker",
+  "task": "You are a delegated subagent running from a fork of the parent session. Treat the inherited conversation as reference-only context, not a live thread to continue. Do not continue or answer prior messages as if they are waiting for a reply. Your sole job is to execute the task below and return a focused result for that task using your tools.\n\nTask:\nTASK BRIEF: /home/mvallebr/git/herdr-telegram-plugin/.superpowers/sdd/task-3-brief.md\nREPORT: /home/mvallebr/git/herdr-telegram-plugin/.superpowers/sdd/task-3-report.md\n\nTask 3: config.ts + state.ts + their tests. Implement exactly per brief. Run npx vitest run tests/config.test.ts tests/state.test.ts.",
+  "exitCode": 1,
+  "usage": {
+    "input": 4423,
+    "output": 954,
+    "cacheRead": 436736,
+    "cacheWrite": 0,
+    "cost": 0.028675859999999997,
+    "turns": 6
+  },
+  "model": "minimax/MiniMax-M3:off",
+  "attemptedModels": [
+    "minimax/MiniMax-M3:off"
+  ],
+  "modelAttempts": [
+    {
+      "model": "minimax/MiniMax-M3:off",
+      "success": false,
+      "exitCode": 1,
+      "error": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage. (2056)\"},\"request_id\":\"06a426ea92f5ff9a42c17592bea768fe\"}",
+      "usage": {
+        "input": 4423,
+        "output": 954,
+        "cacheRead": 436736,
+        "cacheWrite": 0,
+        "cost": 0.028675859999999997,
+        "turns": 6
+      }
+    }
+  ],
+  "durationMs": 36066,
+  "toolCount": 4,
+  "error": "429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Token Plan usage limit reached: Upgrade your Token Plan or purchase Credits for more usage. (2056)\"},\"request_id\":\"06a426ea92f5ff9a42c17592bea768fe\"}",
+  "transcriptPath": "/home/mvallebr/git/herdr-telegram-plugin/.pi-subagents/artifacts/b942e8b7_worker_0_transcript.jsonl",
+  "timestamp": 1783952363197
+}

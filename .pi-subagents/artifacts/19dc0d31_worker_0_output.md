@@ -1,0 +1,1 @@
+All verified clean. Working tree shows only `.pi-subagents/` which is unrelated tooling.

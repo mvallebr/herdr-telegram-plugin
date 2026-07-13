@@ -3,6 +3,7 @@ import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping } from "./mapping.js";
 import { runAgentTurn } from "./wait-loop.js";
+import { getAgents } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -47,6 +48,11 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     stateDir: statePath,
     chatId: state.authorized_chat_id ?? 0,
     startTime: Date.now(),
+    saveMappings: () => {
+      const raw: DaemonState["thread_mappings"] = {};
+      for (const [tid, m] of deps.map.entries()) raw[tid] = m;
+      saveState(statePath, { ...state, thread_mappings: raw });
+    },
   };
 
   registerCommands(tg.bot, deps);
@@ -82,11 +88,24 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     if (chatId !== state.authorized_chat_id) return;
 
     const threadId = ctx.message?.message_thread_id;
-    if (!threadId) return;
+    if (!threadId) {
+      // Message in main chat (no thread) — ignore or prompt to use a thread
+      await ctx.reply(
+        "Send messages inside a thread (tap + or New Thread in the chat header). Use /bind <pane-label> inside the thread to bind it."
+      );
+      return;
+    }
 
     const mapping = findMapping(threadId, deps.map);
     if (!mapping) {
-      await ctx.reply("Topic not mapped to a pane. Run /agents to see status.");
+      const panes = getAgents();
+      const buttons = panes.map((p) => [
+        { text: `${p.label} (${p.agent})`, callback_data: `bind:${p.pane_id}:${threadId}` },
+      ]);
+      await ctx.reply(
+        "This thread is not bound to a pane. Pick one:",
+        { reply_markup: { inline_keyboard: buttons } }
+      );
       return;
     }
 
@@ -94,6 +113,30 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     if (!text || text.startsWith("/")) return; // commands handled separately
 
     await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
+  });
+
+  // Handle inline keyboard taps for thread binding
+  tg.bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    const match = data.match(/^bind:(.+?):(\d+)$/);
+    if (!match) return;
+    const [, paneId, threadIdStr] = match;
+    const threadId = parseInt(threadIdStr, 10);
+    const panes = getAgents();
+    const pane = panes.find((p) => p.pane_id === paneId);
+    if (!pane) {
+      await ctx.answerCallbackQuery({ text: "Pane no longer exists." });
+      return;
+    }
+    deps.map.set(threadId, {
+      pane_id: pane.pane_id,
+      label: pane.label,
+      agent: pane.agent,
+      created_at: new Date().toISOString(),
+    });
+    deps.saveMappings();
+    await ctx.answerCallbackQuery({ text: `Bound to ${pane.label}` });
+    await ctx.editMessageText(`Bound this thread to ${pane.label} (${pane.agent}). Send a message to start.`);
   });
 
   tg.start();
