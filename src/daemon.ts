@@ -77,7 +77,17 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     const rawMappings: DaemonState["thread_mappings"] = {};
     for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
     saveState(statePath, { ...state, thread_mappings: rawMappings });
-    await ctx.reply(`Reconciliation complete: ${newMap.size} topics mapped. Send a message in any topic.`);
+    const result = (reconcile as any).lastResult as { created: string[]; failed: string[]; total: number } | undefined;
+    if (result && result.failed.length > 0) {
+      await ctx.reply(
+        `Reconciliation: ${newMap.size} panes mapped.\n` +
+        `Auto-created ${result.created.length} topics.\n` +
+        `Could not auto-create: ${result.failed.join(", ")}\n` +
+        `For those, create a thread via Telegram UI and use /bind <pane-label>.`
+      );
+    } else {
+      await ctx.reply(`Reconciliation complete: ${newMap.size} topics mapped. Send a message in any topic.`);
+    }
   });
 
   // Handle plain text (routed via thread_id)

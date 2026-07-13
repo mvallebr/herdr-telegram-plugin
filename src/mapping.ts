@@ -25,42 +25,41 @@ export async function reconcile(
 ): Promise<Map<number, ThreadMapping>> {
   const panes = getAgents();
   const map = new Map<number, ThreadMapping>();
+  const created: string[] = [];
+  const failed: string[] = [];
 
-  // Detect whether the chat supports forum topics
-  let useForum = false;
+  // Try to list existing topics first (works in supergroups with forum).
+  // For private chats, this may 404 — that's fine, we just try to create blindly.
   let topics: TopicInfo[] = [];
   try {
-    const chat = await tg.bot.api.getChat(chatId);
-    useForum = chat.type === "supergroup" && Boolean((chat as any).is_forum);
-    if (useForum) {
-      topics = await tg.getForumTopics(chatId);
-    }
+    topics = await tg.getForumTopics(chatId);
   } catch {
-    // ignore: fall back to manual binding via /bind
+    // getForumTopics not supported in this chat — proceed to try createForumTopic
   }
 
-  if (useForum) {
-    for (const pane of panes) {
-      let threadId = matchTopic(pane, topics);
-      if (!threadId) {
-        try {
-          threadId = await tg.createForumTopic(chatId, pane.label);
-          topics.push({ message_thread_id: threadId, name: pane.label });
-        } catch {
-          // forum topic creation failed; user must bind manually
-          continue;
-        }
+  for (const pane of panes) {
+    let threadId = matchTopic(pane, topics);
+    if (!threadId) {
+      try {
+        threadId = await tg.createForumTopic(chatId, pane.label);
+        topics.push({ message_thread_id: threadId, name: pane.label });
+        created.push(pane.label);
+      } catch (err: any) {
+        // Can't auto-create in this chat — user will bind manually with /bind
+        failed.push(pane.label);
+        continue;
       }
-      map.set(threadId, {
-        pane_id: pane.pane_id,
-        label: pane.label,
-        agent: pane.agent,
-        created_at: new Date().toISOString(),
-      });
     }
+    map.set(threadId, {
+      pane_id: pane.pane_id,
+      label: pane.label,
+      agent: pane.agent,
+      created_at: new Date().toISOString(),
+    });
   }
-  // For private chats (or groups without forum), we return an empty map.
-  // The user creates threads via Telegram UI and binds them with /bind.
+
+  // Stash diagnostics so the daemon can report them
+  (reconcile as any).lastResult = { created, failed, total: panes.length };
 
   return map;
 }
