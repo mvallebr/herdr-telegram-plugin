@@ -23,8 +23,9 @@ export class TelegramClient {
 
   async getForumTopics(chatId: number): Promise<TopicInfo[]> {
     try {
-      const result = await this.bot.api.getForumTopics(chatId);
-      return result.map((t) => ({
+      // grammy 1.x doesn't expose getForumTopics on typed API; use raw
+      const result: any[] = await (this.bot.api as any).raw.getForumTopics({ chat_id: chatId });
+      return result.map((t: any) => ({
         message_thread_id: t.message_thread_id,
         name: t.name,
       }));
