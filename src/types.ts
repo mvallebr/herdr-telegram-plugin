@@ -26,4 +26,7 @@ export interface DaemonState {
   /** Topics the bot has ever created in this chat. Maps thread_id -> { name, created_at }.
    *  Used for dedup because getForumTopics returns 404 in private chats. */
   known_topics?: Record<number, { name: string; created_at: string }>;
+  /** Tabs the bot has observed. Maps tab_id -> { label, thread_id }.
+   *  Used by the watcher to detect new/closed/renamed tabs. */
+  known_tabs?: Record<string, { label: string; thread_id: number }>;
 }

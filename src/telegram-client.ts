@@ -25,6 +25,10 @@ export class TelegramClient {
     await this.bot.api.deleteForumTopic(chatId, messageThreadId);
   }
 
+  async editForumTopic(chatId: number, messageThreadId: number, name: string): Promise<void> {
+    await this.bot.api.editForumTopic(chatId, messageThreadId, { name });
+  }
+
   async getForumTopics(chatId: number): Promise<TopicInfo[]> {
     try {
       // grammy 1.x doesn't expose getForumTopics on typed API; use raw
