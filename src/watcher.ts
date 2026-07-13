@@ -16,7 +16,8 @@ const log = createLogger("watcher");
 export async function syncTabs(
   chatId: number,
   tg: TelegramClient,
-  state: DaemonState
+  state: DaemonState,
+  deps?: { map: Map<number, ThreadMapping> }
 ): Promise<{ changed: boolean; added: string[]; removed: string[]; renamed: string[] }> {
   const panes = getAgents();
   const knownTabs = state.known_tabs ?? {};
@@ -35,6 +36,7 @@ export async function syncTabs(
       try {
         await tg.deleteForumTopic(chatId, entry.thread_id);
         delete state.thread_mappings[entry.thread_id];
+        deps?.map.delete(entry.thread_id);
         delete knownTabs[tabId];
         removed.push(`${entry.label} (tab ${tabId})`);
       } catch (err: any) {
@@ -55,12 +57,14 @@ export async function syncTabs(
       try {
         const threadId = await tg.createForumTopic(chatId, pane.label);
         knownTabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
-        state.thread_mappings[threadId] = {
+        const mapping = {
           pane_id: pane.pane_id,
           label: pane.label,
           agent: pane.agent,
           created_at: new Date().toISOString(),
         };
+        state.thread_mappings[threadId] = mapping;
+        deps?.map.set(threadId, mapping);
         // Seed with last 5 lines
         try {
           const seed = readPane(pane.pane_id, 5);
@@ -101,17 +105,20 @@ export async function syncTabs(
         // If topic was deleted (manually or otherwise), recreate it
         if (err.message?.includes("TOPIC_ID_INVALID")) {
           try {
-            const newThreadId = await tg.createForumTopic(chatId, pane.label);
-            knownTabs[pane.tab_id] = { label: pane.label, thread_id: newThreadId };
-            state.thread_mappings[newThreadId] = {
-              pane_id: pane.pane_id,
-              label: pane.label,
-              agent: pane.agent,
-              created_at: new Date().toISOString(),
-            };
-            // Drop the stale thread_id mapping
-            delete state.thread_mappings[existing.thread_id];
-            added.push(`${pane.label} (recreated, tab ${pane.tab_id})`);
+        const newThreadId = await tg.createForumTopic(chatId, pane.label);
+        knownTabs[pane.tab_id] = { label: pane.label, thread_id: newThreadId };
+        const newMapping = {
+          pane_id: pane.pane_id,
+          label: pane.label,
+          agent: pane.agent,
+          created_at: new Date().toISOString(),
+        };
+        state.thread_mappings[newThreadId] = newMapping;
+        deps?.map.set(newThreadId, newMapping);
+        // Drop the stale thread_id mapping
+        delete state.thread_mappings[existing.thread_id];
+        deps?.map.delete(existing.thread_id);
+        added.push(`${pane.label} (recreated, tab ${pane.tab_id})`);
           } catch (err2: any) {
             log.warn("watcher: failed to recreate topic", {
               pane: pane.label,
@@ -149,7 +156,8 @@ export async function syncTabs(
 export async function healthCheckTopics(
   chatId: number,
   tg: TelegramClient,
-  state: DaemonState
+  state: DaemonState,
+  deps?: { map: Map<number, ThreadMapping> }
 ): Promise<{ recreated: string[] }> {
   const knownTabs = state.known_tabs ?? {};
   const recreated: string[] = [];
@@ -168,14 +176,17 @@ export async function healthCheckTopics(
           const newThreadId = await tg.createForumTopic(chatId, label);
           knownTabs[tabId] = { label, thread_id: newThreadId };
           if (pane) {
-            state.thread_mappings[newThreadId] = {
+            const newMapping = {
               pane_id: pane.pane_id,
               label,
               agent: pane.agent,
               created_at: new Date().toISOString(),
             };
+            state.thread_mappings[newThreadId] = newMapping;
+            deps?.map.set(newThreadId, newMapping);
           }
           delete state.thread_mappings[entry.thread_id];
+          deps?.map.delete(entry.thread_id);
           recreated.push(`${label} (tab ${tabId})`);
         } catch (err2: any) {
           log.warn("watcher: healthCheck recreate failed", {
@@ -215,12 +226,12 @@ export function startWatcher(
   const tick = async () => {
     try {
       tickCount++;
-      const result = await syncTabs(chatId, tg, state);
+      const result = await syncTabs(chatId, tg, state, deps);
       if (result.changed) saveState();
       // Health check less frequently: pings every known topic to detect deleted ones
       let recreated: string[] = [];
       if (tickCount % HEALTH_CHECK_EVERY === 0) {
-        const hc = await healthCheckTopics(chatId, tg, state);
+        const hc = await healthCheckTopics(chatId, tg, state, deps);
         recreated = hc.recreated;
         if (recreated.length > 0) saveState();
       }
