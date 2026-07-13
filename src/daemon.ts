@@ -5,7 +5,7 @@ import { reconcile, findMapping } from "./mapping.js";
 import { runAgentTurn } from "./wait-loop.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState } from "./state.js";
-import { createLogger } from "./logger.js";
+import { createLogger, type Logger } from "./logger.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 
@@ -20,12 +20,13 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   let state = loadState(statePath);
   const tg = new TelegramClient(cfg.botToken);
 
+  // Re-validate existing pairing
   if (isPaired(state) && state.authorized_chat_id) {
     const errors = await tg.validatePermissions(state.authorized_chat_id);
     if (errors.length > 0) {
       log.warn("Permission validation failed on startup", { errors });
       await tg.sendMessage(
-        state.authorized_chat_id, 1,
+        state.authorized_chat_id, 1, // send to General topic (thread 1)
         "⚠️ Permission check failed:\n" + errors.map(e => "- " + e).join("\n") +
         "\n\nBridge in read-only mode. Fix permissions and restart."
       );
@@ -34,8 +35,9 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   const map = isPaired(state) && state.authorized_chat_id
     ? await reconcile(state.authorized_chat_id!, tg)
-    : new Map<number, DaemonState["thread_mappings"][keyof DaemonState["thread_mappings"]]>();
+    : new Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>();
 
+  // Persist initial mapping
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
   saveState(statePath, { ...state, thread_mappings: rawMappings });
@@ -49,6 +51,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
   registerCommands(tg.bot, deps);
 
+  // Pairing flow
   tg.bot.command("pair", async (ctx) => {
     if (isPaired(state)) {
       await ctx.reply("Already paired. Delete state.json to re-pair.");
@@ -68,8 +71,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply("Reconciliation complete. Send a message in any topic.");
   });
 
+  // Handle plain text (routed via thread_id)
   tg.bot.on("message:text", async (ctx) => {
     if (!isPaired(state) || !state.authorized_chat_id) return;
+
     const chatId = ctx.chat.id;
     if (chatId !== state.authorized_chat_id) return;
 
@@ -83,7 +88,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     }
 
     const text = ctx.message.text;
-    if (!text || text.startsWith("/")) return;
+    if (!text || text.startsWith("/")) return; // commands handled separately
 
     await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
   });
