@@ -24,7 +24,7 @@ No email, no password, no extra verification. Takes under 2 minutes.
 
 ![Fill bot details](images/2_fill_create_new_bot.png)
 
-4. BotFather will reply with a **token**. Copy it — you'll need it in Step 3.
+4. BotFather will reply with a **token**. Copy it — you'll paste it into `config.toml` when configuring the plugin.
 
 ![Copy bot token](images/3_copy_bot_key.png)
 
@@ -39,13 +39,17 @@ Use this token to access the HTTP API:
 Anyone with the token can control your bot. Never commit it to git.
 :::
 
-## Allow anyone to use the bot
+## Restrict bot access to yourself
 
-By default, only you can interact with your bot. Disable this restriction:
+Enable this restriction so only you can control the bot:
 
 ![Restrict bot usage](images/5_restrict_bot_usage.png)
 
-This lets the bot receive messages from you in any chat.
+:::warning Security
+If this is disabled, anyone who finds your bot can send commands to your herdr agents.
+Keep it enabled.
+:::
+
 
 ## Find your bot
 
