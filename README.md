@@ -8,11 +8,25 @@ Each herdr agent pane maps 1:1 to a Telegram forum topic. Messages in a topic ar
 
 ## Quick install
 
+### Option A: install from GitHub via the herdr CLI (recommended)
+
+```bash
+herdr plugin install mvallebr/herdr-telegram-plugin --yes
+```
+
+This drops the plugin into `~/.config/herdr/plugins/github/herdr-telegram-plugin-*` and resolves all dependencies.
+
+### Option B: from a git checkout (for development)
+
 ```bash
 git clone https://github.com/mvallebr/herdr-telegram-plugin
 cd herdr-telegram-plugin
 npm install && npm run build
 ```
+
+Then point herdr at it: `herdr plugin link .`
+
+### Configure
 
 ```bash
 mkdir -p ~/.config/herdr-telegram
@@ -20,11 +34,20 @@ echo '[telegram]' > ~/.config/herdr-telegram/config.toml
 echo 'bot_token = "YOUR_BOT_TOKEN"' >> ~/.config/herdr-telegram/config.toml
 ```
 
+### Start the daemon
+
+From the herdr-managed install (`~/.config/herdr/plugins/github/herdr-telegram-plugin-*`):
+
 ```bash
+cd ~/.config/herdr/plugins/github/herdr-telegram-plugin-*
 node dist/index.js --daemon
 ```
 
-Then open Telegram, find your bot's forum, and `/pair`.
+Or, equivalently, the daemon auto-launches when needed by Telegram activity
+(grammy long-polling only happens while the daemon runs, so a one-shot
+`node dist/index.js --daemon &` per session is the simplest pattern).
+
+Then open Telegram, find your bot's private chat, and send `/pair`.
 
 ## Commands
 
