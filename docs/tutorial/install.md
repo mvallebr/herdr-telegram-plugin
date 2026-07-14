@@ -23,7 +23,6 @@ This compiles TypeScript to `dist/`. The compiled output is what the daemon runs
 
 ```bash
 npm test
-# 45 passed (45)
 ```
 
 ## What you get
