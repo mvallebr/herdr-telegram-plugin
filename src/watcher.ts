@@ -99,7 +99,11 @@ export async function syncTabs(
         await tg.editForumTopic(chatId, existing.thread_id, pane.label);
         existing.label = pane.label;
         const mapping = state.thread_mappings[existing.thread_id];
-        if (mapping) mapping.label = pane.label;
+        if (mapping) {
+          mapping.label = pane.label;
+          // Explicitly re-set so deps.map always reflects the rename
+          deps?.map.set(existing.thread_id, mapping);
+        }
         renamed.push(`${pane.label} (tab ${pane.tab_id})`);
       } catch (err: any) {
         // If topic was deleted (manually or otherwise), recreate it

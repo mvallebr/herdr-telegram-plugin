@@ -108,6 +108,31 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     }
   }
 
+  // Lazy-start the watcher: handlers like /pair may need to start it
+  // after the daemon initially launched unpaired.
+  let watcherStarted = false;
+  let watcherController = new AbortController();
+  const saveStateCallback = () => {
+    const raw: DaemonState["thread_mappings"] = {};
+    for (const [tid, m] of deps.map.entries()) raw[tid] = m;
+    saveState(statePath, { ...state, thread_mappings: raw });
+  };
+  function maybeStartWatcher() {
+    if (watcherStarted) return;
+    if (!isPaired(state) || !state.authorized_chat_id) return;
+    watcherStarted = true;
+    startWatcher(
+      state.authorized_chat_id,
+      tg,
+      state,
+      saveStateCallback,
+      15_000,
+      watcherController.signal,
+      deps
+    );
+    log.info("watcher: lazily started after pair/reconcile");
+  }
+
   // Catch-all message handler (highest priority) for commands that must always work
   tg.bot.on("message", async (ctx, next) => {
     const text = ctx.message?.text ?? "";
@@ -139,6 +164,8 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
         deps.chatId = 0;
         deps.knownTopics = state.known_topics;
         deps.stopWatcher?.();
+        watcherStarted = false;
+        watcherController = new AbortController();
         await ctx.reply(`Unpaired. Deleted ${deleted} topic(s). Send /pair to re-authorize.`);
       } catch (err: any) {
         log.error("unpair failed", { error: err.message });
@@ -176,6 +203,45 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       if (result?.created.length) parts.push(`Auto-created: ${result.created.join(", ")}`);
       if (result?.failed.length) parts.push(`Could not create (bind manually with /bind): ${result.failed.join(", ")}`);
       await ctx.reply(parts.join("\n"));
+      maybeStartWatcher();
+      return;
+    }
+    if (text.startsWith("/reconcile")) {
+      log.info("reconcile via message handler", { chatId: ctx.chat.id });
+      if (!isPaired(state) || !state.authorized_chat_id) { await ctx.reply("Not paired."); return; }
+      const chatId = state.authorized_chat_id;
+      await ctx.reply("Reconciling...");
+      state.known_topics = state.known_topics ?? {};
+      const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
+      for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
+      const raw: DaemonState["thread_mappings"] = {};
+      for (const [tid, m] of newMap.entries()) raw[tid] = m;
+      saveState(statePath, { ...state, thread_mappings: raw });
+      seedTopics(newMap, chatId).catch(() => {});
+      const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+      const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+      if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} dups: ${result.deleted.join(", ")}`);
+      if (result?.created.length) parts.push(`Created: ${result.created.join(", ")}`);
+      if (result?.failed.length) parts.push(`Failed: ${result.failed.join(", ")}`);
+      await ctx.reply(parts.join("\n"));
+      return;
+    }
+    // /cleanup — list all tracked topics
+    if (text.startsWith("/cleanup")) {
+      log.info("cleanup via message handler", { chatId: ctx.chat.id });
+      if (!isPaired(state) || !state.authorized_chat_id) { await ctx.reply("Not paired."); return; }
+      const boundIds = new Set(deps.map.keys());
+      const lines: string[] = [];
+      if (deps.map.size > 0) {
+        lines.push("🔗 Bound topics:");
+        for (const [tid, m] of deps.map.entries()) {
+          lines.push(`  #${tid} → ${m.label} (${m.agent})`);
+        }
+      } else {
+        lines.push("No topics tracked.");
+      }
+      lines.push("", "Use /delete <id> to remove a topic.");
+      await ctx.reply(lines.join("\n"));
       return;
     }
     // Pass through to other handlers (command, message:text, etc.)
@@ -375,27 +441,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   tg.start();
   log.info("Daemon started", { paired: isPaired(state), panes: map.size });
 
-  // Watcher controller — used to stop the watcher on /unpair
-  const watcherController = new AbortController();
-
-  // Start the tab watcher: detects new/closed/renamed herdr tabs every 30s
-  // and syncs Telegram topics accordingly.
-  const saveStateCallback = () => {
-    const raw: DaemonState["thread_mappings"] = {};
-    for (const [tid, m] of deps.map.entries()) raw[tid] = m;
-    saveState(statePath, { ...state, thread_mappings: raw });
-  };
-  if (isPaired(state) && state.authorized_chat_id) {
-    startWatcher(
-      state.authorized_chat_id,
-      tg,
-      state,
-      saveStateCallback,
-      15_000,
-      watcherController.signal,
-      deps
-    );
-  }
+  maybeStartWatcher();
   deps.stopWatcher = () => watcherController.abort();
 
   return {
