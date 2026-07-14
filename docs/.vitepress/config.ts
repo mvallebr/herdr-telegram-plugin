@@ -14,78 +14,35 @@ export default defineConfig({
       src: "/logo.svg",
       alt: "herdr-telegram-plugin",
     },
-    nav: [
-      { text: "Tutorial", link: "/tutorial/" },
-      { text: "Guide", link: "/guide/configuration" },
-      { text: "Internals", link: "/internals/how-it-works" },
-    ],
+    nav: [],
 
-    sidebar: {
-      "/tutorial/": [
-        {
-          text: "Tutorial",
-          items: [
-            { text: "Overview", link: "/tutorial/" },
-            { text: "1. Create a Telegram Bot", link: "/tutorial/create-bot" },
-            { text: "2. Install the Plugin", link: "/tutorial/install" },
-            { text: "3. Configure & Run", link: "/tutorial/configure" },
-            { text: "4. Pair & First Message", link: "/tutorial/first-run" },
-            { text: "5. Daily Usage", link: "/tutorial/daily-usage" },
-          ],
-        },
-      ],
-      "/guide/": [
-        {
-          text: "Guide",
-          items: [
-            { text: "Configuration", link: "/guide/configuration" },
-            { text: "Commands", link: "/guide/commands" },
-            { text: "Troubleshooting", link: "/guide/troubleshooting" },
-          ],
-        },
-      ],
-      "/internals/": [
-        {
-          text: "Internals",
-          items: [
-            { text: "How it Works", link: "/internals/how-it-works" },
-          ],
-        },
-      ],
-      "/": [
-        {
-          text: "Home",
-          items: [
-            { text: "Welcome", link: "/" },
-          ],
-        },
-        {
-          text: "Tutorial",
-          items: [
-            { text: "Overview", link: "/tutorial/" },
-            { text: "1. Create a Telegram Bot", link: "/tutorial/create-bot" },
-            { text: "2. Install the Plugin", link: "/tutorial/install" },
-            { text: "3. Configure & Run", link: "/tutorial/configure" },
-            { text: "4. Pair & First Message", link: "/tutorial/first-run" },
-            { text: "5. Daily Usage", link: "/tutorial/daily-usage" },
-          ],
-        },
-        {
-          text: "Guide",
-          items: [
-            { text: "Configuration", link: "/guide/configuration" },
-            { text: "Commands", link: "/guide/commands" },
-            { text: "Troubleshooting", link: "/guide/troubleshooting" },
-          ],
-        },
-        {
-          text: "Internals",
-          items: [
-            { text: "How it Works", link: "/internals/how-it-works" },
-          ],
-        },
-      ],
-    },
+    sidebar: [
+      {
+        text: "Tutorial",
+        items: [
+          { text: "Overview", link: "/tutorial/" },
+          { text: "1. Create a Telegram Bot", link: "/tutorial/create-bot" },
+          { text: "2. Install the Plugin", link: "/tutorial/install" },
+          { text: "3. Configure & Run", link: "/tutorial/configure" },
+          { text: "4. Pair & First Message", link: "/tutorial/first-run" },
+          { text: "5. Daily Usage", link: "/tutorial/daily-usage" },
+        ],
+      },
+      {
+        text: "Guide",
+        items: [
+          { text: "Configuration", link: "/guide/configuration" },
+          { text: "Commands", link: "/guide/commands" },
+          { text: "Troubleshooting", link: "/guide/troubleshooting" },
+        ],
+      },
+      {
+        text: "Internals",
+        items: [
+          { text: "How it Works", link: "/internals/how-it-works" },
+        ],
+      },
+    ],
 
     socialLinks: [
       { icon: "github", link: "https://github.com/mvallebr/herdr-telegram-plugin" },
