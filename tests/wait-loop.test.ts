@@ -91,6 +91,55 @@ real output`;
     expect(out).toContain("after");
     expect(out).not.toContain(longLine);
   });
+
+  it("removes <session_state> blocks without the context-mode preamble", () => {
+    const input = `agent response here
+<session_state source="something-else">
+<session_mode>plan</session_mode>
+<some_other_key>some value</some_other_key>
+</session_state>
+more response`;
+    const out = cleanPaneOutput(input);
+    expect(out).not.toContain("<session_state");
+    expect(out).not.toContain("</session_state>");
+    expect(out).toContain("agent response here");
+    expect(out).toContain("more response");
+  });
+
+  it("filters status bars / debug overlays (high non-word ratio)", () => {
+    const input = `here is a normal sentence
+~12 % | $0.50 | 1.2k/300k | ctx=8% | mode=implement | R=99%
+the agent continued discussing the topic`;
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("here is a normal sentence");
+    expect(out).toContain("the agent continued");
+    expect(out).not.toContain("ctx=8%");
+  });
+
+  it("filters lines starting with XML-like opening tags", () => {
+    const input = `agent response
+<tool_name>bash</tool_name>
+<tool_args>ls -la</tool_args>
+<result>total 42</result>
+the response continues`;
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("agent response");
+    expect(out).toContain("the response continues");
+    expect(out).not.toContain("<tool_name>");
+    expect(out).not.toContain("<result>");
+  });
+
+  it("keeps single-line responses intact", () => {
+    const out = cleanPaneOutput("São 13/07/2026, 19:21:47 (horário de Brasília).");
+    expect(out).toBe("São 13/07/2026, 19:21:47 (horário de Brasília).");
+  });
+
+  it("strips ANSI escape codes from status bars before scoring", () => {
+    const input = "real response\n\x1b[32m~12 % | $0.50 | 1.2k/300k\x1b[0m\nmore response";
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("real response");
+    expect(out).toContain("more response");
+  });
 });
 
 describe("extractResponseSince", () => {
@@ -247,8 +296,9 @@ describe("runAgentTurn (content-based polling)", () => {
   });
 
   it("truncates responses over 3900 chars", async () => {
-    const longLine = "x".repeat(100);
-    const longResponse = USER_INPUT + "\n" + Array(170).fill(longLine).join("\n");
+    const longLine =
+      "The agent responded with a detailed explanation about the topic. ".repeat(2);
+    const longResponse = USER_INPUT + "\n" + Array(60).fill(longLine).join("\n");
     const prefix = USER_INPUT; // post-send snapshot has only the typed text
     let readIdx = 0;
     const panes = [prefix, longResponse, longResponse];

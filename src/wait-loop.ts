@@ -17,25 +17,50 @@ export function formatElapsed(totalSec: number): string {
 
 /** Strip context-mode banners and other noise from agent output. */
 export function cleanPaneOutput(content: string): string {
-  // First remove the multi-line context-mode banner block (if present)
-  let clean = content.replace(
-    /\n*context-mode active\.[\s\S]*?<\/session_state>\n*/g,
-    "\n"
-  );
+  // Step 1: remove the entire <session_state ...>...</session_state> block
+  // (any session metadata, not just context-mode).
+  let clean = content.replace(/<session_state[\s\S]*?<\/session_state>/g, "");
+  // Step 2: remove any standalone "context-mode active. ..." lines (in case
+  // the <session_state> wrapper was missing).
+  clean = clean.split("\n").filter((l) => !l.includes("context-mode active")).join("\n");
+  // Step 3: line-level filtering for other noise patterns
   return clean
     .split("\n")
-    .filter(
-      (l: string) =>
-        !l.includes("context-mode active") &&
-        !l.startsWith("<session_state") &&
-        !l.startsWith("<session_mode") &&
-        !l.startsWith("</session_state>") &&
-        !l.match(/^ctx_\w+ >/) &&
-        !l.match(/^[─━═]{20,}/) &&
-        !l.match(/[─━═]{20,}/) &&
-        l.length < 300
-    )
-    .join("\n");
+    .filter((l: string) => isNaturalLanguageLine(l))
+    .join("\n")
+    .trim();
+}
+
+/**
+ * Returns true if the line looks like natural agent prose / output rather
+ * than terminal noise (system banners, debug overlays, status bars, etc.).
+ *
+ * Heuristics:
+ * - Length > 300 → noise (status bars / debug dumps)
+ * - Made mostly of separator chars (─━═) → noise
+ * - Starts with XML tags (<session_*, <tool_*, etc.) → noise
+ * - Starts with `ctx_* >` (tool command-line) → noise
+ * - More than 50% non-word characters → likely noise (status display)
+ * - Contains URLs / paths / JSON-looking keys in a banner-like context → noise
+ */
+export function isNaturalLanguageLine(line: string): boolean {
+  if (!line) return false;
+  if (line.length > 300) return false;
+  if (/[─━═]{20,}/.test(line)) return false;
+  if (/^<[a-z_]/.test(line.trim())) return false; // XML-like opening tag
+  if (/^<\//.test(line.trim())) return false; // XML-like closing tag
+  if (/^ctx_\w+ /.test(line)) return false;
+  if (/^<\?xml/.test(line)) return false;
+  // Pure status bars: lines with many $ / % / digits / pipes and few spaces
+  // are usually status displays, not prose.  Allow escape sequences too.
+  const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
+  // "Decorative" chars typical of status bars / banners / diff lines.
+  // Lines with too many of these are noise regardless of length.
+  const decorations = (stripped.match(/[─━═|~^$%\\]/g) || []).length;
+  if (decorations > 0) return false;
+  // XML-ish opening/closing tags at the start of the line.
+  if (/^\s*<\/?[a-z_]+/i.test(stripped)) return false;
+  return true;
 }
 
 /**
