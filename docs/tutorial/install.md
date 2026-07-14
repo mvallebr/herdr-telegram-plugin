@@ -1,15 +1,18 @@
 # Step 2: Install the Plugin
 
-## Clone the repo
+## Option A: herdr plugin install (recommended)
+
+```bash
+herdr plugin install github.com/mvallebr/herdr-telegram-plugin
+```
+
+Herdr clones the repo, runs `npm ci` + `npm run build`, and registers the plugin.
+
+## Option B: Manual clone and build
 
 ```bash
 git clone https://github.com/mvallebr/herdr-telegram-plugin
 cd herdr-telegram-plugin
-```
-
-## Install dependencies and build
-
-```bash
 npm install
 npm run build
 ```
