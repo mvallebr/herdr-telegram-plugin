@@ -144,6 +144,8 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
           await ctx.reply("Not paired.");
           return;
         }
+        // Reply before deleting topics (deleting the current topic would break ctx.reply)
+        await ctx.reply(`Unpairing...`);
         // Delete all bot-created topics before resetting state
         const kt = state.known_topics ?? {};
         const tids = Object.keys(kt).map(Number);
@@ -194,6 +196,18 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
       const rawMappings: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
+      // Seed known_tabs so watcher doesn't re-create duplicate topics
+      state.known_tabs = state.known_tabs ?? {};
+      const panesAfterPair = getAgents();
+      for (const pane of panesAfterPair) {
+        let threadId: number | undefined;
+        for (const [tid, m] of newMap.entries()) {
+          if (m.pane_id === pane.pane_id) { threadId = tid; break; }
+        }
+        if (threadId && !state.known_tabs[pane.tab_id]) {
+          state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
+        }
+      }
       saveState(statePath, { ...state, thread_mappings: rawMappings });
       // Seed topics with last output (fire-and-forget — don't block reply)
       seedTopics(newMap, chatId).catch(() => {});
@@ -216,6 +230,18 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of newMap.entries()) raw[tid] = m;
+      // Seed known_tabs to prevent watcher from creating duplicates
+      state.known_tabs = state.known_tabs ?? {};
+      const panesAfterReconcile = getAgents();
+      for (const pane of panesAfterReconcile) {
+        let threadId: number | undefined;
+        for (const [tid, m] of newMap.entries()) {
+          if (m.pane_id === pane.pane_id) { threadId = tid; break; }
+        }
+        if (threadId && !state.known_tabs[pane.tab_id]) {
+          state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
+        }
+      }
       saveState(statePath, { ...state, thread_mappings: raw });
       seedTopics(newMap, chatId).catch(() => {});
       const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
