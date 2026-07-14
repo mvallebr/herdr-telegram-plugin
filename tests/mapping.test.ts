@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { matchTopic, resolveOrphanTopics } from "../src/mapping.js";
+import { matchTopic, resolveOrphanTopics, seedKnownTabs } from "../src/mapping.js";
 import type { PaneInfo, TopicInfo, ThreadMapping } from "../src/types.js";
 
 describe("matchTopic", () => {
@@ -50,5 +50,55 @@ describe("resolveOrphanTopics", () => {
     const topics: TopicInfo[] = [{ message_thread_id: 140, name: "Echo" }];
     const existing: Map<number, ThreadMapping> = new Map([[140, { pane_id: "w1:pZ", label: "Echo", agent: "pi", created_at: "x" }]]);
     expect(resolveOrphanTopics(panes, topics, existing)).toHaveLength(0);
+  });
+});
+
+describe("seedKnownTabs", () => {
+  const makePane = (pane_id: string, tab_id: string, label: string): PaneInfo => ({
+    pane_id, tab_id, label, agent: "pi", workspace_id: "w1", status: "idle",
+  });
+
+  it("populates known_tabs from thread_mappings for matching panes", () => {
+    const map = new Map<number, ThreadMapping>([
+      [10, { pane_id: "w1:pA", label: "Agent A", agent: "pi", created_at: "x" }],
+      [20, { pane_id: "w1:pB", label: "Agent B", agent: "pi", created_at: "x" }],
+    ]);
+    const panes = [makePane("w1:pA", "w1:tA", "Agent A"), makePane("w1:pB", "w1:tB", "Agent B")];
+    const result = seedKnownTabs(map, panes, {});
+    expect(result).toEqual({
+      "w1:tA": { label: "Agent A", thread_id: 10 },
+      "w1:tB": { label: "Agent B", thread_id: 20 },
+    });
+  });
+
+  it("skips panes with no matching mapping", () => {
+    const map = new Map<number, ThreadMapping>([
+      [10, { pane_id: "w1:pA", label: "Agent A", agent: "pi", created_at: "x" }],
+    ]);
+    const panes = [makePane("w1:pZ", "w1:tZ", "Unknown")];
+    const result = seedKnownTabs(map, panes, {});
+    expect(result).toEqual({});
+  });
+
+  it("preserves existing known_tabs entries", () => {
+    const map = new Map<number, ThreadMapping>([
+      [10, { pane_id: "w1:pA", label: "Agent A", agent: "pi", created_at: "x" }],
+    ]);
+    const panes = [makePane("w1:pA", "w1:tA", "Agent A")];
+    const existing = { "w1:tB": { label: "Old B", thread_id: 99 } };
+    const result = seedKnownTabs(map, panes, existing);
+    expect(result["w1:tB"]).toEqual({ label: "Old B", thread_id: 99 });
+    expect(result["w1:tA"]).toEqual({ label: "Agent A", thread_id: 10 });
+  });
+
+  it("does not overwrite already-seeded tab_ids", () => {
+    const map = new Map<number, ThreadMapping>([
+      [10, { pane_id: "w1:pA", label: "Agent A", agent: "pi", created_at: "x" }],
+    ]);
+    const panes = [makePane("w1:pA", "w1:tA", "Agent A Renamed")];
+    const existing = { "w1:tA": { label: "Agent A", thread_id: 10 } };
+    const result = seedKnownTabs(map, panes, existing);
+    // Already-seeded entry is NOT overwritten (rename detection is the watcher's job)
+    expect(result["w1:tA"]).toEqual({ label: "Agent A", thread_id: 10 });
   });
 });

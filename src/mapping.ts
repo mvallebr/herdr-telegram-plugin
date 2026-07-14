@@ -114,3 +114,26 @@ export function findMapping(
 ): ThreadMapping | undefined {
   return map.get(threadId);
 }
+
+/**
+ * Populate known_tabs from thread_mappings and the current herdr pane list.
+ * Prevents the watcher from creating duplicate topics for already-mapped panes.
+ */
+export function seedKnownTabs(
+  threadMappings: Map<number, ThreadMapping>,
+  panes: PaneInfo[],
+  existing: Record<string, { label: string; thread_id: number }>
+): Record<string, { label: string; thread_id: number }> {
+  const tabs: Record<string, { label: string; thread_id: number }> = { ...existing };
+  for (const pane of panes) {
+    if (tabs[pane.tab_id]) continue; // already seeded
+    let threadId: number | undefined;
+    for (const [tid, m] of threadMappings.entries()) {
+      if (m.pane_id === pane.pane_id) { threadId = tid; break; }
+    }
+    if (threadId) {
+      tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
+    }
+  }
+  return tabs;
+}

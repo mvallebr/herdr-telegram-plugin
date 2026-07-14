@@ -1,7 +1,7 @@
 import { TelegramClient } from "./telegram-client.js";
 import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
-import { reconcile, findMapping } from "./mapping.js";
+import { reconcile, findMapping, seedKnownTabs } from "./mapping.js";
 import { runAgentTurn } from "./wait-loop.js";
 import { getAgents, readPane } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
@@ -51,20 +51,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
   // Seed known_tabs from initial reconcile so the watcher has a baseline
-  state.known_tabs = state.known_tabs ?? {};
-  if (isPaired(state)) {
-    const panes = getAgents();
-    for (const pane of panes) {
-      // Find existing thread_id by pane_id
-      let threadId: number | undefined;
-      for (const [tid, m] of map.entries()) {
-        if (m.pane_id === pane.pane_id) { threadId = tid; break; }
-      }
-      if (threadId && !state.known_tabs[pane.tab_id]) {
-        state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
-      }
-    }
-  }
+  state.known_tabs = seedKnownTabs(map, isPaired(state) ? getAgents() : [], state.known_tabs ?? {});
   saveState(statePath, {
     ...state,
     thread_mappings: rawMappings,
@@ -197,17 +184,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       const rawMappings: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of newMap.entries()) rawMappings[tid] = m;
       // Seed known_tabs so watcher doesn't re-create duplicate topics
-      state.known_tabs = state.known_tabs ?? {};
-      const panesAfterPair = getAgents();
-      for (const pane of panesAfterPair) {
-        let threadId: number | undefined;
-        for (const [tid, m] of newMap.entries()) {
-          if (m.pane_id === pane.pane_id) { threadId = tid; break; }
-        }
-        if (threadId && !state.known_tabs[pane.tab_id]) {
-          state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
-        }
-      }
+      state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
       saveState(statePath, { ...state, thread_mappings: rawMappings });
       // Seed topics with last output (fire-and-forget — don't block reply)
       seedTopics(newMap, chatId).catch(() => {});
@@ -231,17 +208,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of newMap.entries()) raw[tid] = m;
       // Seed known_tabs to prevent watcher from creating duplicates
-      state.known_tabs = state.known_tabs ?? {};
-      const panesAfterReconcile = getAgents();
-      for (const pane of panesAfterReconcile) {
-        let threadId: number | undefined;
-        for (const [tid, m] of newMap.entries()) {
-          if (m.pane_id === pane.pane_id) { threadId = tid; break; }
-        }
-        if (threadId && !state.known_tabs[pane.tab_id]) {
-          state.known_tabs[pane.tab_id] = { label: pane.label, thread_id: threadId };
-        }
-      }
+      state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
       saveState(statePath, { ...state, thread_mappings: raw });
       seedTopics(newMap, chatId).catch(() => {});
       const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
