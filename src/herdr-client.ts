@@ -3,6 +3,9 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import type { PaneInfo } from "./types.js";
+import type { AgentSessionRef } from "./agent-sessions.js";
+
+export type { AgentSessionRef };
 
 const DEFAULT_HERDR_BIN = "herdr";
 const COMMON_PATHS = [
@@ -186,6 +189,49 @@ export function readPane(paneId: string, lines: number): string {
     "pane", "read", paneId, "--source", "recent",
     "--lines", String(lines), "--format", "text",
   ]);
+}
+
+export interface AgentInfo {
+  agent: string;
+  pane_id: string;
+  tab_id: string;
+  workspace_id: string;
+  agent_session?: AgentSessionRef;
+}
+
+/**
+ * Fetch info about an agent target (pane id, tab id, or label).
+ * Returns the parsed agent_info object or null if not found / not an agent.
+ */
+export function getAgentInfo(target: string): AgentInfo | null {
+  let raw: string;
+  try {
+    raw = execHerdrJson(["agent", "get", target]);
+  } catch {
+    return null;
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  const a = parsed?.result?.agent;
+  if (!a) return null;
+  let session: AgentSessionRef | undefined;
+  const s = a.agent_session;
+  if (s && s.kind === "path" && typeof s.value === "string") {
+    session = { kind: "path", path: s.value };
+  } else if (s && s.kind === "id" && typeof s.value === "string") {
+    session = { kind: "id", id: s.value };
+  }
+  return {
+    agent: a.agent ?? "?",
+    pane_id: String(a.pane_id ?? target),
+    tab_id: String(a.tab_id ?? ""),
+    workspace_id: String(a.workspace_id ?? ""),
+    agent_session: session,
+  };
 }
 
 export function spawnDaemon(args: string[], herdrBinPath?: string): ChildProcess {

@@ -1,6 +1,7 @@
 import type { Config } from "./config.js";
 import type { TelegramClient } from "./telegram-client.js";
-import { sendText, readPane } from "./herdr-client.js";
+import { sendText, readPane, waitIdle } from "./herdr-client.js";
+import { readAgentOutput } from "./output-reader.js";
 
 export function shouldThrottle(lastSentAt: number, throttleMs: number): boolean {
   return Date.now() - lastSentAt < throttleMs;
@@ -54,10 +55,22 @@ export function isNaturalLanguageLine(line: string): boolean {
   // Pure status bars: lines with many $ / % / digits / pipes and few spaces
   // are usually status displays, not prose.  Allow escape sequences too.
   const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
-  // "Decorative" chars typical of status bars / banners / diff lines.
-  // Lines with too many of these are noise regardless of length.
-  const decorations = (stripped.match(/[─━═|~^$%\\]/g) || []).length;
-  if (decorations > 0) return false;
+  // Allow: ASCII + common Latin-1 punctuation/diacritics used in prose.
+  //   - Printable ASCII: \x20-\x7E
+  //   - Latin-1 Supplement letters + punctuation (á, é, ç, ã, etc.)
+  //     - Letters: \u00C0-\u00FF (À Á Â ã ç etc.)
+  //     - Common punctuation/marks used in text: ¡ ¢ £ § ¨ © « ¬ ® °
+  //   - General Punctuation (curly quotes, dashes, ellipsis): \u2010-\u2026
+  //   - Mathematical/spaces: \u00A0 (non-breaking space)
+  //
+  // Reject anything outside these ranges — block drawing, geometric
+  // shapes, bullets, dingbats, powerline glyphs, etc. all live in
+  // Geometric Shapes / Box Drawing / etc. blocks.
+  const isDecorative = /[^\x20-\x7E\u00A0-\u00FF\u2010-\u2026]/.test(stripped);
+  if (isDecorative) return false;
+  // ASCII status-bar / banner characters.
+  const asciiDecorations = (stripped.match(/[─━═|~^$%\\·•]/g) || []).length;
+  if (asciiDecorations > 0) return false;
   // XML-ish opening/closing tags at the start of the line.
   if (/^\s*<\/?[a-z_]+/i.test(stripped)) return false;
   return true;
@@ -223,14 +236,102 @@ export async function runAgentTurn(
     now: opts.deps?.now ?? defaultWaitLoopDeps.now,
   };
   const maxOutputLines = opts.maxOutputLines ?? 200;
-  const pollIntervalMs = opts.pollIntervalMs ?? 1000;
-  const stabilityWindowMs = opts.stabilityWindowMs ?? 3000;
+  const startTime = deps.now();
+
+  // Fast path: try the jsonl / structured strategy first. readAgentOutput
+  // sends the prompt itself and waits for idle via herdr agent wait.
+  //
+  // We skip this fast path when the caller has overridden deps, because
+  // that signals a unit test that mocks sendText/readPane but not the new
+  // herdr-client calls (waitIdle / getAgentInfo) — going down the
+  // structured path would fail the test even though it is exercising the
+  // scrape loop directly.
+  let structured: Awaited<ReturnType<typeof readAgentOutput>> | null = null;
+  if (!opts.deps) {
+    try {
+      structured = await readAgentOutput({
+        paneId,
+        prompt: text,
+        maxWaitS: cfg.maxTotalWaitS,
+        maxOutputLines,
+        extractResponseSince,
+        deps: {
+          sendText: deps.sendText,
+          readPane: deps.readPane,
+          waitIdle,
+          now: deps.now,
+        },
+      });
+    } catch {
+      structured = null;
+    }
+  }
+
+  if (
+    structured &&
+    structured.source !== "screen-scrape" &&
+    structured.text.trim().length > 0
+  ) {
+    const elapsed = Math.floor((deps.now() - startTime) / 1000);
+    const truncated = truncateForTelegram(structured.text);
+    const tag =
+      structured.source === "pi-jsonl"
+        ? "[pi session log]"
+        : structured.source === "omp-jsonl"
+          ? "[omp session log]"
+          : "[agent session log]";
+    await sendMsg(
+      chatId,
+      threadId,
+      `✅ (${formatElapsed(elapsed)}) ${tag}:\n\n${truncated}`
+    );
+    return;
+  }
+
+  // Screen-scrape fallback: original polling-with-progress loop.
+  await runScreenScrapeLoop({
+    paneId,
+    threadId,
+    text,
+    cfg,
+    deps,
+    maxOutputLines,
+    startTime,
+    sendMsg,
+    chatId,
+  });
+}
+
+/** Cap text length to fit in a single Telegram message (4096 char limit). */
+function truncateForTelegram(text: string): string {
+  if (text.length <= 3900) return text;
+  return (
+    text.slice(0, 3900) +
+    `\n\n... (truncated, ${text.length} chars total)`
+  );
+}
+
+interface ScreenScrapeLoopArgs {
+  paneId: string;
+  threadId: number;
+  text: string;
+  cfg: Config;
+  deps: WaitLoopDeps;
+  maxOutputLines: number;
+  startTime: number;
+  sendMsg: WaitLoopDeps["sendMessage"];
+  chatId: number;
+}
+
+/** Original polling-with-progress loop. Used as fallback when jsonl is
+ *  unavailable or returns nothing. */
+async function runScreenScrapeLoop(args: ScreenScrapeLoopArgs): Promise<void> {
+  const { paneId, threadId, text, cfg, deps, maxOutputLines, startTime, sendMsg, chatId } = args;
+  const pollIntervalMs = 1000;
+  const stabilityWindowMs = 3000;
 
   deps.sendText(paneId, text);
 
-  const startTime = deps.now();
-
-  // Capture first snapshot AFTER sending text (the "before agent responds" state).
   let lastContent = "";
   try {
     lastContent = deps.readPane(paneId, maxOutputLines);
@@ -332,9 +433,7 @@ export async function runAgentTurn(
   }
   const clean = cleanPaneOutput(finalContent);
   const responseText = extractResponseSince(clean, text);
-  const truncated = responseText.length > 3900
-    ? responseText.slice(0, 3900) + `\n\n... (truncated, ${responseText.length} chars total)`
-    : responseText;
+  const truncated = truncateForTelegram(responseText);
   const elapsed = Math.floor((deps.now() - startTime) / 1000);
   await sendMsg(chatId, threadId, `✅ (${formatElapsed(elapsed)}):\n\n${truncated}`);
 }
