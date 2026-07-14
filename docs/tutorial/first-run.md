@@ -2,8 +2,8 @@
 
 ## Authorize the bot
 
-1. Open your Telegram forum (the one from Step 1)
-2. Send `/pair` in the main chat (not inside a topic)
+1. Open your chat with the bot (the one from Step 1)
+2. Send `/pair`
 
 ![Pair command](images/7_pair.png)
 
@@ -11,21 +11,19 @@ The bot replies:
 
 ```
 ✅ Chat authorized. Reconciling tabs...
-Auto-created: good-morning-chat, pi-optimize, vox2d, ...
 ```
 
-Your herdr agent tabs now appear as forum topics:
+Your herdr agent tabs are now linked to the bot. The watcher syncs them in the background.
 
 ![Herdr tabs open](images/8_pair_herdr_tabs_open.png)
 
-:::tip Topic sync
-The watcher polls every 15 seconds. New agent tabs may take a few seconds to appear.
+:::tip Tab sync
+The watcher polls every 15 seconds. New agent tabs may take a few seconds to appear in the mapping.
 :::
 
 ## Send your first message
 
-1. Open a topic that matches one of your herdr agent tabs
-2. Type any message — e.g. "what are you working on?"
+Just type a message:
 
 ![Test message](images/9_test_message.png)
 
