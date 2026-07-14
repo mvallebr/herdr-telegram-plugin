@@ -1,5 +1,7 @@
 # herdr-telegram-plugin
 
+![herdr-telegram-plugin logo](/logo.svg)
+
 **Remote control herdr agents from Telegram.** Each agent tab gets its own forum topic. Send a message, get the response back — no LLM in the path.
 
 [Get Started →](/tutorial/) &nbsp; [View on GitHub →](https://github.com/mvallebr/herdr-telegram-plugin)

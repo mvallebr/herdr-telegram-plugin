@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800">
+  <defs>
+    <linearGradient id="tg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#36AEEA"/>
+      <stop offset="100%" stop-color="#1D8FE1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Telegram bubble -->
+  <path d="M400 110
+           C520 110 610 200 610 320
+           C610 440 520 530 400 530
+           L355 590
+           L360 525
+           C255 507 190 425 190 320
+           C190 200 280 110 400 110Z"
+        fill="url(#tg)"/>
+
+  <!-- Sheep wool -->
+  <g fill="#ffffff">
+    <circle cx="330" cy="165" r="38"/>
+    <circle cx="370" cy="145" r="42"/>
+    <circle cx="420" cy="140" r="44"/>
+    <circle cx="470" cy="148" r="40"/>
+    <circle cx="510" cy="175" r="34"/>
+  </g>
+
+  <!-- Sheep face -->
+  <ellipse cx="420" cy="205" rx="62" ry="58" fill="#0F172A"/>
+  <ellipse cx="360" cy="195" rx="28" ry="16" fill="#0F172A"/>
+  <ellipse cx="480" cy="195" rx="28" ry="16" fill="#0F172A"/>
+  <circle cx="403" cy="200" r="5" fill="#fff"/>
+  <circle cx="437" cy="200" r="5" fill="#fff"/>
+
+  <!-- Telegram paper plane -->
+  <path d="M330 360 L505 290 L405 410 L385 470 L365 410 Z"
+        fill="#fff"/>
+  <path d="M405 410 L505 290 L385 385 Z"
+        fill="#DDEEFF"/>
+
+  <!-- Wordmark -->
+  <text x="400" y="690"
+        text-anchor="middle"
+        font-family="Inter,Segoe UI,Arial,sans-serif"
+        font-size="88"
+        font-weight="700"
+        fill="#0F172A">herdr</text>
+
+  <text x="400" y="735"
+        text-anchor="middle"
+        font-family="Inter,Segoe UI,Arial,sans-serif"
+        font-size="28"
+        letter-spacing="6"
+        fill="#64748B">TELEGRAM PLUGIN</text>
+</svg>

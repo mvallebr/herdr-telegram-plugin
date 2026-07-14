@@ -10,7 +10,10 @@ export default defineConfig({
   cleanUrls: true,
 
   themeConfig: {
-    logo: "🔌",
+    logo: {
+      src: "/logo.svg",
+      alt: "herdr-telegram-plugin",
+    },
     nav: [
       { text: "Tutorial", link: "/tutorial/" },
       { text: "Guide", link: "/guide/configuration" },
