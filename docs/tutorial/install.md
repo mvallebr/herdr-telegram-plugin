@@ -19,26 +19,14 @@ npm run build
 
 This compiles TypeScript to `dist/`. The compiled output is what the daemon runs.
 
-## Verify
+## Verify installation
 
 ```bash
-npm test
+herdr plugin list
+# herdr-telegram-plugin  0.1.0  installed
 ```
 
-## What you get
-
-```
-herdr-telegram-plugin/
-├── dist/           # Compiled JS (what runs)
-├── src/            # TypeScript source
-│   ├── daemon.ts       # Main daemon (bot + watcher)
-│   ├── wait-loop.ts    # Content polling + response extraction
-│   ├── watcher.ts      # Tab → topic sync
-│   └── ...
-├── tests/          # Vitest tests
-├── docs/           # This documentation
-└── package.json
-```
+You should see the plugin listed as installed. If you used the manual clone method, skip this check.
 
 ## Next
 
