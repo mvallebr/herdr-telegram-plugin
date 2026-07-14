@@ -10,12 +10,23 @@ If you've never used Telegram before, start here:
 
 No email, no password, no extra verification. Takes under 2 minutes.
 
-## Open @BotFather
+## Create the bot with @BotFather
 
-1. In Telegram, search for [@BotFather](https://t.me/BotFather)
+1. In Telegram, search for [@BotFather](https://t.me/BotFather) and start a chat
+
+![@BotFather](images/0_botfather.png)
+
 2. Send the command `/newbot`
+
+![Create new bot](images/1_create_new_bot.png)
+
 3. Follow the prompts — give your bot a **name** and a **username** (must end in `bot`)
+
+![Fill bot details](images/2_fill_create_new_bot.png)
+
 4. BotFather will reply with a **token**. Copy it — you'll need it in Step 3.
+
+![Copy bot token](images/3_copy_bot_key.png)
 
 ```
 Done! Congratulations on your new bot. You will find it at t.me/your_bot.
@@ -37,6 +48,10 @@ Still in @BotFather, set these two options:
 /setprivacy  → Disable    (bot needs to see all messages, not just commands)
 ```
 
+Also set the bot to allow anyone to interact with it:
+
+![Restrict bot usage](images/5_restrict_bot_usage.png)
+
 These are required for the bot to receive messages inside forum topics.
 
 ## Create a Forum
@@ -46,8 +61,14 @@ The bot needs a **forum** (supergroup with topics enabled) to work:
 1. In Telegram, tap the menu → **New Group**
 2. Add at least one other person (you can remove them later)
 3. Name the group, then go to **Group Settings → Topics → ON**
-4. Add your bot as a **member** and promote it to **administrator**
-5. Give the bot these admin permissions: **Manage Topics**
+
+![Enable threaded mode](images/4_enable_threaded_mode.png)
+
+4. Find your bot and add it as a **member**, then promote it to **administrator**
+
+![Find your bot](images/6_find_your_bot_as_contact.png)
+
+5. Give the bot these admin permissions: **Manage Topics** and **Send Messages**
 
 Your forum now has topics enabled and the bot is ready to create and manage them.
 

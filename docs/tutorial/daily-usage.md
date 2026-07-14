@@ -35,6 +35,8 @@ All commands work in any topic or in the main forum chat.
 
 **Multiple agents** — Each tab can have a different agent model. Mix and match.
 
+![Message to another agent](images/10_message_other_agent.png)
+
 ## Monitoring
 
 ```bash
