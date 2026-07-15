@@ -37,6 +37,21 @@ describe("coordinateTurn", () => {
     expect(calls).toEqual(["jsonl unavailable"]);
   });
 
+  it("publishes a blocked question and releases the turn without waiting for timeout", async () => {
+    const wrapper: AgentWrapper = {
+      submit: async () => {},
+      status: async () => ({ state: "blocked", question: "1. Continue\n2. Stop" }),
+    };
+    const calls: string[] = [];
+    await coordinateTurn(wrapper, {
+      progress: async () => { calls.push("progress"); },
+      final: async () => { calls.push("final"); },
+      blocked: async (question) => { calls.push(`blocked:${question}`); },
+      failed: async () => { calls.push("failed"); },
+    }, { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 5000 }, fakeClock());
+    expect(calls).toEqual(["blocked:1. Continue\n2. Stop"]);
+  });
+
   it("forwards a changed preview once and suppresses repeated previews", async () => {
     const statuses = [
       { state: "working" as const, preview: "step one" },

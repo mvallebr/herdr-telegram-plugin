@@ -86,4 +86,18 @@ describe("agent wrappers", () => {
     c.advance(1000);
     expect(await wrapper.status()).toEqual({ state: "final", text: "unrelated final answer", source: "screen-scrape" });
   });
+
+  it("reports a Herdr-blocked interactive question instead of a final screen response", async () => {
+    const wrapper = new ScreenScrapeWrapper("pane", 50, 1000, {
+      now: () => 0,
+      sendText: () => {},
+      getStatus: () => "blocked",
+      readPane: () => "→ Asked 1 question\n\nWhat should happen next?\n1. Continue\n2. Stop",
+    });
+    await wrapper.submit("prompt");
+    expect(await wrapper.status()).toEqual({
+      state: "blocked",
+      question: "What should happen next?\n1. Continue\n2. Stop",
+    });
+  });
 });

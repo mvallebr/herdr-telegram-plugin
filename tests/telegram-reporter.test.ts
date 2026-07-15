@@ -26,6 +26,15 @@ describe("TelegramTurnReporter", () => {
     expect(messages[0]).toContain("No terminal output was forwarded");
   });
 
+  it("formats an interactive agent question as blocked instead of Working", async () => {
+    const messages: string[] = [];
+    const reporter = new TelegramTurnReporter({
+      sendMessage: async (_chat, _thread, text) => { messages.push(text); return 1; },
+    } as any, 1, 2, () => 0, 0);
+    await reporter.blocked("Choose one:\n1. Continue\n2. Stop");
+    expect(messages[0]).toBe("⚠️ Agent needs input:\n\nChoose one:\n1. Continue\n2. Stop");
+  });
+
   it("labels a progress preview as Working rather than a final response", async () => {
     const messages: string[] = [];
     const reporter = new TelegramTurnReporter({

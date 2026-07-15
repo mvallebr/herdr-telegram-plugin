@@ -2,6 +2,7 @@ import type { AgentWrapper } from "./agent-wrapper.js";
 
 export interface TurnReporter {
   progress(elapsedSeconds: number, preview?: string): Promise<void>;
+  blocked(question?: string): Promise<void>;
   final(text: string, source: string, alreadyPublished?: boolean): Promise<void>;
   failed(reason: string): Promise<void>;
 }
@@ -31,6 +32,10 @@ export async function coordinateTurn(
     }
     if (status.state === "failed") {
       await reporter.failed(status.reason);
+      return;
+    }
+    if (status.state === "blocked") {
+      await reporter.blocked(status.question);
       return;
     }
     await deps.sleep(options.progressIntervalMs);

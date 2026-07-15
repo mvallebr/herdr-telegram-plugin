@@ -40,6 +40,11 @@ export class TelegramTurnReporter implements TurnReporter {
     await this.telegram.sendMessage(this.chatId, this.threadId, `✅ (${formatElapsed(elapsed)})${body}`);
   }
 
+  async blocked(question?: string): Promise<void> {
+    const body = question?.trim() ? `:\n\n${truncate(question)}` : ". Send a reply in this topic to continue.";
+    await this.telegram.sendMessage(this.chatId, this.threadId, `⚠️ Agent needs input${body}`);
+  }
+
   async failed(reason: string): Promise<void> {
     if (reason.includes("Codex JSONL")) {
       await this.telegram.sendMessage(this.chatId, this.threadId, "⚠️ Codex finished, but the bridge could not safely correlate its session-log response. No terminal output was forwarded.");

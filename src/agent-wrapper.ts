@@ -6,6 +6,7 @@ import type { OutputSource } from "./output-reader.js";
 
 export type AgentStatus =
   | { state: "working"; preview?: string }
+  | { state: "blocked"; question?: string }
   | { state: "final"; text: string; source: OutputSource }
   | { state: "failed"; reason: string };
 

@@ -56,6 +56,9 @@ export class ScreenScrapeWrapper implements AgentWrapper {
     } catch {
       return { state: "working" };
     }
+    if (this.deps.getStatus?.() === "blocked") {
+      return { state: "blocked", question: extractBlockedQuestion(current) };
+    }
     const stableCurrent = stripStatusBar(current);
     const anchored = extractScreenResponse(current, this.prompt) || extractScreenDelta(this.initialContent, stableCurrent);
     const isIdle = this.deps.getStatus?.() === "idle" || this.deps.getStatus?.() === "done";
@@ -82,6 +85,13 @@ export class ScreenScrapeWrapper implements AgentWrapper {
     }
     return { state: "final", text: response, source: "screen-scrape" };
   }
+}
+
+function extractBlockedQuestion(content: string): string | undefined {
+  const marker = content.lastIndexOf("Asked 1 question");
+  const block = marker >= 0 ? content.slice(marker) : content;
+  const question = cleanPaneOutput(block.split("\n").filter((line) => !line.includes("Asked 1 question")).join("\n"));
+  return question || undefined;
 }
 
 /** Structured-log adapter (Codex, Pi, OMP and future session-log agents). */

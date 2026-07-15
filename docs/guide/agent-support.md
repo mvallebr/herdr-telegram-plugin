@@ -14,6 +14,10 @@ All agents share the same turn lifecycle: submit once, poll `status()`, publish 
 
 `progress_interval_ms` controls both wrapper polling and the required quiet period for screen scraping. The Coordinator emits a neutral `Working` heartbeat at that cadence; a wrapper may attach a new safe preview. The final message is only sent when the wrapper reports `final`.
 
+## Interactive questions
+
+Some terminal agents can pause for a decision. When Herdr reports `agent_status: blocked`, the screen-scrape wrapper returns `blocked` instead of waiting indefinitely. Telegram receives the extracted question and choices as `⚠️ Agent needs input`; reply in the same topic to continue. A blocked turn releases that pane's queue so the reply can be sent to the agent.
+
 Telegram messages are capped below 4,096 characters. Longer final responses are truncated with an indication.
 
 ## Contributing a wrapper
