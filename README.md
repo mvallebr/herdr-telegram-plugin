@@ -83,6 +83,16 @@ topic → pane → reply round trip in Telegram.
 
 The daemon connects to Telegram via grammy and to herdr via CLI (`spawnSync`). A watcher syncs herdr tabs to forum topics every 15s. A shared turn coordinator sends the prompt once, polls an agent wrapper at the configured interval, and publishes neutral progress until a safe final result arrives. Codex/Pi/OMP use session logs; other agents use anchor-based screen scraping.
 
+## Agent support
+
+| Agent | Output adapter |
+|---|---|
+| Codex | Correlated JSONL `final_answer` |
+| Pi / OMP | Herdr-provided JSONL session path |
+| OpenCode and other agents | Screen scraping with prompt anchor, snapshot delta, and stable-screen fallback |
+
+See the [full support matrix](docs/guide/agent-support.md). To contribute a wrapper or report a bug, read [CONTRIBUTING.md](CONTRIBUTING.md).
+
 [→ Full documentation](https://mvallebr.github.io/herdr-telegram-plugin/)
 
 ## License

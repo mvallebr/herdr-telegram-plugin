@@ -32,6 +32,7 @@ export default defineConfig({
         text: "Guide",
         items: [
           { text: "Configuration", link: "/guide/configuration" },
+          { text: "Agent Support", link: "/guide/agent-support" },
           { text: "Commands", link: "/guide/commands" },
           { text: "Troubleshooting", link: "/guide/troubleshooting" },
         ],

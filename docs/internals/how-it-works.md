@@ -25,49 +25,27 @@ Long-running Node.js process. Starts a [grammy](https://grammy.dev) bot that lis
 
 Polls herdr's agent list every 15 seconds. Detects new, renamed, closed, and recreated panes. Syncs detected changes to Telegram by creating/renaming/deleting forum topics. Also runs periodic health checks to detect topics that were deleted manually.
 
-### Wait Loop (`wait-loop.ts`)
+### Turn Coordinator and wrappers
 
-Handles a single message turn. When you send a text message to a topic:
+`TurnCoordinator` owns polling cadence, heartbeats, progress limits, and final delivery. Each `AgentWrapper` owns only agent transport and reports `working`, `final`, or `failed`.
 
-#### Phase 1: Detect change
-
-```
-sendText(paneId, userText)          # type the message into the pane
-read first snapshot                  # capture post-send state
-poll until pane content changes       # agent picks up the input
-```
-
-#### Phase 2: Stability detection
+For screen-scraped agents, the wrapper submits the prompt, captures a snapshot, and extracts output using the prompt anchor or a changed snapshot. Structured agents (Codex, Pi, OMP) use session logs instead.
 
 ```
-poll every 1 second
-  strip status bar lines             # pi cost/token display ignores
-  if real content changed:
-    reset stability timer
-    send ⏳ Working (Xs): [progress]  # throttled (configurable)
-    track progress count             # capped by max_progress_updates
-  if no real changes for 3s:
-    → break (agent done typing)
+submit(prompt)
+status() → working | final | failed
+Coordinator polls every progress_interval_ms
+  → ⏳ Working heartbeat or safe preview
+  → ✅ only after final
 ```
 
 :::info Status bar filtering
 The pi agent refreshes its status bar (cost, token usage) every ~2 seconds. `stripStatusBar()` removes these trailing lines before comparing content, so status bar refreshes don't reset the stability timer.
 :::
 
-#### Phase 3: Extract response
+### Screen-scrape extraction
 
-```
-read final pane content
-extractResponseSince(content, userText)
-  │  find last line containing userInput
-  │  return everything after it
-  │  trim trailing noise (separators, status bars, prompts)
-send ✅ (Xs): [response]
-```
-
-### Anchor-based extraction (`extractResponseSince`)
-
-Instead of computing a line-level diff between before/after snapshots of the pane (which breaks when the pane scrolls or separators are cleaned), the response is extracted by anchoring on the **user's input line** in the current content.
+The first choice is the user's prompt as an anchor in the current screen. If a UI removes that prompt, the wrapper compares the post-submit snapshot with the changed screen. When Herdr also confirms `idle`, it can use the cleaned changed screen as a final fallback.
 
 This is robust against:
 - **Pane scrolling** — lines shift at the top, but the user's input anchor stays
@@ -80,12 +58,12 @@ This is robust against:
 ```
 1. User types "what's the status?" in Telegram topic t1-renamed
 2. Grammy receives the update → message:text handler fires
-3. Handler calls runAgentTurn(paneId="w1:p1M", ..., text="what's the status?")
-4. sendText → herdr CLI types the message into pane w1:p1M
-5. Phase 1: polls pane until content changes (agent starts working)
-6. Phase 2: polls every 1s, strips status bars, sends ⏳ Working every 60s
-7. Phase 3: reads final content, anchors on "what's the status?", extracts response
-8. sendMessage → "✅ (8s): Tests are all passing..."
+3. Handler enqueues the turn for its pane; other panes continue independently
+4. Wrapper submits the prompt through herdr CLI
+5. Coordinator polls `status()` at `progress_interval_ms`
+6. Telegram receives a `⏳ Working` heartbeat or a new safe preview
+7. Wrapper reports `final` from a session log or stable screen output
+8. Telegram receives `✅` with the final response
 ```
 
 ## State
