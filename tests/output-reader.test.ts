@@ -75,6 +75,32 @@ describe("readAgentOutput", () => {
     expect(result?.source).toBe("omp-jsonl");
   });
 
+  it("preserves a Codex JSONL source instead of labelling it as pi", async () => {
+    const sessionPath = writeSession("ignored");
+    const result = await readAgentOutput({
+      paneId: "w1:pX", prompt: "hi", maxWaitS: 5,
+      deps: {
+        sendText: () => {}, waitIdle: () => ({ status: "idle" as const }), readPane: () => "",
+        getAgentInfo: () => ({ agent: "codex", pane_id: "w1:pX", tab_id: "w1:tX", workspace_id: "w1", agent_session: { kind: "path", path: sessionPath } }),
+        readJsonl: () => ({ text: "Codex reply", timestamp: "", source: "codex-jsonl" }), now: () => 1000,
+      },
+    });
+    expect(result?.source).toBe("codex-jsonl");
+  });
+
+  it("fails closed for Codex when its JSONL response cannot be correlated", async () => {
+    const sessionPath = writeSession("ignored");
+    const result = await readAgentOutput({
+      paneId: "w1:pX", prompt: "hi", maxWaitS: 5,
+      deps: {
+        sendText: () => {}, waitIdle: () => ({ status: "idle" as const }), readPane: () => "unrelated terminal text",
+        getAgentInfo: () => ({ agent: "codex", pane_id: "w1:pX", tab_id: "w1:tX", workspace_id: "w1", agent_session: { kind: "path", path: sessionPath } }),
+        readJsonl: () => null, now: () => 1000, sleep: async () => {},
+      },
+    });
+    expect(result).toMatchObject({ source: "unavailable", text: "" });
+  });
+
   it("falls back to scrape when no agent_session reported", async () => {
     const result = await readAgentOutput({
       paneId: "w1:pX",

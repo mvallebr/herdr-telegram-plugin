@@ -8,7 +8,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "npm run build && vitest run",
+    "smoke": "npm run build && node scripts/smoke.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"

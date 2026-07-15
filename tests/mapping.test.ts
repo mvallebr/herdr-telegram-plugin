@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { matchTopic, resolveOrphanTopics, seedKnownTabs } from "../src/mapping.js";
+import { matchTopic, resolveOrphanTopics, seedKnownTabs, restoreKnownTabMappings } from "../src/mapping.js";
 import type { PaneInfo, TopicInfo, ThreadMapping } from "../src/types.js";
 
 describe("matchTopic", () => {
@@ -100,5 +100,20 @@ describe("seedKnownTabs", () => {
     const result = seedKnownTabs(map, panes, existing);
     // Already-seeded entry is NOT overwritten (rename detection is the watcher's job)
     expect(result["w1:tA"]).toEqual({ label: "Agent A", thread_id: 10 });
+  });
+});
+
+describe("restoreKnownTabMappings", () => {
+  it("prefers the current known-tab topic over a stale mapping for the same pane", () => {
+    const panes: PaneInfo[] = [{
+      pane_id: "w1:pC", tab_id: "w1:tC", label: "Codex", agent: "codex", workspace_id: "w1", status: "idle",
+    }];
+    const previous = new Map<number, ThreadMapping>([
+      [695, { pane_id: "w1:pC", label: "Codex", agent: "codex", created_at: "old" }],
+      [775, { pane_id: "w1:pC", label: "Codex", agent: "codex", created_at: "new" }],
+    ]);
+    const restored = restoreKnownTabMappings(panes, { "w1:tC": { label: "Codex", thread_id: 775 } }, previous);
+    expect([...restored.keys()]).toEqual([775]);
+    expect(restored.get(775)?.pane_id).toBe("w1:pC");
   });
 });

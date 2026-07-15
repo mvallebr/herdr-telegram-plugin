@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Spawn tests for `node dist/index.js`. These verify the CLI behaves the same
@@ -12,7 +13,7 @@ import { homedir } from "node:os";
  * the user runs `node dist/index.js --status` from there).
  */
 
-const PLUGIN_ROOT = join(homedir(), "git/herdr-telegram-plugin");
+const PLUGIN_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DIST_ENTRY = join(PLUGIN_ROOT, "dist/index.js");
 
 function runCli(args: string[], opts: { cwd?: string } = {}): {
@@ -51,15 +52,37 @@ describe("CLI: --status", () => {
     expect([0, 1]).toContain(r.status);
     expect(r.stdout).toMatch(/^(Daemon: (running|not running))/);
   });
+
+  it("reports the persisted polling state for a live PID", () => {
+    const stateRoot = mkdtempSync(join(tmpdir(), "herdr-status-test-"));
+    const daemonDir = join(stateRoot, "herdr-telegram");
+    mkdirSync(daemonDir, { recursive: true });
+    writeFileSync(join(daemonDir, "daemon.pid"), String(process.pid));
+    writeFileSync(join(daemonDir, "state.json"), JSON.stringify({ authorized_chat_id: null }));
+    writeFileSync(join(daemonDir, "polling-status.json"), JSON.stringify({ state: "retrying" }));
+    const previous = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = stateRoot;
+    try {
+      const r = runCli(["--status"]);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("Polling: retrying");
+    } finally {
+      process.env.XDG_STATE_HOME = previous;
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("CLI: --daemon (lifecycle)", () => {
   let stateDir: string;
+  let configDir: string;
 
   beforeEach(() => {
     // Point state at a temp dir so we don't disturb the user's actual state.
     stateDir = mkdtempSync(join(tmpdir(), "herdr-cli-test-"));
+    configDir = mkdtempSync(join(tmpdir(), "herdr-cli-config-test-"));
     process.env.XDG_STATE_HOME = stateDir;
+    process.env.HERDR_TG_CONFIG_DIR = configDir;
     // Kill any daemon from a previous test run
     const pidFile = join(stateDir, "herdr-telegram/daemon.pid");
     if (existsSync(pidFile)) {
@@ -77,13 +100,24 @@ describe("CLI: --daemon (lifecycle)", () => {
       } catch {}
     }
     delete process.env.XDG_STATE_HOME;
+    delete process.env.HERDR_TG_CONFIG_DIR;
     if (existsSync(stateDir)) {
       try { rmSync(stateDir, { recursive: true }); } catch {}
+    }
+    if (existsSync(configDir)) {
+      try { rmSync(configDir, { recursive: true }); } catch {}
     }
   });
 
   // NOTE: starting a real daemon requires a bot token in config + network.
   // We skip this in CI; the unit tests for daemon internals cover the logic.
+
+  it("does not leave a PID file when startup validation fails", () => {
+    const result = runCli(["--daemon"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("bot_token not found");
+    expect(existsSync(join(stateDir, "herdr-telegram/daemon.pid"))).toBe(false);
+  });
 
   it.skip("starts a daemon, second invocation refuses to double-start", () => {
     // Skipped because requires real Telegram bot config. To run locally:

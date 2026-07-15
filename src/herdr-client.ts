@@ -1,4 +1,4 @@
-import { spawnSync, spawn, type ChildProcess } from "node:child_process";
+import { spawnSync, spawn, type ChildProcess } from "./child-process.js";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -193,6 +193,7 @@ export function readPane(paneId: string, lines: number): string {
 
 export interface AgentInfo {
   agent: string;
+  agent_status: string;
   pane_id: string;
   tab_id: string;
   workspace_id: string;
@@ -227,6 +228,7 @@ export function getAgentInfo(target: string): AgentInfo | null {
   }
   return {
     agent: a.agent ?? "?",
+    agent_status: a.agent_status ?? "unknown",
     pane_id: String(a.pane_id ?? target),
     tab_id: String(a.tab_id ?? ""),
     workspace_id: String(a.workspace_id ?? ""),

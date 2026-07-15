@@ -29,4 +29,6 @@ export interface DaemonState {
   /** Tabs the bot has observed. Maps tab_id -> { label, thread_id }.
    *  Used by the watcher to detect new/closed/renamed tabs. */
   known_tabs?: Record<string, { label: string; thread_id: number }>;
+  /** Recently handled Telegram update ids, retained to prevent replay after restart. */
+  processed_update_ids?: number[];
 }
