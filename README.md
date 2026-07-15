@@ -32,6 +32,7 @@ Then point herdr at it: `herdr plugin link .`
 mkdir -p ~/.config/herdr-telegram
 echo '[telegram]' > ~/.config/herdr-telegram/config.toml
 echo 'bot_token = "YOUR_BOT_TOKEN"' >> ~/.config/herdr-telegram/config.toml
+echo 'progress_interval_ms = 15000' >> ~/.config/herdr-telegram/config.toml
 ```
 
 ### Start the daemon
@@ -49,6 +50,23 @@ Or, equivalently, the daemon auto-launches when needed by Telegram activity
 
 Then open Telegram, find your bot's private chat, and send `/pair`.
 
+The daemon keeps a single long-poll connection. Temporary Telegram failures,
+including a `409 Conflict` after a supervised restart, are retried with
+backoff; invalid bot credentials fail fast. Use `node dist/index.js --status`
+to inspect the process and polling state.
+
+### Operational smoke check
+
+Run this only on a machine with Herdr and a real bot configuration:
+
+```bash
+npm run smoke
+```
+
+It validates `herdr agent list` and the bot credentials without consuming
+updates or sending messages. Then start the daemon and verify one manual
+topic → pane → reply round trip in Telegram.
+
 ## Commands
 
 | Command | What it does |
@@ -63,7 +81,7 @@ Then open Telegram, find your bot's private chat, and send `/pair`.
 
 ## How it works
 
-The daemon connects to Telegram via grammy and to herdr via CLI (`spawnSync`). A watcher syncs herdr tabs to forum topics every 15s. Messages are forwarded to agent panes; responses are extracted via anchor-based content polling.
+The daemon connects to Telegram via grammy and to herdr via CLI (`spawnSync`). A watcher syncs herdr tabs to forum topics every 15s. A shared turn coordinator sends the prompt once, polls an agent wrapper at the configured interval, and publishes neutral progress until a safe final result arrives. Codex/Pi/OMP use session logs; other agents use anchor-based screen scraping.
 
 [→ Full documentation](https://mvallebr.github.io/herdr-telegram-plugin/)
 

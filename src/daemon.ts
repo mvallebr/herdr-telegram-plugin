@@ -1,17 +1,19 @@
 import { TelegramClient } from "./telegram-client.js";
 import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
-import { reconcile, findMapping, seedKnownTabs } from "./mapping.js";
+import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
 import { runAgentTurn } from "./wait-loop.js";
 import { getAgents, readPane } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
-import { loadState, saveState } from "./state.js";
+import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
+import { TurnDispatcher } from "./turn-dispatcher.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
 
-export async function startDaemon(configDir?: string, stateDir?: string): Promise<{ stop: () => void }> {
+export async function startDaemon(configDir?: string, stateDir?: string): Promise<{ stop: () => Promise<void> }> {
   const log = createLogger("daemon");
   const cfg = loadConfig(configDir);
   const statePath = stateDir ?? path.join(
@@ -23,26 +25,44 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   // Ensure known_topics is always initialized so in-place mutations persist
   state.known_topics = state.known_topics ?? {};
 
-  const tg = new TelegramClient(cfg.botToken);
+  const pollingStatusPath = path.join(statePath, "polling-status.json");
+  const tg = new TelegramClient(cfg.botToken, (polling) => {
+    mkdirSync(statePath, { recursive: true });
+    writeFileSync(pollingStatusPath, JSON.stringify({ ...polling, updatedAt: new Date().toISOString() }) + "\n");
+    const data = { state: polling.state, attempt: polling.attempt, error: polling.error };
+    if (polling.state === "retrying" || polling.state === "failed") log.warn("Telegram polling state", data);
+    else log.info("Telegram polling state", data);
+  });
 
   // Re-validate existing pairing
   if (isPaired(state) && state.authorized_chat_id) {
     const errors = await tg.validatePermissions(state.authorized_chat_id);
     if (errors.length > 0) {
       log.warn("Permission validation failed on startup", { errors });
-      await tg.sendMessage(
-        state.authorized_chat_id, 1, // send to General topic (thread 1)
-        "⚠️ Permission check failed:\n" + errors.map(e => "- " + e).join("\n") +
-        "\n\nBridge in read-only mode. Fix permissions and restart."
-      );
+      // A transient Telegram outage must not make a healthy daemon impossible
+      // to start. Polling has its own retry loop; this notification is best effort.
+      try {
+        await tg.sendMessage(
+          state.authorized_chat_id, 1, // send to General topic (thread 1)
+          "⚠️ Permission check failed:\n" + errors.map(e => "- " + e).join("\n") +
+          "\n\nBridge in read-only mode. Fix permissions and restart."
+        );
+      } catch (err) {
+        log.warn("Could not send permission warning", { message: err instanceof Error ? err.message : String(err) });
+      }
     }
   }
 
+  const startupPanes = isPaired(state) ? getAgents() : [];
+  const previousMappings = new Map<number, DaemonState["thread_mappings"][keyof DaemonState["thread_mappings"]]>(
+    Object.entries(state.thread_mappings).map(([threadId, mapping]) => [Number(threadId), mapping])
+  );
+  const startupMappings = restoreKnownTabMappings(startupPanes, state.known_tabs, previousMappings);
   const map = isPaired(state) && state.authorized_chat_id
     ? await reconcile(
         state.authorized_chat_id!,
         tg,
-        new Map(), // no existing mappings on cold start
+        startupMappings,
         state.known_topics!
       )
     : new Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>();
@@ -51,7 +71,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   const rawMappings: DaemonState["thread_mappings"] = {};
   for (const [tid, m] of map.entries()) rawMappings[tid] = m;
   // Seed known_tabs from initial reconcile so the watcher has a baseline
-  state.known_tabs = seedKnownTabs(map, isPaired(state) ? getAgents() : [], state.known_tabs ?? {});
+  state.known_tabs = seedKnownTabs(map, startupPanes, state.known_tabs ?? {});
   saveState(statePath, {
     ...state,
     thread_mappings: rawMappings,
@@ -69,6 +89,27 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       saveState(statePath, { ...state, thread_mappings: raw });
     },
   };
+  const turns = new TurnDispatcher();
+
+  // Telegram can replay an update when long polling is interrupted around a
+  // restart. Persist a small update-id window so a replay never re-prompts an
+  // agent (and never creates a duplicate Telegram reply).
+  tg.bot.use(async (ctx, next) => {
+    const latest = loadState(statePath);
+    if (rememberUpdateId(latest, ctx.update.update_id)) {
+      log.warn("Ignoring replayed Telegram update", { updateId: ctx.update.update_id });
+      return;
+    }
+    log.info("Telegram update accepted", {
+      updateId: ctx.update.update_id,
+      messageId: ctx.message?.message_id,
+      threadId: ctx.message?.message_thread_id,
+      text: ctx.message?.text?.slice(0, 80),
+    });
+    state.processed_update_ids = latest.processed_update_ids;
+    saveState(statePath, latest);
+    await next();
+  });
 
   registerCommands(tg.bot, deps);
 
@@ -268,12 +309,22 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     });
     if (!mapping) return; // unbound thread — ignore
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
-    await runAgentTurn(
-      mapping.pane_id, threadId,
-      "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
-      cfg, tg, state.authorized_chat_id!,
-      50 // read only last 50 lines to avoid stale context-mode banners
-    );
+    turns.enqueue(mapping.pane_id, async () => {
+      try {
+        await runAgentTurn(
+          mapping.pane_id, threadId,
+          "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
+          cfg, tg, state.authorized_chat_id!
+        );
+      } catch (err) {
+        log.error("Digest turn failed", {
+          paneId: mapping.pane_id,
+          threadId,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
+      }
+    });
   });
 
   // Pairing flow (grammy command handler — kept for when grammy works)
@@ -348,7 +399,20 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       return;
     }
 
-    await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
+    // Do not await an agent turn in Grammy's update handler: a slow Codex
+    // turn must not stop Telegram from routing a new message to OpenCode.
+    turns.enqueue(mapping.pane_id, async () => {
+      try {
+        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
+      } catch (err) {
+        log.error("Agent turn failed", {
+          paneId: mapping.pane_id,
+          threadId,
+          message: err instanceof Error ? err.message : String(err),
+        });
+        await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
+      }
+    });
   });
 
   // Handle inline keyboard taps for thread binding
@@ -431,13 +495,13 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply(parts.join("\n"));
   });
 
-  tg.start();
+  await tg.start();
   log.info("Daemon started", { paired: isPaired(state), panes: map.size });
 
   maybeStartWatcher();
   deps.stopWatcher = () => watcherController.abort();
 
   return {
-    stop: () => tg.bot.stop(),
+    stop: () => tg.stop(),
   };
 }

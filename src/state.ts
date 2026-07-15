@@ -22,7 +22,16 @@ export function loadState(stateDir?: string): DaemonState {
   // Backfill new fields for older state files
   if (!parsed.known_topics) parsed.known_topics = {};
   if (!parsed.known_tabs) parsed.known_tabs = {};
+  if (!parsed.processed_update_ids) parsed.processed_update_ids = [];
   return parsed;
+}
+
+/** Records an update id and returns true when it has already been processed. */
+export function rememberUpdateId(state: DaemonState, updateId: number, maxEntries = 200): boolean {
+  const ids = state.processed_update_ids ?? [];
+  if (ids.includes(updateId)) return true;
+  state.processed_update_ids = [...ids, updateId].slice(-maxEntries);
+  return false;
 }
 
 export function saveState(stateDir: string | undefined, state: DaemonState): void {

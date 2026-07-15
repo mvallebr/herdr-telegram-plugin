@@ -4,6 +4,8 @@ import {
   formatElapsed,
   cleanPaneOutput,
   extractResponseSince,
+  extractScreenResponse,
+  extractScreenDelta,
   runAgentTurn,
   type WaitLoopDeps,
 } from "../src/wait-loop.js";
@@ -25,6 +27,7 @@ const dummyCfg = {
   throttleMs: 100,
   maxTotalWaitS: 30,
   maxProgressUpdates: -1, // unlimited for tests
+  progressIntervalMs: 100,
 };
 
 describe("shouldThrottle", () => {
@@ -169,6 +172,39 @@ describe("extractResponseSince", () => {
   });
 });
 
+describe("extractScreenResponse", () => {
+  it("returns empty when the exact prompt is absent instead of leaking terminal text", () => {
+    const content = [
+      "older output",
+      "› a wrapped or transformed prompt",
+      "Useful final answer",
+      "─".repeat(31),
+      "status · 10%",
+    ].join("\n");
+    expect(extractScreenResponse(content, "original long prompt")).toBe("");
+  });
+
+  it("still returns the exact anchored response", () => {
+    expect(extractScreenResponse("prompt\nclean reply", "prompt")).toBe("clean reply");
+  });
+
+  it("keeps an OpenCode prompt anchor after stripping its terminal border", () => {
+    const prompt = "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.";
+    const pane = `┃  ${prompt}\n┃\n┃  Original goal\n┃  A clean summary`;
+    expect(extractScreenResponse(pane, prompt)).toBe("Original goal\nA clean summary");
+  });
+});
+
+describe("extractScreenDelta", () => {
+  it("returns only new terminal text when a prompt disappears after submit", () => {
+    expect(extractScreenDelta("header\nold", "header\nnew answer")).toBe("new answer");
+  });
+
+  it("fails closed when there is no stable shared prefix", () => {
+    expect(extractScreenDelta("old", "unrelated")).toBe("");
+  });
+});
+
 describe("runAgentTurn (content-based polling)", () => {
   function makeFakeClock(startMs = 0) {
     let now = startMs;
@@ -209,9 +245,8 @@ describe("runAgentTurn (content-based polling)", () => {
     });
     expect(order[0]).toBe("sendText");
     expect(order[1]).toBe("readPane:postSend");
-    const sent = tg.sent[tg.sent.length - 1].text;
-    expect(sent).toContain("agent response line");
-    expect(sent).not.toContain("old content");
+    expect(tg.sent.some((m) => m.text.includes("agent response line"))).toBe(true);
+    expect(tg.sent[tg.sent.length - 1].text).toBe("✅ (0s).");
   });
 
   it("waits for pane to stabilize before sending final response", async () => {
@@ -241,9 +276,8 @@ describe("runAgentTurn (content-based polling)", () => {
       stabilityWindowMs: 50,
     });
     expect(readIdx).toBeGreaterThanOrEqual(4);
-    const finalSent = tg.sent[tg.sent.length - 1].text;
-    expect(finalSent).toContain("more");
-    expect(finalSent).not.toContain("old"); // prefix content stripped by anchor
+    expect(tg.sent.some((m) => m.text.includes("more"))).toBe(true);
+    expect(tg.sent[tg.sent.length - 1].text).toBe("✅ (0s).");
   });
 
   it("sends Working progress updates while pane is still changing", async () => {
@@ -316,9 +350,9 @@ describe("runAgentTurn (content-based polling)", () => {
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
     });
-    const sent = tg.sent[tg.sent.length - 1].text;
-    expect(sent).toContain("... (truncated");
-    expect(sent.length).toBeLessThan(4200);
+    const preview = tg.sent.find((m) => m.text.includes("... (truncated"));
+    expect(preview?.text).toContain("... (truncated");
+    expect(preview?.text.length).toBeLessThan(4200);
   });
 
   it("strips context-mode banner before sending", async () => {
@@ -347,11 +381,11 @@ more agent output`;
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
     });
-    const sent = tg.sent[tg.sent.length - 1].text;
-    expect(sent).not.toContain("context-mode active");
-    expect(sent).not.toContain("<session_state");
-    expect(sent).toContain("agent output");
-    expect(sent).toContain("more agent output");
-    expect(sent).not.toContain("old content");
+    const preview = tg.sent.find((m) => m.text.includes("agent output"))?.text ?? "";
+    expect(preview).not.toContain("context-mode active");
+    expect(preview).not.toContain("<session_state");
+    expect(preview).toContain("agent output");
+    expect(preview).toContain("more agent output");
+    expect(preview).not.toContain("old content");
   });
 });

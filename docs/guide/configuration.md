@@ -18,43 +18,28 @@ bot_token = "..."           # required — from @BotFather
 
 # --- Waiting & timeouts ---
 
-throttle_ms = 60000         # min ms between ⏳ Working progress updates
+progress_interval_ms = 15000 # ask the agent wrapper for status every 15s
 max_total_wait_s = 1800     # max seconds total for an agent turn (30 min)
-max_progress_updates = 120  # Working updates before giving up (-1 = never)
+max_progress_updates = 60   # maximum ⏳ Working updates (-1 = unlimited)
 ```
 
 ## Options in detail
 
-### throttle_ms
+### progress_interval_ms
 
-Controls how often `⏳ Working` progress messages are sent while the agent is still producing output. Default: `60000` (1 minute).
+Controls how often the shared turn coordinator asks the selected agent wrapper for its status. If it is still working, Telegram receives one neutral `⏳ Working` message. Default: `15000` (15 seconds).
 
-Lower values give more frequent updates but can clutter the chat. Higher values reduce noise at the cost of less visibility into what the agent is doing.
+This applies equally to Codex JSONL, Pi/OMP JSONL, and screen-scraped agents. Lower values give more frequent updates but can clutter the chat.
+
+For the screen-scrape fallback (such as OpenCode), this same interval is also the required quiet time before output can be final. One configuration controls both polling and stability.
 
 ### max_total_wait_s
 
-Hard timeout in seconds for the entire agent turn. If the agent doesn't respond within this time, the wait loop exits and sends whatever it has.
+Hard timeout in seconds for the entire agent turn. If no wrapper returns a safe final response in time, the bot sends a timeout warning. It does not forward uncorrelated terminal content.
 
 ### max_progress_updates
 
-Number of `⏳ Working` progress messages before the bot gives up.
-
-| Value | Effective max wait (with default throttle) |
-|---|---|
-| `10`  | ~10 minutes |
-| `60`  | ~1 hour |
-| `120` | ~2 hours |
-| `-1`  | Never give up |
-
-When the limit is reached, the bot sends:
-
-```
-⚠️ Agent didn't respond in time.
-
-[last known output]
-
-Try /digest for a summary.
-```
+Maximum number of neutral `⏳ Working` messages for a turn. Polling continues until `max_total_wait_s`; this setting only limits chat noise. Use `-1` for unlimited updates.
 
 ## Environment variables
 

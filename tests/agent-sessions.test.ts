@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   readPiSessionResponse,
+  readCodexSessionResponse,
+  readCodexSessionProgress,
   readAgentSessionResponse,
   pickOutputStrategy,
 } from "../src/agent-sessions.js";
@@ -143,6 +145,49 @@ describe("readPiSessionResponse", () => {
     const path = writeSession(content);
     const result = readPiSessionResponse(path, 0);
     expect(result?.text).toBe("ok");
+  });
+});
+
+describe("readCodexSessionResponse", () => {
+  let tmpDir: string;
+  beforeEach(() => { tmpDir = mkdtempSync(join(tmpdir(), "codex-jsonl-")); });
+  afterEach(() => { rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it("returns the newest final assistant output_text after the send timestamp", () => {
+    const path = join(tmpDir, "rollout.jsonl");
+    writeFileSync(path, [
+      JSON.stringify({ timestamp: "2026-07-15T00:00:01.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "old" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:05.000Z", type: "response_item", payload: { type: "reasoning", role: "assistant", content: [] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:06.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "partial reply" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:08.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "clean Codex reply" }] } }),
+    ].join("\n"));
+    const response = readCodexSessionResponse(path, Date.parse("2026-07-15T00:00:02.000Z"));
+    expect(response).toMatchObject({ text: "clean Codex reply", source: "codex-jsonl" });
+  });
+
+  it("correlates an assistant reply to the matching user prompt", () => {
+    const path = join(tmpDir, "correlated.jsonl");
+    writeFileSync(path, [
+      JSON.stringify({ timestamp: "2026-07-15T00:00:03.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "other request" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:04.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "wrong reply" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:05.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "telegram request" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:06.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "correct reply" }] } }),
+    ].join("\n"));
+    expect(readCodexSessionResponse(path, Date.parse("2026-07-15T00:00:02.000Z"), "telegram request")?.text)
+      .toBe("correct reply");
+  });
+
+  it("returns correlated commentary only as progress, never the final answer", () => {
+    const path = join(tmpDir, "progress.jsonl");
+    writeFileSync(path, [
+      JSON.stringify({ timestamp: "2026-07-15T00:00:03.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "other" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:04.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "wrong progress" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:05.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "telegram request" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:06.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "current progress" }] } }),
+      JSON.stringify({ timestamp: "2026-07-15T00:00:07.000Z", type: "response_item", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "final only" }] } }),
+    ].join("\n"));
+    expect(readCodexSessionProgress(path, Date.parse("2026-07-15T00:00:02.000Z"), "telegram request")?.text)
+      .toBe("current progress");
   });
 });
 

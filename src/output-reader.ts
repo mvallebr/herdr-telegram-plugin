@@ -11,11 +11,11 @@
 import { readPane, getAgentInfo, sendText, waitIdle } from "./herdr-client.js";
 import {
   pickOutputStrategy,
-  readPiSessionResponse,
+  readAgentSessionResponse,
   type AgentResponse,
 } from "./agent-sessions.js";
 
-export type OutputSource = "pi-jsonl" | "omp-jsonl" | "screen-scrape";
+export type OutputSource = "pi-jsonl" | "omp-jsonl" | "codex-jsonl" | "screen-scrape" | "unavailable";
 
 export interface ExtractedOutput {
   text: string;
@@ -31,9 +31,11 @@ export interface OutputReaderDeps {
   /** Override for getAgentInfo (testing). */
   getAgentInfo?: (target: string) => ReturnType<typeof getAgentInfo>;
   /** Override for jsonl reader (testing). */
-  readJsonl?: (path: string, sinceMs: number) => AgentResponse | null;
+  readJsonl?: (path: string, sinceMs: number, prompt?: string) => AgentResponse | null;
   /** Now in ms (override for tests). */
   now?: () => number;
+  /** Delay used while a session log flushes after the agent becomes idle. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export const defaultDeps: Required<OutputReaderDeps> = {
@@ -41,10 +43,9 @@ export const defaultDeps: Required<OutputReaderDeps> = {
   waitIdle,
   readPane,
   getAgentInfo,
-  // Default reader is generic — supports pi + omp + unknown agents that
-  // happen to use the same jsonl format.
-  readJsonl: (path, sinceMs) => readPiSessionResponse(path, sinceMs),
+  readJsonl: (path, sinceMs, prompt) => readAgentSessionResponse({ kind: "path", path }, "?", sinceMs, prompt),
   now: () => Date.now(),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
 export interface ReadAgentOutputOptions {
@@ -97,15 +98,40 @@ export async function readAgentOutput(
   const waitResult = deps.waitIdle(opts.paneId, opts.maxWaitS);
 
   // 4. Try the jsonl reader first (cheap, perfect content).
-  if (strategy.strategy === "jsonl" && agentInfo?.agent_session?.kind === "path") {
-    const path = agentInfo.agent_session.path;
-    const response = deps.readJsonl(path, sendStartedAt);
-    if (response && response.text) {
-      const src: OutputSource =
-        agentInfo.agent === "omp" ? "omp-jsonl" : "pi-jsonl";
+  if (strategy.strategy === "jsonl") {
+    const path = agentInfo?.agent_session?.kind === "path" ? agentInfo.agent_session.path : undefined;
+    // `agent wait` can report a transient idle state before Codex has
+    // finished a turn. Poll its structured log through the configured turn
+    // deadline, accepting only `phase: final_answer` (the reader enforces
+    // that), rather than forwarding a commentary/progress message.
+    const attempts = agentInfo?.agent === "codex"
+      ? Math.max(1, Math.ceil((opts.maxWaitS * 1000) / 500))
+      : 1;
+    let response: AgentResponse | null = null;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      response = opts.deps?.readJsonl && path
+        ? deps.readJsonl(path, sendStartedAt, opts.prompt)
+        : strategy.reader(sendStartedAt, opts.prompt);
+      if (response?.text) break;
+      if (attempt < attempts - 1) await deps.sleep(500);
+    }
+    if (response?.text) {
+      const source: OutputSource = agentInfo?.agent === "omp" && response.source === "pi-jsonl"
+        ? "omp-jsonl"
+        : response.source as OutputSource;
       return {
         text: response.text,
-        source: src,
+        source,
+      };
+    }
+    // Codex panes can contain another live Codex conversation. Scraping that
+    // terminal after a missed JSONL correlation leaks unrelated tool output.
+    // Fail closed instead of treating arbitrary screen text as a reply.
+    if (agentInfo?.agent === "codex") {
+      return {
+        text: "",
+        source: "unavailable",
+        fallbackReason: "Codex JSONL did not contain a response correlated to this prompt",
       };
     }
     // Jsonl failed — fall through to screen scraping.

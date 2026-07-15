@@ -115,6 +115,29 @@ export function findMapping(
   return map.get(threadId);
 }
 
+/** Rebuild mappings using the watcher-owned known_tabs as canonical ids. */
+export function restoreKnownTabMappings(
+  panes: PaneInfo[],
+  knownTabs: Record<string, { label: string; thread_id: number }> = {},
+  previous: Map<number, ThreadMapping> = new Map()
+): Map<number, ThreadMapping> {
+  const restored = new Map<number, ThreadMapping>();
+  for (const pane of panes) {
+    const canonicalThreadId = knownTabs[pane.tab_id]?.thread_id;
+    const previousEntry = Array.from(previous.values()).find((m) => m.pane_id === pane.pane_id);
+    const fallbackThreadId = Array.from(previous.entries()).find(([, m]) => m.pane_id === pane.pane_id)?.[0];
+    const threadId = canonicalThreadId ?? fallbackThreadId;
+    if (!threadId) continue;
+    restored.set(threadId, {
+      pane_id: pane.pane_id,
+      label: pane.label,
+      agent: pane.agent,
+      created_at: previousEntry?.created_at ?? new Date().toISOString(),
+    });
+  }
+  return restored;
+}
+
 /**
  * Populate known_tabs from thread_mappings and the current herdr pane list.
  * Prevents the watcher from creating duplicate topics for already-mapped panes.

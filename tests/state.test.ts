@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { loadState, saveState } from "../src/state.js";
+import { loadState, saveState, rememberUpdateId } from "../src/state.js";
 import type { DaemonState } from "../src/types.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -25,9 +25,19 @@ describe("loadState / saveState", () => {
       thread_mappings: { "140": { pane_id: "w1:pZ", label: "Echo", agent: "pi", created_at: "..." } },
       known_topics: {},
       known_tabs: {},
+      processed_update_ids: [],
     };
     saveState(tmpDir, orig);
     const loaded = loadState(tmpDir);
     expect(loaded).toEqual(orig);
+  });
+
+  it("deduplicates recent Telegram update ids with a bounded window", () => {
+    const state = loadState(tmpDir);
+    expect(rememberUpdateId(state, 10, 2)).toBe(false);
+    expect(rememberUpdateId(state, 10, 2)).toBe(true);
+    expect(rememberUpdateId(state, 11, 2)).toBe(false);
+    expect(rememberUpdateId(state, 12, 2)).toBe(false);
+    expect(state.processed_update_ids).toEqual([11, 12]);
   });
 });

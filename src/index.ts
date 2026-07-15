@@ -4,6 +4,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, unlinkSync } from "
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { removePidFileIfOwned } from "./daemon-pid.js";
 
 // Always chdir to the script's own directory so paths like `./dist/` resolve
 // correctly even when invoked from a different cwd (e.g. via `herdr plugin`).
@@ -57,10 +58,15 @@ if (args.includes("--status")) {
   if (running) {
     const pid = readFileSync(pidFile, "utf8").trim();
     const stateFile = join(stateDir, "state.json");
+    const pollingFile = join(stateDir, "polling-status.json");
     const paired = existsSync(stateFile)
       ? JSON.parse(readFileSync(stateFile, "utf8")).authorized_chat_id !== null
       : false;
-    process.stdout.write(`Daemon: running (PID ${pid}) | Paired: ${paired ? "yes" : "no"}\n`);
+    let polling = "unknown";
+    try {
+      polling = JSON.parse(readFileSync(pollingFile, "utf8")).state ?? polling;
+    } catch {}
+    process.stdout.write(`Daemon: running (PID ${pid}) | Paired: ${paired ? "yes" : "no"} | Polling: ${polling}\n`);
     process.exit(0);
   } else {
     process.stdout.write("Daemon: not running\n");
@@ -69,6 +75,10 @@ if (args.includes("--status")) {
 }
 
 if (args.includes("--daemon")) {
+  void runDaemon();
+}
+
+async function runDaemon(): Promise<void> {
   // Refuse to double-start
   const pidFile = join(stateDir, "daemon.pid");
   if (existsSync(pidFile)) {
@@ -82,22 +92,22 @@ if (args.includes("--daemon")) {
     }
   }
   mkdirSync(stateDir, { recursive: true });
-  writeFileSync(pidFile, String(process.pid), "utf8");
-
-  process.stdout.write(`Daemon started (PID ${process.pid})\n`);
   try {
-    startDaemon();
+    const daemon = await startDaemon(process.env.HERDR_TG_CONFIG_DIR);
+    writeFileSync(pidFile, String(process.pid), "utf8");
+    process.stdout.write(`Daemon started (PID ${process.pid})\n`);
+    const shutdown = () => {
+      void daemon.stop().finally(() => process.exit(0));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
   } catch (err: any) {
     process.stderr.write(`Daemon failed to start: ${err.message}\n`);
-    try {
-      unlinkSync(pidFile);
-    } catch {}
+    removePidFileIfOwned(pidFile, process.pid);
     process.exit(1);
   }
 
   process.on("exit", () => {
-    try {
-      unlinkSync(pidFile);
-    } catch {}
+    removePidFileIfOwned(pidFile, process.pid);
   });
 }

@@ -12,7 +12,7 @@
 
 **🧵 One topic per agent** — the watcher syncs herdr tabs to Telegram forum topics automatically. New agent? New topic appears in seconds.
 
-**⚡ Content-based polling** — wait loop detects when the agent finishes responding using stability detection. No fragile status checks. Status bar refreshes are filtered out.
+**⚡ Unified agent polling** — one coordinator polls a wrapper for each agent. Codex/Pi/OMP use their structured session logs; other agents use stable, anchor-based screen scraping.
 
 **🎯 Anchor-based extraction** — response is extracted by anchoring on the user's input line. Survives pane scrolling, separator bars, and context-mode banners.
 
@@ -26,8 +26,8 @@
 # ~/.config/herdr-telegram/config.toml
 [telegram]
 bot_token = "..."           # from @BotFather
-throttle_ms = 60000         # min between ⏳ Working updates
-max_progress_updates = 120  # updates before timeout (-1 = never)
+progress_interval_ms = 15000 # status poll / ⏳ Working cadence
+max_progress_updates = 60    # cap Telegram progress noise (-1 = unlimited)
 ```
 
 ## Quick reference
