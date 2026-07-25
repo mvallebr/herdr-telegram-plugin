@@ -79,6 +79,8 @@ topic → pane → reply round trip in Telegram.
 | `/cleanup` | Remove duplicate topics |
 | `/reconcile` | Re-sync herdr tabs with Telegram topics |
 | `/last` | Read-only snapshot of the current pane output (no turn submitted) |
+| `/follow [minutes]` | Subscribe to pane updates for N minutes (default 30, 0 = manual); resets on each message |
+| `/unfollow` | Stop the active subscription on this thread |
 
 ## How it works
 

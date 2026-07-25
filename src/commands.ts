@@ -6,6 +6,7 @@ import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
 import { loadState, saveState } from "./state.js";
 import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
+import type { FollowManager } from "./follow-manager.js";
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
@@ -20,12 +21,35 @@ export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMappin
   return lines.join("\n");
 }
 
-export function formatStatus(opts: { uptime: string; paired: boolean; panesCount: number }): string {
-  return [
+export function formatStatus(opts: {
+  uptime: string;
+  paired: boolean;
+  panesCount: number;
+  follows?: Array<{
+    threadId: number;
+    mapping: ThreadMapping;
+    expiresAt: number;
+    timeoutMs: number;
+    now: number;
+  }>;
+}): string {
+  const lines = [
     `Bridge uptime: ${opts.uptime}`,
     `Paired: ${opts.paired ? "yes" : "no"}`,
     `Active panes: ${opts.panesCount}`,
-  ].join("\n");
+  ];
+  if (opts.follows && opts.follows.length > 0) {
+    lines.push("");
+    lines.push("Active follows:");
+    for (const f of opts.follows) {
+      const label =
+        f.timeoutMs === 0
+          ? "manual (no timeout)"
+          : `${Math.max(0, Math.ceil((f.expiresAt - f.now) / 60_000))} min left`;
+      lines.push(`  thread ${f.threadId} (${f.mapping.label}) — ${label}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 export interface CommandDeps {
@@ -40,6 +64,16 @@ export interface CommandDeps {
   stopWatcher?: () => void;
   /** Optional dispatcher, used to hint when a pane is mid-turn. */
   turns?: { isBusy(paneId: string): boolean };
+  /** Optional subscription registry. /follow registers, /unfollow removes. */
+  follows?: FollowManager;
+  /** Default minutes when /follow is invoked without an explicit argument. */
+  follows_default_minutes?: number;
+  /** Optional hook called by /follow after registering a subscription, so
+   *  the daemon can spawn the background poll loop. */
+  onFollowStart?: (threadId: number) => void;
+  /** Optional hook called by /unfollow after dropping a subscription, so
+   *  the daemon can stop the background poll loop. */
+  onFollowStop?: (threadId: number) => void;
 }
 
 /** Format the body of a /last readback. Pure function: easy to unit-test. */
@@ -73,11 +107,13 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/topics — list bound topic ids (use /delete <id> to remove)",
         "/delete <id> — delete a forum topic by its thread id",
         "/unpair — reset pairing (re-authorize with /pair)",
-        "/status — bridge uptime and connection info",
+        "/status — bridge uptime and connection info (incl. active follows)",
         "/interrupt — send Ctrl+C to this thread's agent",
         "/trust — send 'trust, always allow' to this thread's agent",
         "/digest — today's activity (coming soon)",
         "/last — show current pane output (read-only, no turn)",
+        "/follow [minutes] — keep listening after the agent responds; expires N min after your last message (default 30, 0 = manual)",
+        "/unfollow — stop listening on this thread",
         "",
         "Plain text in any thread is sent to that thread's pane.",
       ].join("\n")
@@ -95,10 +131,21 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     const h = Math.floor(uptime / 3600);
     const m = Math.floor((uptime % 3600) / 60);
     const s = uptime % 60;
+    const now = Date.now();
+    const followsSnapshot = deps.follows
+      ? deps.follows.listAll().map((f) => ({
+          threadId: f.threadId,
+          mapping: f.mapping,
+          expiresAt: f.expiresAt,
+          timeoutMs: f.timeoutMs,
+          now,
+        }))
+      : undefined;
     await ctx.reply(formatStatus({
       uptime: `${h}h ${m}m ${s}s`,
       paired: isPaired(state),
       panesCount: deps.map.size,
+      follows: followsSnapshot,
     }));
   });
 
@@ -240,5 +287,70 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     } catch (err: any) {
       await ctx.reply(`Failed to delete #${threadId}: ${err.message}`);
     }
+  });
+
+  bot.command("follow", async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply("Send /follow inside a thread.");
+      return;
+    }
+    if (!deps.follows) {
+      await ctx.reply("Subscriptions not available.");
+      return;
+    }
+    const mapping = findMapping(threadId, deps.map);
+    if (!mapping) {
+      await ctx.reply("No pane for this topic.");
+      return;
+    }
+    const arg = (ctx.match ?? "").trim();
+    let minutes: number;
+    if (arg === "") {
+      minutes = deps.follows_default_minutes ?? 30;
+    } else {
+      const parsed = parseInt(arg, 10);
+      if (isNaN(parsed) || parsed < 0) {
+        await ctx.reply("Usage: /follow [minutes] — minutes must be a non-negative integer (0 = no timeout).");
+        return;
+      }
+      minutes = parsed;
+    }
+    const sub = deps.follows.subscribe(threadId, mapping, minutes);
+    deps.onFollowStart?.(threadId);
+    // React to the user's /follow message so they see confirmation inline.
+    try {
+      await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
+    } catch {
+      // reactions may be unavailable in some chats; ignore.
+    }
+    const hint =
+      minutes === 0
+        ? "no timeout — /unfollow to stop"
+        : `expires in ${minutes} min from your last message`;
+    await ctx.reply(`Following ${mapping.label}. ${hint}.`);
+  });
+
+  bot.command("unfollow", async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply("Send /unfollow inside a thread.");
+      return;
+    }
+    if (!deps.follows) {
+      await ctx.reply("Subscriptions not available.");
+      return;
+    }
+    const had = deps.follows.remove(threadId);
+    deps.onFollowStop?.(threadId);
+    // Clear the 👀 reaction if we had set one.
+    if (had) {
+      try {
+        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, []);
+      } catch {
+        // ignore
+      }
+    }
+    await ctx.reply(had ? "Unfollowed." : "Was not following this thread.");
   });
 }

@@ -2,12 +2,13 @@ import { TelegramClient } from "./telegram-client.js";
 import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
-import { runAgentTurn } from "./wait-loop.js";
+import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
 import { getAgents, readPane } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
+import { FollowManager } from "./follow-manager.js";
 import { TurnDispatcher } from "./turn-dispatcher.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
@@ -78,6 +79,9 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   });
 
   const turns = new TurnDispatcher();
+  const follows = new FollowManager();
+  /** Active background follow loops, keyed by threadId. Cancel the runner to stop. */
+  const followLoops = new Map<number, { cancel: () => void }>();
 
   const deps: CommandDeps = {
     map,
@@ -86,6 +90,64 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     startTime: Date.now(),
     knownTopics: state.known_topics,
     turns,
+    follows,
+    follows_default_minutes: cfg.followTimeoutMinutes,
+    onFollowStart: (threadId: number) => {
+      // Idempotent: stop any existing loop first.
+      followLoops.get(threadId)?.cancel();
+      const sub = follows.get(threadId);
+      if (!sub) return;
+      const mapping = sub.mapping;
+      let cancelled = false;
+      const cancel = () => { cancelled = true; };
+      followLoops.set(threadId, { cancel });
+      // Fire and forget — the loop runs in background.
+      void (async () => {
+        let expired = false;
+        try {
+          await runAgentFollowLoop({
+            paneId: mapping.pane_id,
+            threadId,
+            cfg,
+            tg,
+            chatId: state.authorized_chat_id!,
+            shouldContinue: () => {
+              if (cancelled) return false;
+              const sub = follows.get(threadId);
+              if (!sub) return false;
+              if (follows.isExpired(threadId)) {
+                expired = true;
+                return false;
+              }
+              return true;
+            },
+            advanceTurn: () => { /* each poll tick — no-op for now */ },
+          });
+        } catch (err) {
+          log.error("Follow loop crashed", {
+            paneId: mapping.pane_id,
+            threadId,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          // If we exited because of expiration (not manual /unfollow), drop
+          // the subscription and tell the user.
+          if (expired) {
+            follows.remove(threadId);
+            await tg.sendMessage(
+              state.authorized_chat_id!,
+              threadId,
+              "⏱️ Subscription expired — /follow to listen again."
+            );
+          }
+          followLoops.delete(threadId);
+        }
+      })();
+    },
+    onFollowStop: (threadId: number) => {
+      followLoops.get(threadId)?.cancel();
+      followLoops.delete(threadId);
+    },
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of deps.map.entries()) raw[tid] = m;
@@ -404,6 +466,8 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     // Do not await an agent turn in Grammy's update handler: a slow Codex
     // turn must not stop Telegram from routing a new message to OpenCode.
     turns.enqueue(mapping.pane_id, async () => {
+      // Reset follow timer on user message (decision 2).
+      if (deps.follows) deps.follows.touch(threadId);
       try {
         await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
       } catch (err) {

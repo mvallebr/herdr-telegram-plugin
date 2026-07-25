@@ -60,4 +60,28 @@ describe("loadConfig", () => {
     const cfg = loadConfig(tmpDir);
     expect(cfg.stabilityWindowMs).toBe(45_000);
   });
+
+  it("defaults follow_timeout_minutes to 30 when missing", () => {
+    fs.writeFileSync(configFile, 'bot_token = "t"');
+    const cfg = loadConfig(tmpDir);
+    expect(cfg.followTimeoutMinutes).toBe(30);
+  });
+
+  it("loads follow_timeout_minutes from config.toml", () => {
+    fs.writeFileSync(
+      configFile,
+      '[telegram]\nbot_token = "t"\nfollow_timeout_minutes = 60'
+    );
+    const cfg = loadConfig(tmpDir);
+    expect(cfg.followTimeoutMinutes).toBe(60);
+  });
+
+  it("accepts follow_timeout_minutes = 0 (no timeout, manual unsubscribe only)", () => {
+    fs.writeFileSync(
+      configFile,
+      '[telegram]\nbot_token = "t"\nfollow_timeout_minutes = 0'
+    );
+    const cfg = loadConfig(tmpDir);
+    expect(cfg.followTimeoutMinutes).toBe(0);
+  });
 });
