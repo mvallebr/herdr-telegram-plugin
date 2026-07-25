@@ -93,4 +93,104 @@ describe("coordinateTurn", () => {
     }, { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 5000 }, fakeClock());
     expect(finalFlags).toEqual([true]);
   });
+
+  describe("stabilityWindowMs (universal, applies to all wrappers)", () => {
+    function makeClock() {
+      let now = 0;
+      return {
+        now: () => now,
+        sleep: async (ms: number) => { now += ms; },
+      };
+    }
+
+    it("does not close immediately on first final; waits for stability window", async () => {
+      // Two final polls only — far short of the 30s window.
+      const statuses = [
+        { state: "final" as const, text: "early answer", source: "codex-jsonl" as const },
+        { state: "final" as const, text: "early answer", source: "codex-jsonl" as const },
+      ];
+      const events: string[] = [];
+      const clock = makeClock();
+      await coordinateTurn(
+        { submit: async () => {}, status: async () => statuses.shift() ?? { state: "working" } },
+        {
+          progress: async () => {},
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async () => {},
+        },
+        { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 60_000, stabilityWindowMs: 30_000 },
+        clock,
+      );
+      expect(events).toEqual([]);
+    });
+
+    it("publishes final once the same response persists past stabilityWindowMs", async () => {
+      const statuses = Array.from({ length: 60 }, () => ({
+        state: "final" as const,
+        text: "stable answer",
+        source: "pi-jsonl" as const,
+      }));
+      const events: string[] = [];
+      const clock = makeClock();
+      await coordinateTurn(
+        { submit: async () => {}, status: async () => statuses.shift() ?? { state: "working" } },
+        {
+          progress: async () => {},
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async () => {},
+        },
+        { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 120_000, stabilityWindowMs: 30_000 },
+        clock,
+      );
+      expect(events).toEqual(["final:pi-jsonl:stable answer"]);
+    });
+
+    it("discards a pending final when status returns to working (JSONL flicker)", async () => {
+      // Insert a single "working" poll halfway through the streak. After
+      // the reset, only 15 more final polls follow — not enough to complete
+      // the 30s window from the new starting point.
+      const statuses: any[] = [];
+      for (let i = 0; i < 15; i++) {
+        statuses.push({ state: "final", text: "early", source: "codex-jsonl" });
+      }
+      statuses.push({ state: "working", preview: "still typing" });
+      for (let i = 0; i < 20; i++) {
+        statuses.push({ state: "final", text: "early", source: "codex-jsonl" });
+      }
+      const events: string[] = [];
+      const clock = makeClock();
+      await coordinateTurn(
+        { submit: async () => {}, status: async () => statuses.shift() ?? { state: "working" } },
+        {
+          progress: async () => {},
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async () => {},
+        },
+        { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 120_000, stabilityWindowMs: 30_000 },
+        clock,
+      );
+      expect(events).toEqual([]);
+    });
+
+    it("reports blocked even when a pending final exists", async () => {
+      const statuses = [
+        { state: "final" as const, text: "still computing", source: "codex-jsonl" as const },
+        { state: "blocked" as const, question: "Need approval" },
+      ];
+      const events: string[] = [];
+      const clock = makeClock();
+      await coordinateTurn(
+        { submit: async () => {}, status: async () => statuses.shift() ?? { state: "working" } },
+        {
+          progress: async () => {},
+          final: async () => events.push("final"),
+          blocked: async (q) => events.push(`blocked:${q}`),
+          failed: async () => events.push("failed"),
+        },
+        { prompt: "hello", progressIntervalMs: 1000, maxWaitMs: 60_000, stabilityWindowMs: 30_000 },
+        clock,
+      );
+      expect(events).toEqual(["blocked:Need approval"]);
+    });
+  });
 });
