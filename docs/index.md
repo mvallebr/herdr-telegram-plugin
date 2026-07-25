@@ -18,6 +18,8 @@
 
 **🛡️ Safe by default** — `/pair` requires explicit authorization. Progress updates are throttled and capped. Stuck models don't loop forever.
 
+**👀 Subscribe to panes** — `/follow` keeps you listening to agent activity for up to 30 minutes after your last message (configurable). Reset on each message, expire on idle. Useful for watching long-running tool calls finish.
+
 ---
 
 ## Make it yours

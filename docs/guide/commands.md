@@ -82,3 +82,58 @@ Any non-command message in a bound topic is forwarded to the corresponding herdr
 (bot replies)  ⏳ Working (3s): [agent thinking...]
 (bot replies)  ✅ (8s): Tests are all passing, just need to...
 ```
+
+### /last
+
+Read-only snapshot of the current pane output. **Does not submit a turn** — useful when you want to peek at what the agent is doing without disturbing it.
+
+```
+/last
+→ [2026-07-25T13:00:05.624Z] agy
+→
+→ (... 14007 chars omitted)
+→ ...recent output...
+```
+
+The snapshot is truncated to the last 3000 chars (with a `(... N chars omitted)` notice when applicable). If a turn is currently in progress, a `(painel imprimindo — pode estar parcial)` hint is appended.
+
+## Subscriptions
+
+### /follow [minutes]
+
+Subscribe to pane updates without sending a prompt. Useful when you want to keep listening to agent activity after your last message — for example, watching a long-running tool call finish, or being notified when the agent emits a `final` or `blocked` response while you're away.
+
+The subscription:
+
+- **Lasts `minutes` after your last message** (default from `follow_timeout_minutes` in config, usually 30).
+- **Resets the timer on each message you send** to the same topic.
+- **Emits "Subscription expired"** when the timer runs out.
+- **Can be disabled** by passing `0` — you must `/unfollow` to stop.
+
+```
+/follow
+→ Following Echo. expires in 30 min from your last message.
+
+/follow 60
+→ Following Echo. expires in 60 min from your last message.
+
+/follow 0
+→ Following Echo. no timeout — /unfollow to stop.
+```
+
+The bot reacts with 👀 on the `/follow` message as visual confirmation. Re-running `/follow` on the same thread replaces the active subscription with the new timeout.
+
+In follow mode, the bridge publishes only `final` and `blocked` events from the agent — no `Working` heartbeats, no preview spam. On expiration, you'll receive `⏱️ Subscription expired — /follow to listen again.`
+
+### /unfollow
+
+Stop the active subscription on the current thread.
+
+```
+/unfollow
+→ Unfollowed.
+```
+
+Subscriptions are **in-memory**: they do not survive a daemon restart. After a restart you'll need to re-run `/follow` to resume monitoring.
+
+The bot clears the 👀 reaction when you `/unfollow` an active subscription.

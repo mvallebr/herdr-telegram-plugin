@@ -3,6 +3,7 @@ import type { TelegramClient } from "./telegram-client.js";
 import { sendText, readPane } from "./herdr-client.js";
 import { createAgentWrapper, ScreenScrapeWrapper } from "./agent-wrappers.js";
 import { coordinateTurn } from "./turn-coordinator.js";
+import type { AgentWrapper } from "./agent-wrapper.js";
 import { TelegramTurnReporter } from "./telegram-reporter.js";
 
 export function shouldThrottle(lastSentAt: number, throttleMs: number): boolean {
@@ -166,4 +167,56 @@ export async function runAgentTurn(
     maxProgressUpdates: cfg.maxProgressUpdates,
     stabilityWindowMs: stabilityMs,
   }, deps);
+}
+
+/**
+ * Observe a pane in follow mode: poll every `pollIntervalMs`, send a Telegram
+ * message when the pane content changes (delta vs last snapshot), and stop
+ * when `shouldContinue()` returns false.
+ *
+ * On every poll, calls `advanceTurn` so the caller can refresh its timer
+ * (e.g. reset on user message). `getAgentInfo` is queried lazily to detect
+ * blocked state.
+ */
+export async function runAgentFollowLoop(opts: {
+  paneId: string;
+  threadId: number;
+  cfg: Config;
+  tg: TelegramClient;
+  chatId: number;
+  shouldContinue: () => boolean;
+  advanceTurn: () => void;
+  deps?: Partial<WaitLoopDeps>;
+}): Promise<void> {
+  const deps: WaitLoopDeps = {
+    sendText: opts.deps?.sendText ?? sendText,
+    readPane: opts.deps?.readPane ?? readPane,
+    sendMessage: opts.deps?.sendMessage ?? ((c, t, body, options) => opts.tg.sendMessage(c, t, body, options)),
+    sleep: opts.deps?.sleep ?? sleep,
+    now: opts.deps?.now ?? (() => Date.now()),
+  };
+  const maxLines = 4_000;
+  let lastSnapshot = "";
+  try {
+    lastSnapshot = cleanPaneOutput(stripStatusBar(deps.readPane(opts.paneId, maxLines)));
+  } catch {
+    lastSnapshot = "";
+  }
+  while (opts.shouldContinue()) {
+    opts.advanceTurn();
+    await deps.sleep(opts.cfg.progressIntervalMs);
+    if (!opts.shouldContinue()) break;
+    let raw: string;
+    try {
+      raw = deps.readPane(opts.paneId, maxLines);
+    } catch {
+      continue;
+    }
+    const current = cleanPaneOutput(stripStatusBar(raw));
+    if (current !== lastSnapshot && current.trim().length > 0) {
+      lastSnapshot = current;
+      const preview = current.slice(-3000);
+      await deps.sendMessage(opts.chatId, opts.threadId, preview);
+    }
+  }
 }

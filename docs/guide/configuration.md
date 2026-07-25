@@ -28,6 +28,12 @@ stability_window_ms = 30000  # min ms the pane must stay unchanged before
                               # a screen-scrape turn is declared final.
                               # Larger values tolerate herdr's idle-flicker
                               # during long tool calls.
+
+# --- Subscriptions (/follow) ---
+
+follow_timeout_minutes = 30  # default timeout for /follow subscriptions.
+                              # Timer resets on each user message. 0 = no
+                              # timeout, manual /unfollow required.
 ```
 
 ## Options in detail
@@ -51,6 +57,12 @@ Hard timeout in seconds for the entire agent turn. If no wrapper returns a safe 
 ### max_progress_updates
 
 Maximum number of neutral `⏳ Working` messages for a turn. Polling continues until `max_total_wait_s`; this setting only limits chat noise. Use `-1` for unlimited updates.
+
+### follow_timeout_minutes
+
+Default minutes a `/follow` subscription stays alive after your last message before expiring. Default: `30`. Set to `0` to disable the timeout entirely — you then must `/unfollow` manually to stop the subscription.
+
+Each message you send while subscribed resets the timer to this value. Per-thread `timeout_minutes` can also be set inline: `/follow 60` overrides the default for that thread only.
 
 ## Environment variables
 
