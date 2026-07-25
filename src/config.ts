@@ -12,6 +12,10 @@ export interface Config {
   maxProgressUpdates: number;
   /** How often the coordinator asks a wrapper for status. */
   progressIntervalMs: number;
+  /** Min ms the pane must remain unchanged before a screen-scrape turn is
+   *  declared final. Larger values tolerate herdr's idle-flicker during long
+   *  tool calls. Default 30000. */
+  stabilityWindowMs: number;
 }
 
 function parseTomlLine(line: string): [string, string] | null {
@@ -36,6 +40,7 @@ export function loadConfig(configDir?: string): Config {
   let fileMaxTotalWaitS = 1800;
   let fileMaxProgressUpdates = 60;
   let fileProgressIntervalMs = 15_000;
+  let fileStabilityWindowMs = 30_000;
 
   if (fs.existsSync(filePath)) {
     const lines = fs.readFileSync(filePath, "utf8").split("\n");
@@ -55,6 +60,7 @@ export function loadConfig(configDir?: string): Config {
         else if (kv[0] === "max_total_wait_s") fileMaxTotalWaitS = parseInt(kv[1], 10);
         else if (kv[0] === "max_progress_updates") fileMaxProgressUpdates = parseInt(kv[1], 10);
         else if (kv[0] === "progress_interval_ms") fileProgressIntervalMs = parseInt(kv[1], 10);
+        else if (kv[0] === "stability_window_ms") fileStabilityWindowMs = parseInt(kv[1], 10);
       } else if (kv[0] === "bot_token") {
         fileBotToken = kv[1];
       }
@@ -81,5 +87,6 @@ export function loadConfig(configDir?: string): Config {
     maxTotalWaitS: fileMaxTotalWaitS,
     maxProgressUpdates: fileMaxProgressUpdates,
     progressIntervalMs: fileProgressIntervalMs,
+    stabilityWindowMs: fileStabilityWindowMs,
   };
 }

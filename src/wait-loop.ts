@@ -149,14 +149,15 @@ export async function runAgentTurn(
   // wide enough for a 4k response that wrapped in a narrow terminal; the
   // scraper expands further if its prompt anchor has scrolled away.
   const maxOutputLines = opts.maxOutputLines ?? 1_000;
+  const stabilityMs = opts.stabilityWindowMs ?? cfg.stabilityWindowMs;
   const startedAt = deps.now();
   const telegram = { sendMessage: deps.sendMessage } as Pick<TelegramClient, "sendMessage">;
   const reporter = new TelegramTurnReporter(telegram, chatId, threadId, deps.now, startedAt);
   // Unit tests deliberately provide pane mocks; keep those entirely at the
   // screen adapter seam instead of invoking the real Herdr metadata command.
   const wrapper = opts.deps
-    ? new ScreenScrapeWrapper(paneId, maxOutputLines, opts.stabilityWindowMs ?? cfg.progressIntervalMs, deps)
-    : createAgentWrapper(paneId, { maxOutputLines, stabilityWindowMs: opts.stabilityWindowMs ?? cfg.progressIntervalMs }, deps);
+    ? new ScreenScrapeWrapper(paneId, maxOutputLines, stabilityMs, deps)
+    : createAgentWrapper(paneId, { maxOutputLines, stabilityWindowMs: stabilityMs }, deps);
   await coordinateTurn(wrapper, reporter, {
     prompt: text,
     progressIntervalMs: opts.pollIntervalMs ?? cfg.progressIntervalMs,

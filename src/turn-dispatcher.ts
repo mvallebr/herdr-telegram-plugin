@@ -13,4 +13,10 @@ export class TurnDispatcher {
       if (this.tails.get(paneId) === next) this.tails.delete(paneId);
     }).catch(() => undefined);
   }
+
+  /** Read-only check used by read-only commands (e.g. /last) to hint that
+   *  the snapshot may be partial. Does not mutate dispatcher state. */
+  isBusy(paneId: string): boolean {
+    return this.tails.has(paneId);
+  }
 }

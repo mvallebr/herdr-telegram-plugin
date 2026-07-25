@@ -1,10 +1,11 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
-import { getAgents, sendText } from "./herdr-client.js";
+import { getAgents, readPane, sendText } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
 import { loadState, saveState } from "./state.js";
+import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
@@ -37,6 +38,28 @@ export interface CommandDeps {
   knownTopics?: Record<number, { name: string; created_at: string }>;
   /** Stops the tab watcher (called on /unpair). */
   stopWatcher?: () => void;
+  /** Optional dispatcher, used to hint when a pane is mid-turn. */
+  turns?: { isBusy(paneId: string): boolean };
+}
+
+/** Format the body of a /last readback. Pure function: easy to unit-test. */
+export function formatLastReadback(opts: {
+  mapping: ThreadMapping;
+  rawPane: string;
+  busy: boolean;
+  now: () => string;
+  truncateAt: number;
+}): string {
+  const cleaned = cleanPaneOutput(stripStatusBar(opts.rawPane));
+  const truncated =
+    cleaned.length > opts.truncateAt
+      ? `(... ${cleaned.length - opts.truncateAt} chars omitted)\n${cleaned.slice(-opts.truncateAt)}`
+      : cleaned;
+  const ts = opts.now();
+  const busyHint = opts.busy
+    ? "\n\n_(painel imprimindo — pode estar parcial)_"
+    : "";
+  return `[${ts}] ${opts.mapping.label}\n\n${truncated}${busyHint}`;
 }
 
 export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
@@ -54,6 +77,7 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/interrupt — send Ctrl+C to this thread's agent",
         "/trust — send 'trust, always allow' to this thread's agent",
         "/digest — today's activity (coming soon)",
+        "/last — show current pane output (read-only, no turn)",
         "",
         "Plain text in any thread is sent to that thread's pane.",
       ].join("\n")
@@ -94,6 +118,34 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     if (!mapping) { await ctx.reply("No pane for this topic."); return; }
     sendText(mapping.pane_id, "trust, always allow");
     await ctx.reply(`Trusted ${mapping.label}`);
+  });
+
+  bot.command("last", async (ctx) => {
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) {
+      await ctx.reply("Send /last inside a thread.");
+      return;
+    }
+    const mapping = findMapping(threadId, deps.map);
+    if (!mapping) {
+      await ctx.reply("No pane for this topic.");
+      return;
+    }
+    let raw: string;
+    try {
+      raw = readPane(mapping.pane_id, 500);
+    } catch (err: any) {
+      await ctx.reply(`Failed to read pane: ${err.message}`);
+      return;
+    }
+    const body = formatLastReadback({
+      mapping,
+      rawPane: raw,
+      busy: deps.turns?.isBusy(mapping.pane_id) ?? false,
+      now: () => new Date().toISOString(),
+      truncateAt: 3000,
+    });
+    await ctx.reply(body);
   });
 
   bot.command("bind", async (ctx) => {
