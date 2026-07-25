@@ -27,4 +27,33 @@ describe("TurnDispatcher", () => {
     expect(events).toEqual(["opencode"]);
     release();
   });
+
+  describe("isBusy", () => {
+    it("returns false for an unknown pane", () => {
+      const dispatcher = new TurnDispatcher();
+      expect(dispatcher.isBusy("never-enqueued")).toBe(false);
+    });
+
+    it("returns true while an enqueued turn is still running", async () => {
+      const dispatcher = new TurnDispatcher();
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      dispatcher.enqueue("p1", async () => { await blocked; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(dispatcher.isBusy("p1")).toBe(true);
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(dispatcher.isBusy("p1")).toBe(false);
+    });
+
+    it("does not flag other panes as busy", async () => {
+      const dispatcher = new TurnDispatcher();
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      dispatcher.enqueue("p1", async () => { await blocked; });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(dispatcher.isBusy("p2")).toBe(false);
+      release();
+    });
+  });
 });

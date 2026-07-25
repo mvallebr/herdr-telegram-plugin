@@ -45,4 +45,19 @@ describe("loadConfig", () => {
     const cfg = loadConfig(tmpDir);
     expect(cfg.chatId).toBe(-100123);
   });
+
+  it("defaults stability_window_ms to 30000 when missing", () => {
+    fs.writeFileSync(configFile, 'bot_token = "t"');
+    const cfg = loadConfig(tmpDir);
+    expect(cfg.stabilityWindowMs).toBe(30_000);
+  });
+
+  it("loads stability_window_ms from config.toml", () => {
+    fs.writeFileSync(
+      configFile,
+      '[telegram]\nbot_token = "t"\nstability_window_ms = 45000'
+    );
+    const cfg = loadConfig(tmpDir);
+    expect(cfg.stabilityWindowMs).toBe(45_000);
+  });
 });

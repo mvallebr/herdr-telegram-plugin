@@ -78,6 +78,7 @@ topic → pane → reply round trip in Telegram.
 | `/bind <label>` | Bind the current topic to a herdr pane |
 | `/cleanup` | Remove duplicate topics |
 | `/reconcile` | Re-sync herdr tabs with Telegram topics |
+| `/last` | Read-only snapshot of the current pane output (no turn submitted) |
 
 ## How it works
 

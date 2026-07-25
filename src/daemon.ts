@@ -77,19 +77,21 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     thread_mappings: rawMappings,
   });
 
+  const turns = new TurnDispatcher();
+
   const deps: CommandDeps = {
     map,
     stateDir: statePath,
     chatId: state.authorized_chat_id ?? 0,
     startTime: Date.now(),
     knownTopics: state.known_topics,
+    turns,
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of deps.map.entries()) raw[tid] = m;
       saveState(statePath, { ...state, thread_mappings: raw });
     },
   };
-  const turns = new TurnDispatcher();
 
   // Telegram can replay an update when long polling is interrupted around a
   // restart. Persist a small update-id window so a replay never re-prompts an
