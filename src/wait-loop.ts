@@ -196,11 +196,15 @@ export async function runAgentFollowLoop(opts: {
     now: opts.deps?.now ?? (() => Date.now()),
   };
   const maxLines = 4_000;
+  // Take a baseline at subscribe time. We do NOT apply cleanPaneOutput here:
+  // that filter is tuned for end-of-turn output, and discards the most recent
+  // lines (where activity actually happens). For follow mode we only strip the
+  // status bar and keep everything else so byte-level diffs reflect real change.
   let lastSnapshot = "";
   try {
-    lastSnapshot = cleanPaneOutput(stripStatusBar(deps.readPane(opts.paneId, maxLines)));
+    lastSnapshot = stripStatusBar(deps.readPane(opts.paneId, maxLines));
   } catch {
-    lastSnapshot = "";
+    // ignored
   }
   while (opts.shouldContinue()) {
     opts.advanceTurn();
@@ -212,11 +216,23 @@ export async function runAgentFollowLoop(opts: {
     } catch {
       continue;
     }
-    const current = cleanPaneOutput(stripStatusBar(raw));
-    if (current !== lastSnapshot && current.trim().length > 0) {
-      lastSnapshot = current;
-      const preview = current.slice(-3000);
-      await deps.sendMessage(opts.chatId, opts.threadId, preview);
+    const current = stripStatusBar(raw);
+    if (current === lastSnapshot || current.trim().length === 0) continue;
+    // Compute the delta from the previous snapshot.
+    // Common case: pane grew (new lines appended). Emit the suffix only.
+    if (lastSnapshot && current.startsWith(lastSnapshot)) {
+      const delta = current.slice(lastSnapshot.length).replace(/^\n+/, "");
+      if (delta.length > 0) {
+        const trimmed = delta.length > 3000 ? "…\n" + delta.slice(-3000) : delta;
+        await deps.sendMessage(opts.chatId, opts.threadId, trimmed);
+      }
+    } else {
+      // Less common: pane shrank or scrolled (old prefix dropped). Emit a
+      // labelled tail so the user sees activity but doesn't get a duplicated
+      // dump of the previous snapshot.
+      const tail = current.length > 3000 ? current.slice(-3000) : current;
+      await deps.sendMessage(opts.chatId, opts.threadId, `…(pane scrolled)…\n${tail}`);
     }
+    lastSnapshot = current;
   }
 }
