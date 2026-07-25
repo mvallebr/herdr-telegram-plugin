@@ -7,6 +7,7 @@ import {
   extractScreenResponse,
   extractScreenDelta,
   runAgentTurn,
+  runAgentFollowLoop,
   type WaitLoopDeps,
 } from "../src/wait-loop.js";
 
@@ -420,5 +421,285 @@ more agent output`;
     expect(preview).toContain("agent output");
     expect(preview).toContain("more agent output");
     expect(preview).not.toContain("old content");
+  });
+});
+
+describe("runAgentFollowLoop (pane delta)", () => {
+  function makeFakeClock(startMs = 0) {
+    let now = startMs;
+    return {
+      now: () => now,
+      advance: (ms: number) => { now += ms; },
+      set: (ms: number) => { now = ms; },
+    };
+  }
+
+  // Create a deps object where readPane returns a sequence of panes
+  // controlled by the test, sleep is a no-op, sendMessage records.
+  function makeFollowDeps(paneSequence: string[]) {
+    let readCalls = 0;
+    const sent: Array<{ chatId: number; threadId: number; text: string }> = [];
+    const sleeps: number[] = [];
+    return {
+      paneSequence,
+      readCalls: () => readCalls,
+      sent,
+      sleeps,
+      deps: {
+        readPane: () => {
+          const idx = readCalls++;
+          return paneSequence[Math.min(idx, paneSequence.length - 1)];
+        },
+        sendMessage: async (chatId: number, threadId: number, text: string) => {
+          sent.push({ chatId, threadId, text });
+          return sent.length;
+        },
+        sleep: async (ms: number) => {
+          sleeps.push(ms);
+        },
+        now: () => Date.now(),
+        sendText: () => {},
+      } as Partial<WaitLoopDeps>,
+    };
+  }
+
+  function makeCfg(intervalMs = 100) {
+    return {
+      ...dummyCfg,
+      progressIntervalMs: intervalMs,
+    } as any;
+  }
+
+  it("emits only the suffix delta when the pane grew", async () => {
+    const fixture = makeFollowDeps([
+      "pane baseline content",   // baseline (no trailing newline)
+      "pane baseline content\nagent responded: hello", // grew (no trailing newline)
+      "pane baseline content\nagent responded: hello\nmore stuff", // grew again
+    ]);
+    // shouldContinue ticks twice per iteration. 6 ticks = 3 iterations:
+    // 1 baseline + 2 polls.
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 6,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(2);
+    expect(fixture.sent[0].text).toBe("agent responded: hello");
+    expect(fixture.sent[1].text).toBe("more stuff");
+  });
+
+  it("emits nothing when the pane is unchanged between polls", async () => {
+    const fixture = makeFollowDeps([
+      "stable pane content",
+      "stable pane content",
+      "stable pane content",
+    ]);
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 6,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(0);
+  });
+
+  it("emits the old prefix as delta when the pane scrolled (case from production bug)", async () => {
+    // Repro of the bug that motivated this fix: a persistent status-bar-like
+    // suffix showed up at the end of both reads (the 'endsWith' trap).
+    // We must NOT return the previous content as 'prefix' — emit a labelled
+    // tail instead so the user sees activity but no duplication.
+    const statusBar = "───── MiniMax/medium ─────";
+    const baseline = "a\nb\nc\n" + statusBar;
+    const after = "[tool output]\nagent thinking\n" + statusBar;
+    const fixture = makeFollowDeps([baseline, after]);
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 4,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(1);
+    // Must NOT include the previous pane content "a\nb\nc\n"
+    expect(fixture.sent[0].text).not.toContain("a\nb\nc");
+    // Must indicate the pane scrolled
+    expect(fixture.sent[0].text).toMatch(/pane scrolled/);
+    // Should include the new content observed
+    expect(fixture.sent[0].text).toContain("[tool output]");
+  });
+
+  it("truncates huge suffixes to last 3000 chars with ellipsis prefix", async () => {
+    const baseline = "base\n";
+    // 5000 chars of new content
+    const huge = "x".repeat(5000);
+    const after = baseline + huge + "\n";
+    const fixture = makeFollowDeps([baseline, after]);
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 4,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(1);
+    expect(fixture.sent[0].text.startsWith("…")).toBe(true);
+    // Truncated body should still be under Telegram's 4096-char limit
+    expect(fixture.sent[0].text.length).toBeLessThanOrEqual(3100);
+  });
+
+  it("uses stripStatusBar on baseline and polls (does not discard recent lines)", async () => {
+    // Baseline contains the agent's "real" latest output. If we applied
+    // cleanPaneOutput (the old broken behaviour) the baseline digest would
+    // be missing that line, and the next poll with the same line would be
+    // considered unchanged -> no emission. With stripStatusBar the line is
+    // preserved.
+    //
+    // Note: stripStatusBar's existing regex strips the BARE separator
+    // (`──────...`) but not the modern '─── MiniMax/medium ───' format.
+    // The delta therefore includes the trailing status-bar line. We accept
+    // that here — fixing stripStatusBar's regex is a separate concern.
+    const agentLine = "agent: finished processing your request\n";
+    const baseline = "old intro\n" + agentLine;
+    const after = baseline + "agent: response goes here\n───── MiniMax/medium ─────";
+    const fixture = makeFollowDeps([baseline, after]);
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 4,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(1);
+    // Delta is the suffix that grew between polls. stripStatusBar's regex
+    // does not match the 'MiniMax/medium' status bar format, so it stays in
+    // the emission. That is acceptable noise for follow mode.
+    expect(fixture.sent[0].text).toContain("agent: response goes here");
+    // Critically: must NOT contain the previous lines (no prefix delta).
+    expect(fixture.sent[0].text).not.toContain("old intro");
+    expect(fixture.sent[0].text).not.toContain("agent: finished");
+  });
+
+  it("emits the suffix delta even when both reads share a trailing status bar (regression: endsWith branch)", async () => {
+    // Repro of the production 'manda os últimos 3000' bug from PR #7:
+    // both polls ended in the same persistent status bar (the user's
+    // minimax-m3 hint line), which made the old endsWith branch emit the
+    // entire previous-pane contents as 'prefix delta'.
+    // We must detect this as suffix growth and emit only the new tail.
+    const statusBar = "─── MiniMax/medium ───";
+    const baseline = statusBar + "\nold intro line 1\nold intro line 2\n";
+    const after = baseline + "agent: hello\n";
+    const fixture = makeFollowDeps([baseline, after]);
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 4,
+      advanceTurn: () => {},
+      deps: fixture.deps as WaitLoopDeps,
+    });
+    expect(fixture.sent).toHaveLength(1);
+    // Only the suffix that was appended
+    expect(fixture.sent[0].text).toBe("agent: hello");
+    // Critically: the duplicate 'prefix delta' must NOT appear. The previous
+    // production bug emitted the entire baseline as a 'prefix' here.
+    expect(fixture.sent[0].text).not.toContain("old intro");
+    expect(fixture.sent[0].text).not.toContain(statusBar);
+  });
+
+  it("keeps polling even when readPane throws (no crash, no emission)", async () => {
+    let readCalls = 0;
+    const sent: Array<{ chatId: number; threadId: number; text: string }> = [];
+    const deps: Partial<WaitLoopDeps> = {
+      readPane: () => {
+        readCalls++;
+        if (readCalls === 1) return "stable content\n"; // baseline
+        if (readCalls === 2) throw new Error("herdr unavailable");
+        return "stable content\nnew line"; // recovers (no trailing newline)
+      },
+      sendMessage: async (chatId, threadId, text) => {
+        sent.push({ chatId, threadId, text });
+        return sent.length;
+      },
+      sleep: async () => {},
+      now: () => Date.now(),
+      sendText: () => {},
+    };
+    // shouldContinue is called twice per loop iteration (one at `while` and
+    // one after the sleep). Use 6 ticks = 3 iterations: 1 baseline read +
+    // 1 throw + 1 recovery read.
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => ticks++ < 6,
+      advanceTurn: () => {},
+      deps: deps as WaitLoopDeps,
+    });
+    // First poll: errored -> skipped (no emission). Second poll: new line.
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toBe("new line");
+  });
+
+  it("stops emitting the moment shouldContinue returns false (no extra poll)", async () => {
+    let readCalls = 0;
+    const sent: string[] = [];
+    const deps: Partial<WaitLoopDeps> = {
+      readPane: () => {
+        readCalls++;
+        return `content${readCalls}\n`;
+      },
+      sendMessage: async (_c, _t, text) => {
+        sent.push(text);
+        return sent.length;
+      },
+      sleep: async () => {},
+      now: () => Date.now(),
+      sendText: () => {},
+    };
+    // shouldContinue returns true the first two iterations, false after.
+    let ticks = 0;
+    await runAgentFollowLoop({
+      paneId: "w1:pZ",
+      threadId: 140,
+      cfg: makeCfg(100),
+      tg: {} as any,
+      chatId: 100,
+      shouldContinue: () => {
+        ticks++;
+        return ticks <= 2;
+      },
+      advanceTurn: () => {},
+      deps: deps as WaitLoopDeps,
+    });
+    expect(readCalls).toBeLessThanOrEqual(2); // baseline + at most 1 poll
   });
 });
