@@ -133,7 +133,9 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     }
     let raw: string;
     try {
-      raw = readPane(mapping.pane_id, 500);
+      // Match wait-loop's max scan lines (ScreenScrapeWrapper expands up to 4000)
+      // so /last can show recent output that scrolled off a 500-line buffer.
+      raw = readPane(mapping.pane_id, 4_000);
     } catch (err: any) {
       await ctx.reply(`Failed to read pane: ${err.message}`);
       return;

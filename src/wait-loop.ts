@@ -34,7 +34,8 @@ export function isNaturalLanguageLine(line: string): boolean {
   if (/^\d[\d,.]*\s+tokens$/.test(line.trim()) || /^LSPs? are disabled$/.test(line.trim())) return false;
   if (/[─━═]{20,}/.test(line) || /^ctx_\w+ /.test(line) || /^<\/?[a-z_]/i.test(line.trim())) return false;
   const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
-  if (/[^\x20-\x7E\u00A0-\u00FF\u2010-\u2026]/.test(stripped)) return false;
+  // Reject other control characters (keep printable Unicode incl. emoji, scripts).
+  if (/\p{C}/u.test(stripped)) return false;
   return !/[─━═|~^$%\\·•]/.test(stripped);
 }
 
@@ -163,5 +164,6 @@ export async function runAgentTurn(
     progressIntervalMs: opts.pollIntervalMs ?? cfg.progressIntervalMs,
     maxWaitMs: cfg.maxTotalWaitS * 1000,
     maxProgressUpdates: cfg.maxProgressUpdates,
+    stabilityWindowMs: stabilityMs,
   }, deps);
 }

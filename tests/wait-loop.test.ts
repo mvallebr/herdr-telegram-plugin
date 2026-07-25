@@ -143,6 +143,39 @@ the response continues`;
     expect(out).toContain("real response");
     expect(out).toContain("more response");
   });
+
+  it("preserves lines with common emoji (🚀, ✅, 🎉)", () => {
+    const input = "Recebido com sucesso! 🚀 O teste chegou perfeitamente.\nplain line";
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("Recebido com sucesso! 🚀 O teste chegou perfeitamente.");
+    expect(out).toContain("plain line");
+  });
+
+  it("preserves lines with checkmarks and other Unicode symbols (✅, ⏳, ❌)", () => {
+    const input = "✅ done\n⏳ working\n❌ failed\nplain";
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("✅ done");
+    expect(out).toContain("⏳ working");
+    expect(out).toContain("❌ failed");
+  });
+
+  it("preserves lines with non-Latin scripts (Cyrillic, Greek, accented)", () => {
+    const input = "Olá mundo\nПривет мир\nΓειά σου Κόσμε";
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("Olá mundo");
+    expect(out).toContain("Привет мир");
+    expect(out).toContain("Γειά σου Κόσμε");
+  });
+
+  it("still strips visual separators and lines that are pure ANSI noise", () => {
+    const input = "real\n──────\nmore real\n\x1b[31m\x1b[0m";
+    const out = cleanPaneOutput(input);
+    expect(out).toContain("real");
+    expect(out).toContain("more real");
+    expect(out).not.toContain("──────");
+    // Empty line with only ANSI escapes should be filtered as control chars
+    expect(out).not.toMatch(/^\s*$/m);
+  });
 });
 
 describe("extractResponseSince", () => {
