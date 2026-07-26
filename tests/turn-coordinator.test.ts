@@ -193,4 +193,89 @@ describe("coordinateTurn", () => {
       expect(events).toEqual(["blocked:Need approval"]);
     });
   });
+
+  describe("abort signal", () => {
+    it("forces a final report with the latest preview when aborted mid-loop", async () => {
+      const controller = new AbortController();
+      let statusCalls = 0;
+      // status() returns working with previews until the signal fires; we
+      // abort after a few calls to trigger the force-final branch.
+      const wrapper: AgentWrapper = {
+        submit: async () => {},
+        status: async () => {
+          statusCalls++;
+          if (statusCalls === 4) controller.abort();
+          return { state: "working", preview: "thinking about it" };
+        },
+      };
+      const events: string[] = [];
+      const clock = fakeClock();
+      await coordinateTurn(
+        wrapper,
+        {
+          progress: async (s) => { events.push(`progress:${s}`); },
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async (reason) => { events.push(`failed:${reason}`); },
+          blocked: async () => { events.push("blocked"); },
+        },
+        { prompt: "hello", progressIntervalMs: 1, maxWaitMs: 60_000, signal: controller.signal },
+        clock,
+      );
+      // The exact event count can vary with the abort timing; the
+      // important invariant is a single force-final terminating the run.
+      expect(events.filter((e) => e.startsWith("final:"))).toEqual([
+        "final:abort:thinking about it",
+      ]);
+      expect(events.some((e) => e.startsWith("failed:"))).toBe(false);
+    });
+
+    it("emits a placeholder final when aborted before any preview was captured", async () => {
+      const controller = new AbortController();
+      const wrapper: AgentWrapper = {
+        submit: async () => {},
+        status: async () => {
+          controller.abort();
+          return { state: "working" };
+        },
+      };
+      const events: string[] = [];
+      const clock = fakeClock();
+      await coordinateTurn(
+        wrapper,
+        {
+          progress: async () => {},
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async (reason) => { events.push(`failed:${reason}`); },
+          blocked: async () => {},
+        },
+        { prompt: "hello", progressIntervalMs: 1, maxWaitMs: 60_000, signal: controller.signal },
+        clock,
+      );
+      expect(events).toEqual([
+        "final:abort:(turn aborted by /stop — no response captured yet)",
+      ]);
+    });
+
+    it("does nothing if signal is omitted and the wrapper runs to a normal final", async () => {
+      // Sanity: existing behaviour must be unchanged when no signal is
+      // passed — this guards against regressions in the force-final branch.
+      const wrapper: AgentWrapper = {
+        submit: async () => {},
+        status: async () => ({ state: "final", text: "all good", source: "screen-scrape" }),
+      };
+      const events: string[] = [];
+      await coordinateTurn(
+        wrapper,
+        {
+          progress: async () => {},
+          final: async (text, source) => { events.push(`final:${source}:${text}`); },
+          failed: async () => {},
+          blocked: async () => {},
+        },
+        { prompt: "hi", progressIntervalMs: 1, maxWaitMs: 1000 },
+        fakeClock(),
+      );
+      expect(events).toEqual(["final:screen-scrape:all good"]);
+    });
+  });
 });
