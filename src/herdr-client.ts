@@ -165,6 +165,23 @@ export function sendText(paneId: string, text: string): void {
   execHerdr(buildSendTextArgs(paneId, text));
 }
 
+// `herdr pane send-keys` accepts named keys (Escape, Enter, Up, Down, etc.)
+// instead of raw bytes. Raw ESC sent via `pane run` is interpreted as the
+// start of an ANSI CSI sequence (ESC + control char) and silently swallowed
+// by the agent TUI; send-keys routes the named key through the terminal
+// input pipeline and triggers the agent's real ESC handler.
+export function buildSendKeysArgs(paneId: string, key: string, ...moreKeys: string[]): string[] {
+  return ["pane", "send-keys", paneId, key, ...moreKeys];
+}
+
+export function sendKeys(paneId: string, key: string, ...moreKeys: string[]): void {
+  execHerdr(buildSendKeysArgs(paneId, key, ...moreKeys));
+}
+
+export function sendEscape(paneId: string): void {
+  sendKeys(paneId, "Escape");
+}
+
 export function buildWaitArgs(paneId: string, timeoutS: number): string[] {
   return ["agent", "wait", paneId, "--status", "idle", "--timeout", String(timeoutS * 1000)];
 }
