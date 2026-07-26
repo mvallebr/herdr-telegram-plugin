@@ -374,11 +374,14 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     if (!mapping) return; // unbound thread — ignore
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
     turns.enqueue(mapping.pane_id, async () => {
+      const controller = new AbortController();
+      turns.attachAbortController(mapping.pane_id, controller);
       try {
         await runAgentTurn(
           mapping.pane_id, threadId,
           "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
-          cfg, tg, state.authorized_chat_id!
+          cfg, tg, state.authorized_chat_id!,
+          { signal: controller.signal }
         );
       } catch (err) {
         log.error("Digest turn failed", {
@@ -386,7 +389,9 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
           threadId,
           message: err instanceof Error ? err.message : String(err),
         });
-        await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
+        if (!controller.signal.aborted) {
+          await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
+        }
       }
     });
   });
@@ -463,20 +468,40 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       return;
     }
 
+    // Give the user a visible "seen, queued" hint when their pane already
+    // has a turn in progress. Without this, messages arriving during a long
+    // turn look silently swallowed — the queue serialises per pane but
+    // gives no feedback until the current turn finalises. /stop aborts
+    // the in-progress turn and releases the queue immediately.
+    if (turns.isBusy(mapping.pane_id)) {
+      try {
+        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
+      } catch {
+        // reactions may be unavailable in some chats; ignore.
+      }
+    }
+
     // Do not await an agent turn in Grammy's update handler: a slow Codex
     // turn must not stop Telegram from routing a new message to OpenCode.
     turns.enqueue(mapping.pane_id, async () => {
       // Reset follow timer on user message (decision 2).
       if (deps.follows) deps.follows.touch(threadId);
+      // Attach a fresh AbortController so /stop can interrupt this turn.
+      const controller = new AbortController();
+      turns.attachAbortController(mapping.pane_id, controller);
       try {
-        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId);
+        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId, {
+          signal: controller.signal,
+        });
       } catch (err) {
         log.error("Agent turn failed", {
           paneId: mapping.pane_id,
           threadId,
           message: err instanceof Error ? err.message : String(err),
         });
-        await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
+        if (!controller.signal.aborted) {
+          await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
+        }
       }
     });
   });

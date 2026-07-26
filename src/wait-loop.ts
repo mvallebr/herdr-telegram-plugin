@@ -124,6 +124,10 @@ export interface RunAgentTurnOptions {
   pollIntervalMs?: number;
   stabilityWindowMs?: number;
   deps?: Partial<WaitLoopDeps>;
+  /** Optional AbortSignal. When aborted, the polling loop bails out and
+   *  emits whatever was last captured as the final response, so the queue
+   *  can release and queued messages can proceed. Used by /stop. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -166,6 +170,7 @@ export async function runAgentTurn(
     maxWaitMs: cfg.maxTotalWaitS * 1000,
     maxProgressUpdates: cfg.maxProgressUpdates,
     stabilityWindowMs: stabilityMs,
+    signal: opts.signal,
   }, deps);
 }
 
