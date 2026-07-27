@@ -56,8 +56,17 @@ export class TelegramClient {
   private retryWake?: () => void;
   private status: PollingStatus = { state: "stopped", attempt: 0 };
 
-  constructor(token: string, private readonly observe?: PollingObserver, bot?: Bot) {
-    this.bot = bot ?? new Bot(token);
+  constructor(
+    token: string,
+    private readonly observe?: PollingObserver,
+    bot?: Bot,
+    /** Custom fetch implementation. Test rigs pass a mocked fetch to keep
+     *  grammy from hitting the real Telegram network. */
+    customFetch?: typeof fetch,
+  ) {
+    this.bot = bot ?? (customFetch
+      ? new Bot(token, { client: { fetch: customFetch as never } })
+      : new Bot(token));
   }
 
   getPollingStatus(): PollingStatus {
@@ -154,11 +163,12 @@ export class TelegramClient {
     chatId: number,
     threadId: number,
     text: string,
-    opts?: { disable_notification?: boolean }
+    opts?: { disable_notification?: boolean; reply_markup?: unknown }
   ): Promise<number> {
     const msg = await this.bot.api.sendMessage(chatId, text, {
       message_thread_id: threadId,
       disable_notification: opts?.disable_notification ?? false,
+      reply_markup: opts?.reply_markup as any,
     });
     return msg.message_id;
   }
