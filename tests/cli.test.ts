@@ -77,12 +77,19 @@ describe("CLI: --daemon (lifecycle)", () => {
   let stateDir: string;
   let configDir: string;
 
+  let origBotToken: string | undefined;
+  let origChatId: string | undefined;
+
   beforeEach(() => {
     // Point state at a temp dir so we don't disturb the user's actual state.
     stateDir = mkdtempSync(join(tmpdir(), "herdr-cli-test-"));
     configDir = mkdtempSync(join(tmpdir(), "herdr-cli-config-test-"));
     process.env.XDG_STATE_HOME = stateDir;
     process.env.HERDR_TG_CONFIG_DIR = configDir;
+    origBotToken = process.env.HERDR_TG_BOT_TOKEN;
+    origChatId = process.env.HERDR_TG_CHAT_ID;
+    delete process.env.HERDR_TG_BOT_TOKEN;
+    delete process.env.HERDR_TG_CHAT_ID;
     // Kill any daemon from a previous test run
     const pidFile = join(stateDir, "herdr-telegram/daemon.pid");
     if (existsSync(pidFile)) {
@@ -92,6 +99,10 @@ describe("CLI: --daemon (lifecycle)", () => {
   });
 
   afterEach(() => {
+    if (origBotToken !== undefined) process.env.HERDR_TG_BOT_TOKEN = origBotToken;
+    else delete process.env.HERDR_TG_BOT_TOKEN;
+    if (origChatId !== undefined) process.env.HERDR_TG_CHAT_ID = origChatId;
+    else delete process.env.HERDR_TG_CHAT_ID;
     const pidFile = join(stateDir, "herdr-telegram/daemon.pid");
     if (existsSync(pidFile)) {
       try {
