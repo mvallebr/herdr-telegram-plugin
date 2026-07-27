@@ -58,7 +58,22 @@ export interface HerdrMockState {
 const SCRIPT_HEADER = `#!/usr/bin/env node
 "use strict";
 const fs = require("node:fs");
+const path = require("node:path");
 const statePath = process.env.MOCK_HERDR_STATE;
+// Per-pane read counters live in a sibling file so they survive across
+// calls without us having to writeState() on every read. A readPane call
+// increments the counter, advancing the queued reads one slot.
+const counterPath = statePath + ".counters";
+function readCounters() {
+  try {
+    return JSON.parse(fs.readFileSync(counterPath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+function writeCounters(c) {
+  fs.writeFileSync(counterPath, JSON.stringify(c, null, 2));
+}
 function readState() {
   return JSON.parse(fs.readFileSync(statePath, "utf8"));
 }
@@ -118,11 +133,12 @@ if (cmd === "pane") {
   }
   if (sub === "read") {
     const paneId = args[2];
+    const counters = readCounters();
+    counters[paneId] = (counters[paneId] ?? 0) + 1;
+    writeCounters(counters);
     const s = readState();
-    s.read_counts = s.read_counts ?? {};
-    s.read_counts[paneId] = (s.read_counts[paneId] ?? 0) + 1;
     const pane = s.panes[paneId] ?? { reads: [""] };
-    const idx = Math.min(s.read_counts[paneId] - 1, pane.reads.length - 1);
+    const idx = Math.min(counters[paneId] - 1, pane.reads.length - 1);
     const content = pane.reads[idx] ?? "";
     process.stdout.write(content);
     process.exit(0);
@@ -190,6 +206,17 @@ export class MockHerdr {
     this.persist();
   }
 
+  /** Read the latest persisted state from disk (bypasses the in-memory
+   *  cache so tests can observe what the mock script wrote). */
+  readCountFresh(paneId: string): number {
+    try {
+      const fresh = JSON.parse(readFileSync(this.statePath, "utf8"));
+      return fresh.read_counts?.[paneId] ?? 0;
+    } catch {
+      return this.state.read_counts?.[paneId] ?? 0;
+    }
+  }
+
   appendPaneRead(paneId: string, next: string): void {
     if (!this.state.panes[paneId]) {
       this.state.panes[paneId] = { reads: [""], text_history: [], key_history: [] };
@@ -218,11 +245,23 @@ export class MockHerdr {
   }
 
   textHistory(paneId: string): string[] {
-    return this.state.panes[paneId]?.text_history ?? [];
+    // Re-read state.json so the assertion sees the latest values written
+    // by the mock script via writeState().
+    try {
+      const fresh = JSON.parse(readFileSync(this.statePath, "utf8"));
+      return fresh.panes[paneId]?.text_history ?? [];
+    } catch {
+      return this.state.panes[paneId]?.text_history ?? [];
+    }
   }
 
   keyHistory(paneId: string): string[] {
-    return this.state.panes[paneId]?.key_history ?? [];
+    try {
+      const fresh = JSON.parse(readFileSync(this.statePath, "utf8"));
+      return fresh.panes[paneId]?.key_history ?? [];
+    } catch {
+      return this.state.panes[paneId]?.key_history ?? [];
+    }
   }
 
   readCount(paneId: string): number {

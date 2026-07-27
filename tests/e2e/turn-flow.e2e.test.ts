@@ -51,10 +51,11 @@ const capture = {
 function patchTelegramClientPrototype(): void {
   // The daemon's runObserveLoop calls deps.sendMessage which is built
   // from TelegramClient.prototype.sendMessage when no override is
-  // provided. Patching the prototype covers that path. Note the
-  // first argument is `this` (the TelegramClient instance).
+  // provided. Patching the prototype covers that path. JavaScript
+  // regular functions called as methods receive `this` via the
+  // binding, NOT as a positional argument — so the parameter list
+  // starts with chatId (the first real arg of tg.sendMessage).
   TelegramClient.prototype.sendMessage = async function (
-    _this: TelegramClient,
     chatId: number,
     threadId: number,
     body: string,
@@ -69,6 +70,10 @@ function patchTelegramClientPrototype(): void {
  *  records the meaningful API calls into the test capture. Used by
  *  startDaemon({ customFetch }). */
 function makeTelegramFetch(): typeof fetch {
+  // Stable counter for synthetic message_thread_ids returned by
+  // createForumTopic. We hand back a real number so the daemon's
+  // reconcile() keeps the mapping keys well-formed.
+  let topicCounter = 0;
   return async function patchedFetch(
     url: string | URL | Request,
     init?: RequestInit,
@@ -103,6 +108,18 @@ function makeTelegramFetch(): typeof fetch {
         text: String(payload.text ?? ""),
         reply_markup: payload.reply_markup,
       });
+    } else if (method === "getChat") {
+      return new Response(JSON.stringify({ ok: true, result: { id: Number(payload.chat_id), type: "private", permissions: { can_manage_topics: true } } }), { status: 200, headers: { "content-type": "application/json" } });
+    } else if (method === "getForumTopics") {
+      return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    } else if (method === "createForumTopic") {
+      // Return a unique synthetic message_thread_id so the daemon's
+      // reconcile() can keep the mapping stable across calls.
+      const id = 200000 + topicCounter;
+      topicCounter += 1;
+      return new Response(JSON.stringify({ ok: true, result: { message_thread_id: id, name: String(payload.name ?? "topic"), icon_color: 0 } }), { status: 200, headers: { "content-type": "application/json" } });
+    } else if (method === "editForumTopic" || method === "deleteForumTopic") {
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200, headers: { "content-type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: true, result: true }), {
       status: 200,
