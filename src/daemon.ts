@@ -3,21 +3,50 @@ import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
 import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
-import { getAgents, readPane } from "./herdr-client.js";
+import { getAgents, readPane, sendText } from "./herdr-client.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
 import { FollowManager } from "./follow-manager.js";
 import { TurnDispatcher } from "./turn-dispatcher.js";
+import { parseActionCallback } from "./keyboards.js";
+import { formatLastReadback } from "./commands.js";
+import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
+import { formatStatus } from "./commands.js";
+import { sendEscape } from "./herdr-client.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
 
-export async function startDaemon(configDir?: string, stateDir?: string): Promise<{ stop: () => Promise<void> }> {
+export interface StartDaemonOptions {
+  /** Directory holding config.toml. Defaults to env HERDR_TG_CONFIG_DIR. */
+  configDir?: string;
+  /** Directory holding state.json + pid. Defaults to XDG_STATE_HOME/herdr-telegram. */
+  stateDir?: string;
+  /**
+   * When true, skip the Telegram polling loop. Tests inject a mocked bot
+   * and dispatch updates via bot.handleUpdate instead, so they don't need
+   * network access or a real bot token. Defaults to false (real start).
+   */
+  skipTelegramStart?: boolean;
+  /**
+   * Custom fetch implementation passed to grammy. Tests use this to keep
+   * grammy from hitting api.telegram.org. Production leaves this unset.
+   */
+  customFetch?: typeof fetch;
+}
+
+export async function startDaemon(
+  configDirOrOpts?: string | StartDaemonOptions,
+  stateDir?: string,
+): Promise<{ stop: () => Promise<void> }> {
+  const opts: StartDaemonOptions = typeof configDirOrOpts === "string"
+    ? { configDir: configDirOrOpts, stateDir }
+    : (configDirOrOpts ?? {});
   const log = createLogger("daemon");
-  const cfg = loadConfig(configDir);
-  const statePath = stateDir ?? path.join(
+  const cfg = loadConfig(opts.configDir);
+  const statePath = opts.stateDir ?? path.join(
     process.env.XDG_STATE_HOME ?? path.join(process.env.HOME ?? "/tmp", ".local", "state"),
     "herdr-telegram"
   );
@@ -27,13 +56,18 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   state.known_topics = state.known_topics ?? {};
 
   const pollingStatusPath = path.join(statePath, "polling-status.json");
-  const tg = new TelegramClient(cfg.botToken, (polling) => {
-    mkdirSync(statePath, { recursive: true });
-    writeFileSync(pollingStatusPath, JSON.stringify({ ...polling, updatedAt: new Date().toISOString() }) + "\n");
-    const data = { state: polling.state, attempt: polling.attempt, error: polling.error };
-    if (polling.state === "retrying" || polling.state === "failed") log.warn("Telegram polling state", data);
-    else log.info("Telegram polling state", data);
-  });
+  const tg = new TelegramClient(
+    cfg.botToken,
+    (polling) => {
+      mkdirSync(statePath, { recursive: true });
+      writeFileSync(pollingStatusPath, JSON.stringify({ ...polling, updatedAt: new Date().toISOString() }) + "\n");
+      const data = { state: polling.state, attempt: polling.attempt, error: polling.error };
+      if (polling.state === "retrying" || polling.state === "failed") log.warn("Telegram polling state", data);
+      else log.info("Telegram polling state", data);
+    },
+    undefined,
+    opts.customFetch,
+  );
 
   // Re-validate existing pairing
   if (isPaired(state) && state.authorized_chat_id) {
@@ -98,12 +132,10 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
       const sub = follows.get(threadId);
       if (!sub) return;
       const mapping = sub.mapping;
-      let cancelled = false;
-      const cancel = () => { cancelled = true; };
-      followLoops.set(threadId, { cancel });
+      const controller = new AbortController();
+      followLoops.set(threadId, { cancel: () => controller.abort() });
       // Fire and forget — the loop runs in background.
       void (async () => {
-        let expired = false;
         try {
           await runAgentFollowLoop({
             paneId: mapping.pane_id,
@@ -111,17 +143,14 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
             cfg,
             tg,
             chatId: state.authorized_chat_id!,
-            shouldContinue: () => {
-              if (cancelled) return false;
-              const sub = follows.get(threadId);
-              if (!sub) return false;
-              if (follows.isExpired(threadId)) {
-                expired = true;
-                return false;
-              }
-              return true;
+            signal: controller.signal,
+            // The closure re-reads the subscription each tick so user
+            // messages (which call follows.touch) push the deadline out.
+            expiresAt: () => {
+              const current = follows.get(threadId);
+              return current ? current.expiresAt : null;
             },
-            advanceTurn: () => { /* each poll tick — no-op for now */ },
+            onExpired: () => { follows.remove(threadId); },
           });
         } catch (err) {
           log.error("Follow loop crashed", {
@@ -130,16 +159,6 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
             message: err instanceof Error ? err.message : String(err),
           });
         } finally {
-          // If we exited because of expiration (not manual /unfollow), drop
-          // the subscription and tell the user.
-          if (expired) {
-            follows.remove(threadId);
-            await tg.sendMessage(
-              state.authorized_chat_id!,
-              threadId,
-              "⏱️ Subscription expired — /follow to listen again."
-            );
-          }
           followLoops.delete(threadId);
         }
       })();
@@ -373,15 +392,13 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     });
     if (!mapping) return; // unbound thread — ignore
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
-    turns.enqueue(mapping.pane_id, async () => {
-      const controller = new AbortController();
-      turns.attachAbortController(mapping.pane_id, controller);
+    void turns.start(mapping.pane_id, async (signal) => {
       try {
         await runAgentTurn(
           mapping.pane_id, threadId,
           "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
           cfg, tg, state.authorized_chat_id!,
-          { signal: controller.signal }
+          { signal }
         );
       } catch (err) {
         log.error("Digest turn failed", {
@@ -389,7 +406,7 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
           threadId,
           message: err instanceof Error ? err.message : String(err),
         });
-        if (!controller.signal.aborted) {
+        if (!signal.aborted) {
           await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
         }
       }
@@ -483,23 +500,31 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
 
     // Do not await an agent turn in Grammy's update handler: a slow Codex
     // turn must not stop Telegram from routing a new message to OpenCode.
-    turns.enqueue(mapping.pane_id, async () => {
-      // Reset follow timer on user message (decision 2).
-      if (deps.follows) deps.follows.touch(threadId);
-      // Attach a fresh AbortController so /stop can interrupt this turn.
-      const controller = new AbortController();
-      turns.attachAbortController(mapping.pane_id, controller);
+    // PR #10: if a turn is already running for this pane, pass the message
+    // straight to the pane instead of enqueueing another turn. The
+    // already-running turn continues and observes the new lines; the
+    // follow timer is reset either way. 👀 confirms to the user that we
+    // saw the message and the agent will pick it up.
+    if (deps.follows) deps.follows.touch(threadId);
+    if (turns.isBusy(mapping.pane_id)) {
       try {
-        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId, {
-          signal: controller.signal,
-        });
+        sendText(mapping.pane_id, text);
+        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
+      } catch {
+        // reactions may be unavailable; ignore.
+      }
+      return;
+    }
+    void turns.start(mapping.pane_id, async (signal) => {
+      try {
+        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId, { signal });
       } catch (err) {
         log.error("Agent turn failed", {
           paneId: mapping.pane_id,
           threadId,
           message: err instanceof Error ? err.message : String(err),
         });
-        if (!controller.signal.aborted) {
+        if (!signal.aborted) {
           await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
         }
       }
@@ -509,6 +534,87 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
   // Handle inline keyboard taps for thread binding
   tg.bot.on("callback_query:data", async (ctx) => {
     const data = ctx.callbackQuery.data;
+    // Inline-keyboard action buttons (Stop / Unfollow / Last / Status /
+    // Follow Nm). They do not need a pane selection — the threadId in the
+    // callback carries the binding context.
+    if (data.startsWith("act:")) {
+      const parsed = parseActionCallback(data);
+      if (!parsed) {
+        await ctx.answerCallbackQuery({ text: "Unknown action." });
+        return;
+      }
+      const { command, args, threadId } = parsed;
+      log.info("Inline action callback", { command, args, threadId });
+      const mapping = findMapping(threadId, deps.map);
+      if (!mapping) {
+        await ctx.answerCallbackQuery({ text: "Thread not bound." });
+        return;
+      }
+      try {
+        switch (command) {
+          case "stop":
+            sendEscape(mapping.pane_id);
+            const wasBusy = turns.abort(mapping.pane_id);
+            await ctx.answerCallbackQuery({ text: wasBusy ? "Stopped." : "Nothing in flight." });
+            return;
+          case "unfollow":
+            if (deps.follows?.remove(threadId)) {
+              deps.onFollowStop?.(threadId);
+            }
+            await ctx.answerCallbackQuery({ text: "Unfollowed." });
+            return;
+          case "follow":
+            if (!deps.follows) {
+              await ctx.answerCallbackQuery({ text: "Subscriptions not available." });
+              return;
+            }
+            const minutes = parseInt(args, 10);
+            if (!Number.isFinite(minutes) || minutes < 0) {
+              await ctx.answerCallbackQuery({ text: "Invalid minutes." });
+              return;
+            }
+            // If a subscription is already active for this thread, just
+            // reset the timer instead of restarting the loop. Restarting
+            // would emit a confusing 'Follow cancelled.' immediately after
+            // the user clicked to extend the subscription.
+            if (deps.follows.get(threadId)) {
+              deps.follows.touch(threadId);
+              await ctx.answerCallbackQuery({ text: `Timer reset to ${minutes}m.` });
+              return;
+            }
+            deps.follows.subscribe(threadId, mapping, minutes);
+            deps.onFollowStart?.(threadId);
+            await ctx.answerCallbackQuery({ text: `Following ${minutes}m.` });
+            return;
+          case "last":
+            await ctx.answerCallbackQuery({ text: "Reading last snapshot…" });
+            try {
+              await ctx.api.sendMessage(ctx.chat!.id, "Reading last snapshot…\u200B", { message_thread_id: threadId });
+              const raw = readPane(mapping.pane_id, 4000);
+              const cleaned = cleanPaneOutput(stripStatusBar(raw));
+              await ctx.api.sendMessage(ctx.chat!.id, formatLastReadback({ mapping, rawPane: cleaned, busy: turns.isBusy(mapping.pane_id), now: () => new Date().toISOString(), truncateAt: 3000 }), { message_thread_id: threadId });
+            } catch (e) {
+              log.error("Last readback failed", { threadId, message: e instanceof Error ? e.message : String(e) });
+            }
+            return;
+          case "status":
+            await ctx.answerCallbackQuery({ text: "Status requested." });
+            try {
+              await ctx.api.sendMessage(ctx.chat!.id, formatStatus({ uptime: "", paired: true, panesCount: 0 }) + "\nthreadId: " + threadId, { message_thread_id: threadId });
+            } catch (e) {
+              log.error("Status callback failed", { threadId, message: e instanceof Error ? e.message : String(e) });
+            }
+            return;
+          default:
+            await ctx.answerCallbackQuery({ text: "Unknown action." });
+            return;
+        }
+      } catch (err) {
+        log.error("Action callback failed", { command, args, threadId, message: err instanceof Error ? err.message : String(err) });
+        await ctx.answerCallbackQuery({ text: "Failed." });
+      }
+      return;
+    }
     const match = data.match(/^bind:(.+?):(\d+)$/);
     if (!match) return;
     const [, paneId, threadIdStr] = match;
@@ -586,13 +692,23 @@ export async function startDaemon(configDir?: string, stateDir?: string): Promis
     await ctx.reply(parts.join("\n"));
   });
 
-  await tg.start();
+  if (!opts.skipTelegramStart) {
+    await tg.start();
+  }
   log.info("Daemon started", { paired: isPaired(state), panes: map.size });
 
   maybeStartWatcher();
   deps.stopWatcher = () => watcherController.abort();
 
-  return {
+  const result: { stop: () => Promise<void> } & Record<string, unknown> = {
     stop: () => tg.stop(),
   };
+  // Tests using skipTelegramStart: true need to dispatch updates to the
+  // daemon's bot instance. Expose it under a non-standard key so the
+  // production return type stays { stop }.
+  if (opts.skipTelegramStart) {
+    result.tg = tg;
+    result.follows = follows;
+  }
+  return result;
 }

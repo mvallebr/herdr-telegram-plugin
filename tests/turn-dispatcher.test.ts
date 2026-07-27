@@ -1,19 +1,33 @@
 import { describe, expect, it } from "vitest";
 import { TurnDispatcher } from "../src/turn-dispatcher.js";
 
-describe("TurnDispatcher", () => {
-  it("serializes turns for one pane", async () => {
+describe("TurnDispatcher (PR #10 single-turn model)", () => {
+  it("runs one turn per pane and resolves when it finalises", async () => {
     const dispatcher = new TurnDispatcher();
     const events: string[] = [];
     let release!: () => void;
     const first = new Promise<void>((resolve) => { release = resolve; });
-    dispatcher.enqueue("p1", async () => { events.push("first:start"); await first; events.push("first:end"); });
-    dispatcher.enqueue("p1", async () => { events.push("second"); });
+    void dispatcher.start("p1", async () => {
+      events.push("first:start");
+      await first;
+      events.push("first:end");
+    });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(events).toEqual(["first:start"]);
     release();
+    await dispatcher.waitForIdle("p1");
+    expect(events).toEqual(["first:start", "first:end"]);
+    expect(dispatcher.isBusy("p1")).toBe(false);
+  });
+
+  it("rejects when starting a second turn for the same pane while one is in flight", async () => {
+    const dispatcher = new TurnDispatcher();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    void dispatcher.start("p1", async () => { await blocked; });
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(events).toEqual(["first:start", "first:end", "second"]);
+    await expect(dispatcher.start("p1", async () => {})).rejects.toThrow(/already running/);
+    release();
   });
 
   it("runs turns for different panes independently", async () => {
@@ -21,8 +35,8 @@ describe("TurnDispatcher", () => {
     const events: string[] = [];
     let release!: () => void;
     const blocked = new Promise<void>((resolve) => { release = resolve; });
-    dispatcher.enqueue("codex", async () => { await blocked; events.push("codex"); });
-    dispatcher.enqueue("opencode", async () => { events.push("opencode"); });
+    void dispatcher.start("codex", async () => { await blocked; events.push("codex"); });
+    void dispatcher.start("opencode", async () => { events.push("opencode"); });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(events).toEqual(["opencode"]);
     release();
@@ -31,89 +45,107 @@ describe("TurnDispatcher", () => {
   describe("isBusy", () => {
     it("returns false for an unknown pane", () => {
       const dispatcher = new TurnDispatcher();
-      expect(dispatcher.isBusy("never-enqueued")).toBe(false);
+      expect(dispatcher.isBusy("never-started")).toBe(false);
     });
 
-    it("returns true while an enqueued turn is still running", async () => {
+    it("returns true while a turn is still running", async () => {
       const dispatcher = new TurnDispatcher();
       let release!: () => void;
       const blocked = new Promise<void>((resolve) => { release = resolve; });
-      dispatcher.enqueue("p1", async () => { await blocked; });
+      void dispatcher.start("p1", async () => { await blocked; });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(dispatcher.isBusy("p1")).toBe(true);
       release();
-      await new Promise((resolve) => setTimeout(resolve, 5));
+      await dispatcher.waitForIdle("p1");
       expect(dispatcher.isBusy("p1")).toBe(false);
-    });
-
-    it("does not flag other panes as busy", async () => {
-      const dispatcher = new TurnDispatcher();
-      let release!: () => void;
-      const blocked = new Promise<void>((resolve) => { release = resolve; });
-      dispatcher.enqueue("p1", async () => { await blocked; });
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(dispatcher.isBusy("p2")).toBe(false);
-      release();
     });
   });
 
-  describe("attachAbortController / abort", () => {
-    it("abort() returns false when no controller is attached", () => {
+  describe("waitForIdle", () => {
+    it("resolves immediately when no turn is running", async () => {
       const dispatcher = new TurnDispatcher();
-      expect(dispatcher.abort("missing")).toBe(false);
+      await dispatcher.waitForIdle("p1"); // does not hang
     });
 
-    it("abort() returns false if the controller was never attached", () => {
+    it("resolves once the active turn finishes", async () => {
       const dispatcher = new TurnDispatcher();
-      const c = new AbortController();
-      expect(dispatcher.abort("missing")).toBe(false);
-      expect(c.signal.aborted).toBe(false);
-    });
-
-    it("abort() signals the attached controller and returns true", async () => {
-      const dispatcher = new TurnDispatcher();
-      const c = new AbortController();
       let release!: () => void;
       const blocked = new Promise<void>((resolve) => { release = resolve; });
-      dispatcher.enqueue("p1", async () => { await blocked; });
-      dispatcher.attachAbortController("p1", c);
+      void dispatcher.start("p1", async () => { await blocked; });
+      let waited = false;
+      const waiting = dispatcher.waitForIdle("p1").then(() => { waited = true; });
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(c.signal.aborted).toBe(false);
-      expect(dispatcher.abort("p1")).toBe(true);
-      expect(c.signal.aborted).toBe(true);
+      expect(waited).toBe(false);
       release();
+      await waiting;
+      expect(waited).toBe(true);
+    });
+  });
+
+  describe("abort", () => {
+    it("returns false when no turn is active", () => {
+      const dispatcher = new TurnDispatcher();
+      expect(dispatcher.abort("missing")).toBe(false);
     });
 
-    it("abort() returns false on a second invocation (signal already fired)", async () => {
+    it("signals the running turn's AbortController and returns true", async () => {
       const dispatcher = new TurnDispatcher();
-      const c = new AbortController();
-      dispatcher.enqueue("p1", async () => { await new Promise(() => {}); /* never settles */ });
-      dispatcher.attachAbortController("p1", c);
+      const seen: { aborted: boolean } = { aborted: false };
+      void dispatcher.start("p1", async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => {
+            seen.aborted = true;
+            resolve();
+          });
+        });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(dispatcher.abort("p1")).toBe(true);
+      await dispatcher.waitForIdle("p1");
+      expect(seen.aborted).toBe(true);
+    });
+
+    it("returns false on a second invocation (signal already fired)", async () => {
+      const dispatcher = new TurnDispatcher();
+      void dispatcher.start("p1", async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => resolve());
+        });
+        // After abort, sleep forever to keep the turn in flight.
+        await new Promise(() => {});
+      });
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(dispatcher.abort("p1")).toBe(true);
       expect(dispatcher.abort("p1")).toBe(false);
     });
 
-    it("abort() rotates to whichever controller is attached at call time", async () => {
+    it("isolates aborts per pane", async () => {
       const dispatcher = new TurnDispatcher();
-      const stale = new AbortController();
-      const fresh = new AbortController();
-      // First turn: attach a controller, then enqueue again with a fresh
-      // one before the first turn finishes (simulating a new message
-      // arriving before the previous turn finalises).
-      const blocked = new Promise<void>(() => {});
-      dispatcher.enqueue("p1", async () => { await blocked; });
-      dispatcher.attachAbortController("p1", stale);
-      dispatcher.enqueue("p1", async () => { await blocked; });
-      dispatcher.attachAbortController("p1", fresh);
+      const seen = { p1: false, p2: false };
+      void dispatcher.start("p1", async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => { seen.p1 = true; resolve(); });
+        });
+      });
+      void dispatcher.start("p2", async (signal) => {
+        await new Promise<void>((resolve) => {
+          signal.addEventListener("abort", () => { seen.p2 = true; resolve(); });
+        });
+      });
       await new Promise((resolve) => setTimeout(resolve, 0));
-      // The fresh controller is the one wired in; aborting it should NOT
-      // re-fire the stale one (stale is silently replaced).
-      expect(dispatcher.abort("p1")).toBe(true);
-      expect(fresh.signal.aborted).toBe(true);
-      // The stale controller is no longer reachable via dispatcher so its
-      // signal stays untouched — the caller never asked us to fire it.
-      expect(stale.signal.aborted).toBe(false);
+      dispatcher.abort("p1");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      expect(seen.p1).toBe(true);
+      expect(seen.p2).toBe(false);
     });
+  });
+
+  it("cleans up the controller and active map even when the turn rejects", async () => {
+    const dispatcher = new TurnDispatcher();
+    // Attach a catch so the rejection does not become an unhandled error.
+    dispatcher.start("p1", async () => { throw new Error("boom"); }).catch(() => undefined);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(dispatcher.isBusy("p1")).toBe(false);
+    expect(dispatcher.abort("p1")).toBe(false);
   });
 });

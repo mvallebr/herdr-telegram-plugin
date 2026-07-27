@@ -128,11 +128,20 @@ export interface RunAgentTurnOptions {
    *  emits whatever was last captured as the final response, so the queue
    *  can release and queued messages can proceed. Used by /stop. */
   signal?: AbortSignal;
+  /** Whether the thread currently has an active follow subscription. The
+   *  Working and Final keyboards toggle between "Unfollow" and "Follow
+   *  5m / 30m" based on this. */
+  hasFollow?: boolean;
 }
 
 /**
- * Composition root for one Telegram turn. The coordinator owns lifecycle;
- * wrappers own agent transport; the reporter owns Telegram presentation.
+ * Composition root for one Telegram turn. Submits the prompt to the pane,
+ * polls for stability, and emits Telegram Working ticks + a final response.
+ *
+ * After PR #10 the engine is `runObserveLoop` with an `idle` stop condition
+ * and a Working-style output formatter. The legacy wrappers (ScreenScrape,
+ * codex/pi/omp adapters) are no longer wired in here — the observe loop
+ * polls the pane directly and tracks stability via byte-level diffs.
  */
 export async function runAgentTurn(
   paneId: string,
@@ -144,44 +153,63 @@ export async function runAgentTurn(
   maxOutputLinesOrOptions: number | RunAgentTurnOptions = 200
 ): Promise<void> {
   const opts = typeof maxOutputLinesOrOptions === "number" ? { maxOutputLines: maxOutputLinesOrOptions } : maxOutputLinesOrOptions;
-  const deps: WaitLoopDeps = {
-    sendText: opts.deps?.sendText ?? sendText,
-    readPane: opts.deps?.readPane ?? readPane,
-    sendMessage: opts.deps?.sendMessage ?? ((c, t, body, options) => tg.sendMessage(c, t, body, options)),
-    sleep: opts.deps?.sleep ?? sleep,
-    now: opts.deps?.now ?? (() => Date.now()),
-  };
-  // This is a terminal read window, not a Telegram response limit. Start
-  // wide enough for a 4k response that wrapped in a narrow terminal; the
-  // scraper expands further if its prompt anchor has scrolled away.
-  const maxOutputLines = opts.maxOutputLines ?? 1_000;
   const stabilityMs = opts.stabilityWindowMs ?? cfg.stabilityWindowMs;
-  const startedAt = deps.now();
-  const telegram = { sendMessage: deps.sendMessage } as Pick<TelegramClient, "sendMessage">;
-  const reporter = new TelegramTurnReporter(telegram, chatId, threadId, deps.now, startedAt);
-  // Unit tests deliberately provide pane mocks; keep those entirely at the
-  // screen adapter seam instead of invoking the real Herdr metadata command.
-  const wrapper = opts.deps
-    ? new ScreenScrapeWrapper(paneId, maxOutputLines, stabilityMs, deps)
-    : createAgentWrapper(paneId, { maxOutputLines, stabilityWindowMs: stabilityMs }, deps);
-  await coordinateTurn(wrapper, reporter, {
-    prompt: text,
-    progressIntervalMs: opts.pollIntervalMs ?? cfg.progressIntervalMs,
-    maxWaitMs: cfg.maxTotalWaitS * 1000,
-    maxProgressUpdates: cfg.maxProgressUpdates,
-    stabilityWindowMs: stabilityMs,
+  const maxOutputLines = opts.maxOutputLines ?? 1_000;
+
+  // Submit the prompt immediately — pass-through to the pane.
+  (opts.deps?.sendText ?? sendText)(paneId, text);
+
+  // Lazily require to avoid the spawnSync cost when tests inject mocks.
+  const { runObserveLoop } = await import("./observe-loop.js");
+  // Inline import to avoid a circular dep at module load.
+  const { workingKeyboard, finalKeyboard } = await import("./keyboards.js");
+  await runObserveLoop({
+    paneId,
+    threadId,
+    cfg,
+    tg,
+    chatId,
+    maxOutputLines,
     signal: opts.signal,
-  }, deps);
+    stopCondition: { kind: "idle", stabilityMs },
+    output: {
+      workingTick: ({ elapsedSec, followExpiresInMs }) =>
+        followExpiresInMs === undefined
+          ? `⏳ Working (${formatElapsed(elapsedSec)}).`
+          : `⏳ Working (${formatElapsed(elapsedSec)}, follow expires in ${formatExpiresIn(followExpiresInMs)}).`,
+      paneDelta: (delta) => delta,
+      finalMessage: (text) => `✅ (${formatElapsed(0)}):\n\n${text}`,
+      workingKeyboard: () => workingKeyboard(threadId, opts.hasFollow ?? false),
+      finalKeyboard: () => finalKeyboard(threadId, opts.hasFollow ?? false),
+    },
+    deps: opts.deps as Record<string, unknown> | undefined,
+  });
+}
+
+/** Format ms for the `follow expires in Ym Zs` suffix. */
+export function formatExpiresIn(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = Math.floor(totalSec % 60);
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 /**
- * Observe a pane in follow mode: poll every `pollIntervalMs`, send a Telegram
- * message when the pane content changes (delta vs last snapshot), and stop
- * when `shouldContinue()` returns false.
+ * Subscribe to pane updates until the follow subscription expires or is
+ * cancelled. Each pane change emits a delta. Working ticks fire on the
+ * same cadence as a normal turn (every progressIntervalMs) and now carry
+ * the `, follow expires in Ym Zs` suffix when the subscription has a
+ * timer; manual-mode follow (timeout=0) shows just `Working (Xs).` like a
+ * turn.
  *
- * On every poll, calls `advanceTurn` so the caller can refresh its timer
- * (e.g. reset on user message). `getAgentInfo` is queried lazily to detect
- * blocked state.
+ * After PR #10 this is a thin wrapper over `runObserveLoop` with the
+ * `follow` stop condition. The follow timer is supplied as a closure so
+ * that user messages can `touch(threadId)` and push the deadline out;
+ * manual /unfollow closes the subscription externally and the loop bails
+ * on the next tick via the same deadline check.
  */
 export async function runAgentFollowLoop(opts: {
   paneId: string;
@@ -189,55 +217,47 @@ export async function runAgentFollowLoop(opts: {
   cfg: Config;
   tg: TelegramClient;
   chatId: number;
-  shouldContinue: () => boolean;
-  advanceTurn: () => void;
+  /** Returns the current expiration deadline (ms epoch) or `null` for
+   *  manual mode. The caller owns the underlying subscription and may
+   *  `touch(threadId)` to push the deadline out. */
+  expiresAt: () => number | null;
+  /** Optional callback invoked the moment the timer fires. */
+  onExpired?: () => void;
+  /** Optional AbortSignal — when aborted, the loop bails immediately. */
+  signal?: AbortSignal;
   deps?: Partial<WaitLoopDeps>;
+  /** Whether the thread has an active follow subscription. The Working
+   *  and Final keyboards surface "Unfollow" based on this. */
+  hasFollow?: boolean;
 }): Promise<void> {
-  const deps: WaitLoopDeps = {
-    sendText: opts.deps?.sendText ?? sendText,
-    readPane: opts.deps?.readPane ?? readPane,
-    sendMessage: opts.deps?.sendMessage ?? ((c, t, body, options) => opts.tg.sendMessage(c, t, body, options)),
-    sleep: opts.deps?.sleep ?? sleep,
-    now: opts.deps?.now ?? (() => Date.now()),
-  };
-  const maxLines = 4_000;
-  // Take a baseline at subscribe time. We do NOT apply cleanPaneOutput here:
-  // that filter is tuned for end-of-turn output, and discards the most recent
-  // lines (where activity actually happens). For follow mode we only strip the
-  // status bar and keep everything else so byte-level diffs reflect real change.
-  let lastSnapshot = "";
-  try {
-    lastSnapshot = stripStatusBar(deps.readPane(opts.paneId, maxLines));
-  } catch {
-    // ignored
-  }
-  while (opts.shouldContinue()) {
-    opts.advanceTurn();
-    await deps.sleep(opts.cfg.progressIntervalMs);
-    if (!opts.shouldContinue()) break;
-    let raw: string;
-    try {
-      raw = deps.readPane(opts.paneId, maxLines);
-    } catch {
-      continue;
-    }
-    const current = stripStatusBar(raw);
-    if (current === lastSnapshot || current.trim().length === 0) continue;
-    // Compute the delta from the previous snapshot.
-    // Common case: pane grew (new lines appended). Emit the suffix only.
-    if (lastSnapshot && current.startsWith(lastSnapshot)) {
-      const delta = current.slice(lastSnapshot.length).replace(/^\n+/, "");
-      if (delta.length > 0) {
-        const trimmed = delta.length > 3000 ? "…\n" + delta.slice(-3000) : delta;
-        await deps.sendMessage(opts.chatId, opts.threadId, trimmed);
-      }
-    } else {
-      // Less common: pane shrank or scrolled (old prefix dropped). Emit a
-      // labelled tail so the user sees activity but doesn't get a duplicated
-      // dump of the previous snapshot.
-      const tail = current.length > 3000 ? current.slice(-3000) : current;
-      await deps.sendMessage(opts.chatId, opts.threadId, `…(pane scrolled)…\n${tail}`);
-    }
-    lastSnapshot = current;
-  }
+  const { runObserveLoop } = await import("./observe-loop.js");
+  const { workingKeyboard, finalKeyboard } = await import("./keyboards.js");
+  const hasFollow = opts.hasFollow ?? true;
+  await runObserveLoop({
+    paneId: opts.paneId,
+    threadId: opts.threadId,
+    cfg: opts.cfg,
+    tg: opts.tg,
+    chatId: opts.chatId,
+    maxOutputLines: 4_000,
+    signal: opts.signal,
+    stopCondition: {
+      kind: "follow",
+      expiresAt: opts.expiresAt,
+      onExpired: opts.onExpired,
+    },
+    output: {
+      workingTick: ({ elapsedSec, followExpiresInMs }) =>
+        followExpiresInMs === undefined
+          ? `⏳ Working (${formatElapsed(elapsedSec)}).`
+          : `⏳ Working (${formatElapsed(elapsedSec)}, follow expires in ${formatExpiresIn(followExpiresInMs)}).`,
+      paneDelta: (delta) => delta,
+      finalMessage: (text) => `🟢 Follow ended.\n\n${text}`,
+      expiredMessage: () => "⏱️ Subscription expired — /follow to listen again.",
+      abortedMessage: () => "👋 Follow cancelled.",
+      workingKeyboard: () => workingKeyboard(opts.threadId, hasFollow),
+      finalKeyboard: () => finalKeyboard(opts.threadId, hasFollow),
+    },
+    deps: opts.deps as Record<string, unknown> | undefined,
+  });
 }
