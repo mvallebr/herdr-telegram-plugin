@@ -1,6 +1,6 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
-import { getAgents, readPane, sendText } from "./herdr-client.js";
+import { getAgents, readPane, sendText, sendEscape } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
@@ -62,8 +62,9 @@ export interface CommandDeps {
   knownTopics?: Record<number, { name: string; created_at: string }>;
   /** Stops the tab watcher (called on /unpair). */
   stopWatcher?: () => void;
-  /** Optional dispatcher, used to hint when a pane is mid-turn. */
-  turns?: { isBusy(paneId: string): boolean };
+  /** Optional dispatcher, used to hint when a pane is mid-turn and to
+   *  abort the currently running turn when /stop is invoked. */
+  turns?: { isBusy(paneId: string): boolean; abort(paneId: string): boolean };
   /** Optional subscription registry. /follow registers, /unfollow removes. */
   follows?: FollowManager;
   /** Default minutes when /follow is invoked without an explicit argument. */
@@ -108,7 +109,8 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/delete <id> — delete a forum topic by its thread id",
         "/unpair — reset pairing (re-authorize with /pair)",
         "/status — bridge uptime and connection info (incl. active follows)",
-        "/interrupt — send Ctrl+C to this thread's agent",
+        "/interrupt — send Ctrl+C to this thread's agent (hard interrupt)",
+        "/stop — send ESC to this thread's agent (soft cancel of current operation)",
         "/trust — send 'trust, always allow' to this thread's agent",
         "/digest — today's activity (coming soon)",
         "/last — show current pane output (read-only, no turn)",
@@ -156,6 +158,33 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     if (!mapping) { await ctx.reply("No pane for this topic."); return; }
     sendText(mapping.pane_id, "\x03"); // Ctrl+C
     await ctx.reply(`Interrupted ${mapping.label}`);
+  });
+
+  bot.command("stop", async (ctx) => {
+    // Send ESC to the pane — same as pressing ESC in the agent's TUI.
+    // Soft-cancels the current operation (tool call, generation) without
+    // killing the agent process. For a hard interrupt, use /interrupt.
+    //
+    // Uses herdr pane send-keys with the named 'Escape' key. Raw ESC
+    // bytes via 'pane run' are interpreted as the start of an ANSI CSI
+    // sequence and silently swallowed; send-keys routes the named key
+    // through the terminal input pipeline and triggers the real handler.
+    //
+    // Also aborts the in-flight turn so queued user messages can proceed.
+    // Without this, a stuck turn (e.g. agent outputting in a way that
+    // never stabilises for the coordinator's stability window) blocks
+    // every subsequent message for up to max_total_wait_s.
+    const threadId = ctx.message?.message_thread_id;
+    if (!threadId) return;
+    const mapping = findMapping(threadId, deps.map);
+    if (!mapping) { await ctx.reply("No pane for this topic."); return; }
+    sendEscape(mapping.pane_id);
+    const wasBusy = deps.turns?.abort(mapping.pane_id) ?? false;
+    await ctx.reply(
+      wasBusy
+        ? `Stopped ${mapping.label} and released the in-progress turn. The queue will now process your pending messages.`
+        : `Stopped ${mapping.label}.`
+    );
   });
 
   bot.command("trust", async (ctx) => {

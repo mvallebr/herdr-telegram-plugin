@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   parseAgentList,
   buildSendTextArgs,
+  buildSendKeysArgs,
   buildWaitArgs,
   herdrBin,
   resetHerdrBinCache,
@@ -100,6 +101,20 @@ describe("buildSendTextArgs", () => {
   it("builds correct args tuple", () => {
     expect(buildSendTextArgs("w1:pZ", "hello world")).toEqual([
       "pane", "run", "w1:pZ", "hello world",
+    ]);
+  });
+});
+
+describe("buildSendKeysArgs", () => {
+  it("builds args tuple with a single named key", () => {
+    expect(buildSendKeysArgs("w1:pZ", "Escape")).toEqual([
+      "pane", "send-keys", "w1:pZ", "Escape",
+    ]);
+  });
+
+  it("appends additional named keys when given", () => {
+    expect(buildSendKeysArgs("w1:pZ", "Escape", "Enter")).toEqual([
+      "pane", "send-keys", "w1:pZ", "Escape", "Enter",
     ]);
   });
 });

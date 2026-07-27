@@ -83,6 +83,8 @@ Any non-command message in a bound topic is forwarded to the corresponding herdr
 (bot replies)  ✅ (8s): Tests are all passing, just need to...
 ```
 
+Messages sent while the previous turn is still in progress are **queued** (per pane). The bridge reacts with 👀 so you can see your message landed. `/stop` aborts the in-progress turn and releases the queue immediately so your queued message is processed right away.
+
 ### /last
 
 Read-only snapshot of the current pane output. **Does not submit a turn** — useful when you want to peek at what the agent is doing without disturbing it.
@@ -96,6 +98,19 @@ Read-only snapshot of the current pane output. **Does not submit a turn** — us
 ```
 
 The snapshot is truncated to the last 3000 chars (with a `(... N chars omitted)` notice when applicable). If a turn is currently in progress, a `(painel imprimindo — pode estar parcial)` hint is appended.
+
+### /stop
+
+Send ESC to the agent in the current topic — the same effect as pressing ESC inside the agent's terminal UI. Use it to soft-cancel an in-flight operation (tool call, generation) without killing the agent process. Does **not** interrupt a `/follow` subscription on the same thread.
+
+If the pane already has a turn in progress (the bridge is still waiting for the previous response to stabilise), `/stop` also **aborts the in-flight turn and releases the queue**, so the next message you send gets processed immediately instead of being held behind the stuck turn. The reply will say so explicitly:
+
+```
+/stop
+→ Stopped Echo and released the in-progress turn. The queue will now process your pending messages.
+```
+
+For a harder interrupt (SIGINT-style) that kills the current operation, use `/interrupt` instead.
 
 ## Subscriptions
 

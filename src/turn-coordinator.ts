@@ -28,6 +28,11 @@ export interface CoordinateTurnOptions {
    *  JSONL session-log adapters, so premature `final_answer` events do not
    *  close the turn while the agent is still working. */
   stabilityWindowMs?: number;
+  /** Optional abort signal. When aborted, the polling loop bails out and
+   *  the most recent working preview (or a "turn aborted by /stop" note
+   *  when no preview was captured) is forwarded as the final response so
+   *  the queue can release and the next user message can proceed. */
+  signal?: AbortSignal;
 }
 
 export async function coordinateTurn(
@@ -43,8 +48,20 @@ export async function coordinateTurn(
   let lastPreview = "";
   let pending: PendingFinal | null = null;
   const stabilityMs = options.stabilityWindowMs ?? 0;
+  const signal = options.signal;
 
   while (deps.now() - startedAt <= options.maxWaitMs) {
+    if (signal?.aborted) {
+      // Force-publish whatever we have so the queue can release. If the
+      // wrapper never produced a preview, synthesize a short message so
+      // the user gets a visible "stopped" signal in Telegram rather than
+      // silence.
+      const text = lastPreview.trim().length > 0
+        ? lastPreview
+        : "(turn aborted by /stop — no response captured yet)";
+      await reporter.final(text, "abort");
+      return;
+    }
     const status = await wrapper.status();
 
     // Blocked always preempts: an interactive question must reach the user
@@ -107,6 +124,9 @@ export async function coordinateTurn(
       );
       if (preview) lastPreview = preview;
     }
+    // Signal may fire during the sleep — catch it before the next iteration
+    // bumps progress and floods Telegram.
+    if (signal?.aborted) continue;
   }
   await reporter.failed("Timed out waiting for the agent response.");
 }
