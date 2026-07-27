@@ -23,7 +23,7 @@
  * `text_history` so tests can assert what the daemon sent.
  */
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 

@@ -708,6 +708,7 @@ export async function startDaemon(
   // production return type stays { stop }.
   if (opts.skipTelegramStart) {
     result.tg = tg;
+    result.follows = follows;
   }
   return result;
 }

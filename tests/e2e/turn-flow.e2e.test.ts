@@ -186,6 +186,8 @@ interface TestRig {
   stop: () => Promise<void>;
   dispatch: (update: Update) => Promise<void>;
   tick: (ms?: number) => Promise<void>;
+  /** Direct access to the daemon's FollowManager (test-only). */
+  follows: import("../../src/follow-manager.js").FollowManager;
 }
 
 async function setupRig(): Promise<TestRig> {
@@ -270,11 +272,15 @@ async function setupRig(): Promise<TestRig> {
   // need a microtask to settle).
   await new Promise((r) => setTimeout(r, 10));
 
+  const follows = (daemon as unknown as { follows: import("../../src/follow-manager.js").FollowManager }).follows;
+  if (!follows) throw new Error("daemon.follows was not exposed (skipTelegramStart: true required)");
+
   return {
     herdr,
     configDir,
     stateDir,
     paneId: PANE_ID,
+    follows,
     stop: daemon.stop,
     async dispatch(update: Update) {
       await tg.bot.handleUpdate(update);
@@ -345,8 +351,9 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
     rig.herdr.setPaneContent(rig.paneId, growing);
 
     await rig.dispatch(buildMessageUpdate(1, "olá agente"));
-    // Let the first turn start ticking.
-    for (let i = 0; i < 5; i++) await rig.tick(50);
+    // Let the first turn start ticking — wait enough ticks for the observe
+    // loop to make at least 2 readPane calls and confirm it is running.
+    for (let i = 0; i < 8; i++) await rig.tick(50);
 
     // While the first turn is mid-flight, send a second message.
     resetCapture();
@@ -362,15 +369,19 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
   });
 
   it("treats a second `act:follow` callback as a touch, not a restart", async () => {
-    // First, /follow via a regular command to seed a subscription.
-    await rig.dispatch(buildMessageUpdate(1, "/follow 5"));
-    for (let i = 0; i < 8; i++) await rig.tick(50);
+    // Seed a subscription directly via the FollowManager so we bypass the
+    // grammy /follow command handler (which is blocked by the message:text
+    // middleware returning early for commands). The test is about the
+    // callback_query:data handler behaviour, not the /follow command itself.
+    const mapping = { pane_id: PANE_ID, label: "Echo", agent: "pi", created_at: new Date().toISOString() };
+    rig.follows.subscribe(THREAD_ID, mapping, 5);
+    for (let i = 0; i < 4; i++) await rig.tick(50);
 
-    // The follow loop should be alive. Now simulate a click on
-    // Follow 5m (the inline button).
+    // The follow subscription is active. Now simulate a click on Follow 5m
+    // (the inline button). threadId in the callback data must match THREAD_ID.
     const callbackMsgId = 1;
-    await rig.dispatch(buildCallbackUpdate(2, callbackMsgId, "act:follow:5:3628"));
-    for (let i = 0; i < 8; i++) await rig.tick(50);
+    await rig.dispatch(buildCallbackUpdate(2, callbackMsgId, `act:follow:5:${THREAD_ID}`));
+    for (let i = 0; i < 4; i++) await rig.tick(50);
 
     // Toast should be "Timer reset to 5m." (touch) — not "Following 5m."
     // (which would be a fresh restart).

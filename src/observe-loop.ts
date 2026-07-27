@@ -9,6 +9,7 @@
 import type { TelegramClient } from "./telegram-client.js";
 import type { Config } from "./config.js";
 import { stripStatusBar } from "./wait-loop.js";
+import { readPane as herdrReadPane } from "./herdr-client.js";
 
 export interface ObserveLoopDeps {
   readPane: (paneId: string, lines: number) => string;
@@ -229,11 +230,10 @@ function computeFollowExpiresInMs(c: FollowStopCondition, now: number): number |
 // --- Defaults --------------------------------------------------------------
 
 function defaultReadPane(paneId: string, lines: number): string {
-  // Lazily resolve to keep unit tests from paying for the spawnSync cost
-  // unless they actually invoke production code.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const mod = require("./herdr-client.js") as typeof import("./herdr-client.js");
-  return mod.readPane(paneId, lines);
+  // Static import at the top of the module. Unit tests always inject
+  // deps?.readPane so this path is never reached in tests; no spawnSync
+  // cost is paid unless production code actually runs.
+  return herdrReadPane(paneId, lines);
 }
 
 function defaultSendMessage(tg: TelegramClient) {
