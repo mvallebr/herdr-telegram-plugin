@@ -68,16 +68,19 @@ describe("/stop command handler", () => {
     const fake = makeFakeBot();
     const map = new Map<number, ThreadMapping>();
     map.set(140, { pane_id: "w1:p27", label: "dmarc", agent: "pi", created_at: "x" });
+    const stopSpy = vi.fn();
     registerCommands(fake.bot, {
       map,
       stateDir: "/tmp/no-such",
       chatId: -100,
       startTime: Date.now(),
       saveMappings: () => {},
+      getPaneAgent: () => ({ stop: stopSpy, isLoopActive: () => false } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
     expect(sendEscapeSpy).toHaveBeenCalledTimes(1);
     expect(sendEscapeSpy).toHaveBeenCalledWith("w1:p27");
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(fake.replies.join("\n")).toContain("Stopped dmarc");
     sendEscapeSpy.mockRestore();
     sendKeysSpy.mockRestore();
@@ -130,6 +133,7 @@ describe("/stop command handler", () => {
       startTime: Date.now(),
       saveMappings: () => {},
       turns: { abort: abortSpy, isBusy: isBusySpy },
+      getPaneAgent: () => ({ stop: () => {}, isLoopActive: () => true } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
     expect(abortSpy).toHaveBeenCalledTimes(1);
@@ -155,6 +159,7 @@ describe("/stop command handler", () => {
       startTime: Date.now(),
       saveMappings: () => {},
       turns: { abort: abortSpy, isBusy: () => false },
+      getPaneAgent: () => ({ stop: () => {}, isLoopActive: () => false } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
     expect(abortSpy).toHaveBeenCalledTimes(1);

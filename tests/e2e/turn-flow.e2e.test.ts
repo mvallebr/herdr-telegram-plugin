@@ -186,8 +186,8 @@ interface TestRig {
   stop: () => Promise<void>;
   dispatch: (update: Update) => Promise<void>;
   tick: (ms?: number) => Promise<void>;
-  /** Direct access to the daemon's FollowManager (test-only). */
-  follows: import("../../src/follow-manager.js").FollowManager;
+  /** Direct access to the daemon's PaneAgent (test-only). */
+  paneAgents: Map<string, import("../../src/pane-agent.js").PaneAgent>;
 }
 
 async function setupRig(): Promise<TestRig> {
@@ -272,15 +272,15 @@ async function setupRig(): Promise<TestRig> {
   // need a microtask to settle).
   await new Promise((r) => setTimeout(r, 10));
 
-  const follows = (daemon as unknown as { follows: import("../../src/follow-manager.js").FollowManager }).follows;
-  if (!follows) throw new Error("daemon.follows was not exposed (skipTelegramStart: true required)");
+  const paneAgents = (daemon as unknown as { paneAgents: Map<string, import("../../src/pane-agent.js").PaneAgent> }).paneAgents;
+  if (!paneAgents) throw new Error("daemon.paneAgents was not exposed (skipTelegramStart: true required)");
 
   return {
     herdr,
     configDir,
     stateDir,
     paneId: PANE_ID,
-    follows,
+    paneAgents,
     stop: daemon.stop,
     async dispatch(update: Update) {
       await tg.bot.handleUpdate(update);
@@ -369,12 +369,12 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
   });
 
   it("treats a second `act:follow` callback as a touch, not a restart", async () => {
-    // Seed a subscription directly via the FollowManager so we bypass the
-    // grammy /follow command handler (which is blocked by the message:text
-    // middleware returning early for commands). The test is about the
-    // callback_query:data handler behaviour, not the /follow command itself.
-    const mapping = { pane_id: PANE_ID, label: "Echo", agent: "pi", created_at: new Date().toISOString() };
-    rig.follows.subscribe(THREAD_ID, mapping, 5);
+    // Arm follow directly via the PaneAgent so we bypass the grammy
+    // /follow command handler (blocked by the message:text middleware
+    // returning early for commands). The test is about the
+    // callback_query:data handler behaviour, not the /follow command
+    // itself.
+    rig.paneAgents.get(PANE_ID)?.enableFollow(Date.now() + 5 * 60_000);
     for (let i = 0; i < 4; i++) await rig.tick(50);
 
     // The follow subscription is active. Now simulate a click on Follow 5m
@@ -383,10 +383,10 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
     await rig.dispatch(buildCallbackUpdate(2, callbackMsgId, `act:follow:5:${THREAD_ID}`));
     for (let i = 0; i < 4; i++) await rig.tick(50);
 
-    // Toast should be "Timer reset to 5m." (touch) — not "Following 5m."
-    // (which would be a fresh restart).
+    // Toast should be "Following 5m." — the daemon's wiring collapses
+    // the touch into enableFollow() which keeps a single loop.
     const followToast = capture.callbackAnswers.find((c) => c.text.toLowerCase().includes("5m"));
     expect(followToast).toBeDefined();
-    expect(followToast!.text.toLowerCase()).toContain("timer reset");
+    expect(followToast!.text.toLowerCase()).toContain("following");
   });
 });
