@@ -1,5 +1,6 @@
 import type { AgentOutputReader, AgentReaderRequest } from "./types.js";
 import { stripStatusBar } from "../output-format.js";
+import { PiJsonlReader, validatePathSession } from "./jsonl.js";
 
 class ScrapeReader implements AgentOutputReader {
   readonly kind = "scrape";
@@ -18,5 +19,18 @@ class ScrapeReader implements AgentOutputReader {
 }
 
 export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputReader {
+  if (req.session?.kind === "path" && (req.agentName === "pi" || req.agentName === "omp")) {
+    const reason = validatePathSession(req.session.path);
+    if (reason) {
+      req.logger.warn("structured source unavailable; falling back to scrape", {
+        paneId: req.paneId,
+        agent: req.agentName,
+        reason,
+      });
+    } else {
+      return new PiJsonlReader(req.session.path, req.logger, req.paneId, req.agentName);
+    }
+  }
+
   return new ScrapeReader(req.paneId, req.readPane);
 }
