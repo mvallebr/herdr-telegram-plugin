@@ -21,6 +21,12 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createLogger, type Logger } from "./logger.js";
 import { createAgentOutputReader } from "./readers/registry.js";
+import { sendText } from "./herdr-client.js";
+import {
+  SENT_TAIL_MAX,
+  tailOf,
+  deriveUnseen,
+} from "./output-diff.js";
 
 // Use createRequire so we can `require("node:sqlite")` from this ESM
 // module without bundler or async-loading ceremony. node:sqlite is built
@@ -565,7 +571,7 @@ export interface AgentCommunicatorDeps {
   sqliteDriver?: SqliteDriver;
   /**
    * Per-agent reader options (e.g. include_tools / include_thoughts for
-   * OpenCode). Wired in from cfg at the daemon/wait-loop entry points.
+   * OpenCode). Wired in from cfg at the daemon entry point.
    */
   opencodeReadOptions?: OpenCodeReadOptions;
 }
@@ -603,7 +609,7 @@ export function createAgentCommunicator(depsIn: AgentCommunicatorDeps): AgentCom
     sqliteDriver: deps.sqliteDriver,
     logger: log,
   });
-  return new AgentCommunicator(reader, log);
+  return new AgentCommunicator(reader, log, deps.paneId);
 }
 
 function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_session?: AgentSessionRef } | null {
@@ -625,16 +631,39 @@ function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_
 export class AgentCommunicator {
   /** Short identifier of the active reader ("scrape" | "jsonl" | "opencode-db"). */
   readonly readerKind: string;
+  /**
+   * Pane id this communicator is bound to. Required for `sendInput`.
+   * Optional in the constructor purely so existing direct-construction
+   * test sites (which don't exercise input) keep working unchanged —
+   * the factory always supplies a value.
+   */
+  readonly paneId: string;
 
   constructor(
     reader: AgentOutputReader,
     private readonly logger: Logger = fallbackLog,
+    paneId?: string,
   ) {
     this.readerKind = reader.kind;
     this.reader = reader;
+    this.paneId = paneId ?? "";
   }
 
   private readonly reader: AgentOutputReader;
+
+  /**
+   * Diff state. `sentTail` is the trailing SENT_TAIL_MAX chars of the last
+   * snapshot we considered "consumed" by the consumer (a follow loop, a
+   * /last-aware poll, etc.). `initialized` flips to `true` after the first
+   * baseline seed; until then the next `getNewOutput()` call seeds instead
+   * of emitting — historical content must never be replayed as "new".
+   *
+   * Why per-instance: each pane gets its own communicator, so each pane's
+   * turn lifecycle owns its own baseline. Sharing across panes would let
+   * one pane consume another pane's unread content.
+   */
+  private sentTail = "";
+  private initialized = false;
 
   /**
    * Read the current output from the agent.
@@ -642,6 +671,11 @@ export class AgentCommunicator {
    * Returns the structured reader's text when one was selected, otherwise
    * the screen-scrape. Runtime read errors return "" (and surface via the
    * injected logger) — they MUST NOT trigger a fallback to readPane.
+   *
+   * This is a PURE read: it does not seed or update the diff state owned
+   * by `getNewOutput`. Use it for one-shot reads (e.g. the watcher's
+   * seed snapshot) where there's no notion of "what the user has already
+   * seen".
    */
   getAgentOutput(maxLines: number): string {
     try {
@@ -654,6 +688,76 @@ export class AgentCommunicator {
       });
       return "";
     }
+  }
+
+  /**
+   * Stateful diff reader for polling consumers (follow loop, turn
+   * controller, etc.).
+   *
+   *   - First call: seed `sentTail` from the current snapshot and return
+   *     "". Historical content is never replayed — the user has been
+   *     watching the pane live and would see duplicates.
+   *   - Subsequent calls: return the portion of the current snapshot
+   *     that has not yet been seen, and update `sentTail` only when the
+   *     unseen suffix was non-empty. When nothing is new, the baseline
+   *     is left untouched so a stable pane does not drift the anchor.
+   *   - Errors are swallowed by `getAgentOutput` (return "") — the
+   *     first error after a clean seed will look like "snapshot went
+   *     empty", which `deriveUnseen` handles by returning "".
+   *
+   * Multiple calls after the baseline seed each return only what has
+   * appeared since the previous successful call, so a polling consumer
+   * that calls this every tick will see each new chunk exactly once.
+   */
+  getNewOutput(): string {
+    const snapshot = this.getAgentOutput(4000);
+    if (!this.initialized) {
+      this.sentTail = tailOf(snapshot, SENT_TAIL_MAX);
+      this.initialized = true;
+      return "";
+    }
+    const unseen = deriveUnseen(snapshot, this.sentTail);
+    if (unseen.length > 0) {
+      // Re-anchor on the LITERAL current snapshot (not on the unseen
+      // suffix) — trailing-newline stripping on scrape snapshots can
+      // offset by a single `\n`, and substring anchoring against the
+      // snapshot itself always matches on the next poll.
+      this.sentTail = tailOf(snapshot, SENT_TAIL_MAX);
+    }
+    return unseen;
+  }
+
+  /**
+   * Read-only peek for `/last` and similar. Returns whatever the
+   * underlying reader currently reports WITHOUT touching diff state —
+   * a subsequent `getNewOutput()` still treats the first unseen
+   * content as "new".
+   *
+   * Implemented as a thin wrapper over `getAgentOutput` so the
+   * constraint is structurally guaranteed: there is no path through
+   * this method that mutates `sentTail`/`initialized`.
+   */
+  getLatestOutput(): string {
+    return this.getAgentOutput(4000);
+  }
+
+  /**
+   * Forward `text` to the pane as agent input (via herdr's
+   * `pane run` bridge). Equivalent to the user typing in the TUI.
+   * Synchronous — herdr returns once the input has been delivered to
+   * the pane's stdin.
+   *
+   * Throws if the communicator was built without a `paneId` (only
+   * possible via direct constructor — the factory always supplies one).
+   * `PaneAgent` calls this from `handleMessage`.
+   */
+  sendInput(text: string): void {
+    if (!this.paneId) {
+      throw new Error(
+        "AgentCommunicator.sendInput requires a paneId — use createAgentCommunicator()"
+      );
+    }
+    sendText(this.paneId, text);
   }
 }
 

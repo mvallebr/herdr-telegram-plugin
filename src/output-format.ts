@@ -1,7 +1,8 @@
 /**
- * Output-formatting helpers shared between observe-loop (which only needs
- * `stripStatusBar`) and commands/wait-loop (which use both). Lives in its
- * own file so observe-loop does not have to import from wait-loop.
+ * Output-formatting helpers used by the registry's scrape reader, the
+ * commands module (/last), and the daemon's topic seeding. Lives in its
+ * own module so the scrape reader does not have to take a dependency on
+ * Telegram-specific code.
  */
 
 export function isNaturalLanguageLine(line: string): boolean {

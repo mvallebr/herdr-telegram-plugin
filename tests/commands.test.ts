@@ -68,16 +68,19 @@ describe("/stop command handler", () => {
     const fake = makeFakeBot();
     const map = new Map<number, ThreadMapping>();
     map.set(140, { pane_id: "w1:p27", label: "dmarc", agent: "pi", created_at: "x" });
+    const stopSpy = vi.fn();
     registerCommands(fake.bot, {
       map,
       stateDir: "/tmp/no-such",
       chatId: -100,
       startTime: Date.now(),
       saveMappings: () => {},
+      getPaneAgent: () => ({ stop: stopSpy, isLoopActive: () => false } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
     expect(sendEscapeSpy).toHaveBeenCalledTimes(1);
     expect(sendEscapeSpy).toHaveBeenCalledWith("w1:p27");
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(fake.replies.join("\n")).toContain("Stopped dmarc");
     sendEscapeSpy.mockRestore();
     sendKeysSpy.mockRestore();
@@ -116,10 +119,9 @@ describe("/stop command handler", () => {
     sendEscapeSpy.mockRestore();
   });
 
-  it("forwards a busy signal to the dispatcher so the in-flight turn is released", async () => {
+  it("calls PaneAgent.stop() so the in-flight loop releases", async () => {
     const sendEscapeSpy = vi.spyOn(herdrClient, "sendEscape").mockImplementation(() => {});
-    const abortSpy = vi.fn(() => true);
-    const isBusySpy = vi.fn(() => true);
+    const stopSpy = vi.fn();
     const fake = makeFakeBot();
     const map = new Map<number, ThreadMapping>();
     map.set(140, { pane_id: "w1:p27", label: "dmarc", agent: "pi", created_at: "x" });
@@ -129,22 +131,18 @@ describe("/stop command handler", () => {
       chatId: -100,
       startTime: Date.now(),
       saveMappings: () => {},
-      turns: { abort: abortSpy, isBusy: isBusySpy },
+      getPaneAgent: () => ({ stop: stopSpy, isLoopActive: () => true } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
-    expect(abortSpy).toHaveBeenCalledTimes(1);
-    expect(abortSpy).toHaveBeenCalledWith("w1:p27");
-    // The reply must mention that the turn was released — distinguishes
-    // it from the no-op path.
-    expect(fake.replies.join("\n")).toMatch(/released the in-progress turn/i);
+    expect(stopSpy).toHaveBeenCalledTimes(1);
+    expect(sendEscapeSpy).toHaveBeenCalledWith("w1:p27");
+    expect(fake.replies.join("\n")).toMatch(/Stopped dmarc/);
     sendEscapeSpy.mockRestore();
   });
 
-  it("tells the user the agent was stopped without mentioning queue release when idle", async () => {
+  it("stops the agent even when no loop is active (no-op)", async () => {
     const sendEscapeSpy = vi.spyOn(herdrClient, "sendEscape").mockImplementation(() => {});
-    // abort() is always invoked; the boolean it returns shapes the reply.
-    // Returning false here means the dispatcher has no in-flight turn.
-    const abortSpy = vi.fn(() => false);
+    const stopSpy = vi.fn();
     const fake = makeFakeBot();
     const map = new Map<number, ThreadMapping>();
     map.set(140, { pane_id: "w1:p27", label: "dmarc", agent: "pi", created_at: "x" });
@@ -154,14 +152,13 @@ describe("/stop command handler", () => {
       chatId: -100,
       startTime: Date.now(),
       saveMappings: () => {},
-      turns: { abort: abortSpy, isBusy: () => false },
+      getPaneAgent: () => ({ stop: stopSpy, isLoopActive: () => false } as never),
     } as CommandDeps);
     await fake.run("stop", { message: { message_thread_id: 140 } });
-    expect(abortSpy).toHaveBeenCalledTimes(1);
-    expect(abortSpy).toHaveBeenCalledWith("w1:p27");
-    // Reply must NOT mention the in-progress turn release — the user just
-    // pressed /stop while their agent was idle.
-    expect(fake.replies.join("\n")).not.toMatch(/in-progress turn/i);
+    // PaneAgent.stop() is idempotent — the daemon invokes it once even
+    // when the loop was already idle. The reply simply confirms the
+    // ESC was sent.
+    expect(stopSpy).toHaveBeenCalledTimes(1);
     expect(fake.replies.join("\n")).toMatch(/Stopped dmarc/);
     sendEscapeSpy.mockRestore();
   });

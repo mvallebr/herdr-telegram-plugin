@@ -1,25 +1,26 @@
 # Agent Support
 
-All agents share the same turn lifecycle: submit once, poll `status()`, publish `Working` updates, then publish a final result. The only variable is the adapter used to read agent output.
+All agents share the same turn pipeline: one `PaneAgent` per Herdr pane, one `AgentCommunicator`, and at most one active observe loop. The variable part is the output reader selected by the communicator.
 
-| Agent | Adapter | Final-result signal | Notes |
-|---|---|---|---|
-| Codex | Structured session-log wrapper | JSONL `final_answer` correlated to the submitted prompt | Commentary is progress only, never final output. |
-| Pi | Structured session-log wrapper | Assistant message in Herdr-provided JSONL path | Requires `agent_session.path`. |
-| OMP | Structured session-log wrapper | Assistant message in Herdr-provided JSONL path | Uses Pi-compatible log parsing. |
-| OpenCode | Screen-scrape wrapper | Stable changed screen, with Herdr `idle` as an extra signal when needed | Uses prompt anchor, snapshot delta, then safe idle fallback. |
-| Other agents | Screen-scrape wrapper | Stable changed screen | Fallback; behavior depends on terminal UI. |
+| Agent | Output source | Notes |
+|---|---|---|
+| OpenCode | SQLite session database | Uses the OpenCode DB when Herdr reports the session id. |
+| Codex | JSONL rollout/session log | Resolves rollout file from Herdr session information. |
+| Pi / OMP | Herdr-provided JSONL session path | Cumulative assistant text from JSONL. |
+| Other agents | Screen scraping fallback | Used only when no structured source is validated. |
 
 ## Progress and completion
 
-`progress_interval_ms` controls both wrapper polling and the required quiet period for screen scraping. The Coordinator emits a neutral `Working` heartbeat at that cadence; a wrapper may attach a new safe preview. The final message is only sent when the wrapper reports `final`.
+`progress_interval_ms` controls the observe-loop polling cadence. New output is emitted as delta chunks. When there is no new output, the loop emits a Working heartbeat. The turn ends when its stop condition is satisfied.
 
-## Interactive questions
+The stop condition is:
 
-Some terminal agents can pause for a decision. When Herdr reports `agent_status: blocked`, the screen-scrape wrapper returns `blocked` instead of waiting indefinitely. Telegram receives the extracted question and choices as `⚠️ Agent needs input`; reply in the same topic to continue. A blocked turn releases that pane's queue so the reply can be sent to the agent.
+```text
+stop = deadline_reached AND (NOT wait_until_idle OR is_idle)
+```
 
-Telegram messages are capped below 4,096 characters. Longer final responses are truncated with an indication.
+Telegram messages are chunked to stay below Telegram limits. Longer output is split into multiple messages.
 
-## Contributing a wrapper
+## Contributing a reader
 
-See [CONTRIBUTING.md](https://github.com/mvallebr/herdr-telegram-plugin/blob/main/CONTRIBUTING.md) for the wrapper contract, tests, and issue-reporting checklist.
+See [CONTRIBUTING.md](https://github.com/mvallebr/herdr-telegram-plugin/blob/main/CONTRIBUTING.md) for tests and issue-reporting checklist.

@@ -1,19 +1,17 @@
 import { TelegramClient } from "./telegram-client.js";
-import { registerCommands, type CommandDeps } from "./commands.js";
+import { registerCommands, getLastReadback, formatStatus, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
-import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
-import { getAgents, readPane, sendText, getAgentInfo, sendEscape } from "./herdr-client.js";
+import { PaneAgent } from "./pane-agent.js";
+import type { OutputEvent } from "./turn/observe-loop-controller.js";
+import { getAgents, readPane, getAgentInfo, sendEscape } from "./herdr-client.js";
 import { createAgentCommunicator } from "./agent-sessions.js";
 import { cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
-import { FollowManager } from "./follow-manager.js";
-import { TurnDispatcher } from "./turn-dispatcher.js";
 import { parseActionCallback } from "./keyboards.js";
-import { getLastReadback, formatStatus } from "./commands.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -111,10 +109,27 @@ export async function startDaemon(
     thread_mappings: rawMappings,
   });
 
-  const turns = new TurnDispatcher();
-  const follows = new FollowManager();
-  /** Active background follow loops, keyed by threadId. Cancel the runner to stop. */
-  const followLoops = new Map<number, { cancel: () => void }>();
+  const paneAgents = new Map<string, PaneAgent>();
+  const getPaneAgent = (paneId: string): PaneAgent | undefined => {
+    let agent = paneAgents.get(paneId);
+    if (!agent) {
+      const mapping = Array.from(map.values()).find((m) => m.pane_id === paneId);
+      if (!mapping) return undefined;
+      const communicator = createAgentCommunicator({ paneId, getAgentInfo, readPane, agentPaths: cfg.agentPaths, opencodeReadOptions: { includeTools: cfg.opencodeIncludeTools, includeThoughts: cfg.opencodeIncludeThoughts }, logger: log });
+      agent = new PaneAgent({ paneId, communicator, config: cfg, emit: (event) => emitPaneEvent(paneId, event) });
+      paneAgents.set(paneId, agent);
+    }
+    return agent;
+  };
+  const emitPaneEvent = (paneId: string, event: OutputEvent): void => {
+    const mappingEntry = Array.from(map.entries()).find(([, m]) => m.pane_id === paneId);
+    if (!mappingEntry || !state.authorized_chat_id) return;
+    const [threadId] = mappingEntry;
+    const text = event.type === "working" ? event.text
+      : event.type === "delta" ? event.text
+      : event.reason === "aborted" ? `🛑 Stopped.\n\n${event.text}` : `✅ ${event.text}`;
+    void tg.sendMessage(state.authorized_chat_id, threadId, text).catch((err) => log.error("Pane event delivery failed", { paneId, message: String(err) }));
+  };
 
   const deps: CommandDeps = {
     map,
@@ -122,55 +137,8 @@ export async function startDaemon(
     chatId: state.authorized_chat_id ?? 0,
     startTime: Date.now(),
     knownTopics: state.known_topics,
-    turns,
-    follows,
+    getPaneAgent,
     follows_default_minutes: cfg.followTimeoutMinutes,
-    agentPaths: cfg.agentPaths,
-    opencodeReadOptions: {
-      includeTools: cfg.opencodeIncludeTools,
-      includeThoughts: cfg.opencodeIncludeThoughts,
-    },
-    onFollowStart: (threadId: number) => {
-      // Idempotent: stop any existing loop first.
-      followLoops.get(threadId)?.cancel();
-      const sub = follows.get(threadId);
-      if (!sub) return;
-      const mapping = sub.mapping;
-      const controller = new AbortController();
-      followLoops.set(threadId, { cancel: () => controller.abort() });
-      // Fire and forget — the loop runs in background.
-      void (async () => {
-        try {
-          await runAgentFollowLoop({
-            paneId: mapping.pane_id,
-            threadId,
-            cfg,
-            tg,
-            chatId: state.authorized_chat_id!,
-            signal: controller.signal,
-            // The closure re-reads the subscription each tick so user
-            // messages (which call follows.touch) push the deadline out.
-            expiresAt: () => {
-              const current = follows.get(threadId);
-              return current ? current.expiresAt : null;
-            },
-            onExpired: () => { follows.remove(threadId); },
-          });
-        } catch (err) {
-          log.error("Follow loop crashed", {
-            paneId: mapping.pane_id,
-            threadId,
-            message: err instanceof Error ? err.message : String(err),
-          });
-        } finally {
-          followLoops.delete(threadId);
-        }
-      })();
-    },
-    onFollowStop: (threadId: number) => {
-      followLoops.get(threadId)?.cancel();
-      followLoops.delete(threadId);
-    },
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
       for (const [tid, m] of deps.map.entries()) raw[tid] = m;
@@ -282,9 +250,15 @@ export async function startDaemon(
         }
         // Reply before deleting topics (deleting the current topic would break ctx.reply)
         await ctx.reply(`Unpairing...`);
-        // Delete all bot-created topics before resetting state
-        const kt = state.known_topics ?? {};
-        const tids = Object.keys(kt).map(Number);
+        // Delete every bot-owned topic before resetting state. We must use
+        // the union of known_topics + thread_mappings keys: known_topics is
+        // a denormalised cache ("topics the bot has ever created in this
+        // chat") and its invariant with thread_mappings is not strictly
+        // enforced — a topic bound via /reconcile may live only in
+        // thread_mappings. Iterating known_topics alone would leave orphans.
+        const tids = new Set<number>();
+        for (const k of Object.keys(state.known_topics ?? {})) tids.add(Number(k));
+        for (const k of Object.keys(state.thread_mappings ?? {})) tids.add(Number(k));
         let deleted = 0;
         for (const tid of tids) {
           try {
@@ -350,22 +324,31 @@ export async function startDaemon(
       log.info("reconcile via message handler", { chatId: ctx.chat.id });
       if (!isPaired(state) || !state.authorized_chat_id) { await ctx.reply("Not paired."); return; }
       const chatId = state.authorized_chat_id;
-      await ctx.reply("Reconciling...");
-      state.known_topics = state.known_topics ?? {};
-      const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
-      for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
-      const raw: DaemonState["thread_mappings"] = {};
-      for (const [tid, m] of newMap.entries()) raw[tid] = m;
-      // Seed known_tabs to prevent watcher from creating duplicates
-      state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
-      saveState(statePath, { ...state, thread_mappings: raw });
-      seedTopics(newMap, chatId).catch(() => {});
-      const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
-      const parts = [`Reconciled: ${newMap.size} panes mapped.`];
-      if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} dups: ${result.deleted.join(", ")}`);
-      if (result?.created.length) parts.push(`Created: ${result.created.join(", ")}`);
-      if (result?.failed.length) parts.push(`Failed: ${result.failed.join(", ")}`);
-      await ctx.reply(parts.join("\n"));
+      try {
+        await ctx.reply("Reconciling...");
+        state.known_topics = state.known_topics ?? {};
+        const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
+        for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
+        const raw: DaemonState["thread_mappings"] = {};
+        for (const [tid, m] of newMap.entries()) raw[tid] = m;
+        // Seed known_tabs to prevent watcher from creating duplicates
+        state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
+        saveState(statePath, { ...state, thread_mappings: raw });
+        seedTopics(newMap, chatId).catch(() => {});
+        const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+        const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+        if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} dups: ${result.deleted.join(", ")}`);
+        if (result?.created.length) parts.push(`Created: ${result.created.join(", ")}`);
+        if (result?.failed.length) parts.push(`Failed: ${result.failed.join(", ")}`);
+        await ctx.reply(parts.join("\n"));
+      } catch (err: any) {
+        log.error("reconcile failed", { chatId, message: err?.message ?? String(err) });
+        try {
+          await ctx.reply(`⚠️ Reconcile failed: ${err?.message ?? String(err)}`);
+        } catch {
+          // If Telegram delivery itself failed, the log entry is the only record.
+        }
+      }
       return;
     }
     // /cleanup — list all tracked topics
@@ -417,25 +400,8 @@ export async function startDaemon(
     });
     if (!mapping) return; // unbound thread — ignore
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
-    void turns.start(mapping.pane_id, async (signal) => {
-      try {
-        await runAgentTurn(
-          mapping.pane_id, threadId,
-          "Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.",
-          cfg, tg, state.authorized_chat_id!,
-          { signal }
-        );
-      } catch (err) {
-        log.error("Digest turn failed", {
-          paneId: mapping.pane_id,
-          threadId,
-          message: err instanceof Error ? err.message : String(err),
-        });
-        if (!signal.aborted) {
-          await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
-        }
-      }
-    });
+    const agent = getPaneAgent(mapping.pane_id);
+    if (agent) agent.handleMessage("Keep it under 4000 characters. Summarize what we've been working on: original goal, progress, blockers, next steps.");
   });
 
   // Pairing flow (grammy command handler — kept for when grammy works)
@@ -510,50 +476,15 @@ export async function startDaemon(
       return;
     }
 
-    // Give the user a visible "seen, queued" hint when their pane already
-    // has a turn in progress. Without this, messages arriving during a long
-    // turn look silently swallowed — the queue serialises per pane but
-    // gives no feedback until the current turn finalises. /stop aborts
-    // the in-progress turn and releases the queue immediately.
-    if (turns.isBusy(mapping.pane_id)) {
-      try {
-        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
-      } catch {
-        // reactions may be unavailable in some chats; ignore.
-      }
+    const paneAgent = getPaneAgent(mapping.pane_id);
+    if (!paneAgent) return;
+    if (paneAgent.isLoopActive()) {
+      // PaneAgent owns the loop; surface the 👀 hint whenever the loop is
+      // already running so the user knows the message will be appended
+      // to the in-flight turn rather than starting a new one.
+      try { await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]); } catch { /* unavailable */ }
     }
-
-    // Do not await an agent turn in Grammy's update handler: a slow Codex
-    // turn must not stop Telegram from routing a new message to OpenCode.
-    // PR #10: if a turn is already running for this pane, pass the message
-    // straight to the pane instead of enqueueing another turn. The
-    // already-running turn continues and observes the new lines; the
-    // follow timer is reset either way. 👀 confirms to the user that we
-    // saw the message and the agent will pick it up.
-    if (deps.follows) deps.follows.touch(threadId);
-    if (turns.isBusy(mapping.pane_id)) {
-      try {
-        sendText(mapping.pane_id, text);
-        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
-      } catch {
-        // reactions may be unavailable; ignore.
-      }
-      return;
-    }
-    void turns.start(mapping.pane_id, async (signal) => {
-      try {
-        await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId, { signal });
-      } catch (err) {
-        log.error("Agent turn failed", {
-          paneId: mapping.pane_id,
-          threadId,
-          message: err instanceof Error ? err.message : String(err),
-        });
-        if (!signal.aborted) {
-          await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
-        }
-      }
-    });
+    paneAgent.handleMessage(text);
   });
 
   // Handle inline keyboard taps for thread binding
@@ -577,59 +508,38 @@ export async function startDaemon(
       }
       try {
         switch (command) {
-          case "stop":
+          case "stop": {
+            const stopAgent = getPaneAgent(mapping.pane_id);
             sendEscape(mapping.pane_id);
-            const wasBusy = turns.abort(mapping.pane_id);
-            await ctx.answerCallbackQuery({ text: wasBusy ? "Stopped." : "Nothing in flight." });
+            stopAgent?.stop();
+            await ctx.answerCallbackQuery({ text: stopAgent?.isLoopActive() ? "Stopped." : "Nothing in flight." });
             return;
+          }
           case "unfollow":
-            if (deps.follows?.remove(threadId)) {
-              deps.onFollowStop?.(threadId);
-            }
+            getPaneAgent(mapping.pane_id)?.disableFollow();
             await ctx.answerCallbackQuery({ text: "Unfollowed." });
             return;
-          case "follow":
-            if (!deps.follows) {
-              await ctx.answerCallbackQuery({ text: "Subscriptions not available." });
-              return;
-            }
+          case "follow": {
+            const followAgent = getPaneAgent(mapping.pane_id);
             const minutes = parseInt(args, 10);
             if (!Number.isFinite(minutes) || minutes < 0) {
               await ctx.answerCallbackQuery({ text: "Invalid minutes." });
               return;
             }
-            // If a subscription is already active for this thread, just
-            // reset the timer instead of restarting the loop. Restarting
-            // would emit a confusing 'Follow cancelled.' immediately after
-            // the user clicked to extend the subscription.
-            if (deps.follows.get(threadId)) {
-              deps.follows.touch(threadId);
-              await ctx.answerCallbackQuery({ text: `Timer reset to ${minutes}m.` });
-              return;
-            }
-            deps.follows.subscribe(threadId, mapping, minutes);
-            deps.onFollowStart?.(threadId);
+            followAgent?.enableFollow(minutes === 0 ? Date.now() : Date.now() + minutes * 60_000);
             await ctx.answerCallbackQuery({ text: `Following ${minutes}m.` });
             return;
+          }
           case "last":
             await ctx.answerCallbackQuery({ text: "Reading last snapshot…" });
             try {
               await ctx.api.sendMessage(ctx.chat!.id, "Reading last snapshot…\u200B", { message_thread_id: threadId });
-              const comm = createAgentCommunicator({
-                paneId: mapping.pane_id,
-                getAgentInfo,
-                readPane,
-                agentPaths: cfg.agentPaths,
-                opencodeReadOptions: {
-                  includeTools: cfg.opencodeIncludeTools,
-                  includeThoughts: cfg.opencodeIncludeThoughts,
-                },
-                logger: log,
-              });
+              const agent = getPaneAgent(mapping.pane_id);
+              if (!agent) throw new Error("Pane agent unavailable");
               const body = getLastReadback({
                 mapping,
-                communicator: comm,
-                busy: turns.isBusy(mapping.pane_id),
+                communicator: { getAgentOutput: () => agent.getLastOutput(), getLatestOutput: () => agent.getLastOutput() } as never,
+                busy: agent.isLoopActive(),
                 now: () => new Date().toISOString(),
                 truncateAt: 3000,
               });
@@ -749,7 +659,7 @@ export async function startDaemon(
   // production return type stays { stop }.
   if (opts.skipTelegramStart) {
     result.tg = tg;
-    result.follows = follows;
+    result.paneAgents = paneAgents;
   }
   return result;
 }
