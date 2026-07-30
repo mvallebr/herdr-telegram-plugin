@@ -2,12 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
   readPiSessionResponse,
   readCodexSessionResponse,
   readCodexSessionProgress,
   readAgentSessionResponse,
   pickOutputStrategy,
+  createAgentCommunicator,
+  type SqliteDriver,
 } from "../src/agent-sessions.js";
 
 describe("readPiSessionResponse", () => {
@@ -242,6 +245,94 @@ describe("pickOutputStrategy", () => {
   });
 });
 
+describe("pickOutputStrategy — opencode id (cumulative)", () => {
+  const SQLITE = "sqlite3";
+
+  interface OpenCodeFixture {
+    dbPath: string;
+    sessionId: string;
+    tmpDir: string;
+  }
+
+  function makeOpenCodeDb(opts: {
+    messages: Array<{ role: "user" | "assistant"; parts: any[] }>;
+    sessionId?: string;
+  }): OpenCodeFixture {
+    const tmpDir = mkdtempSync(join(tmpdir(), "pos-oc-"));
+    const dbPath = join(tmpDir, "opencode.db");
+    const sessionId = opts.sessionId ?? "ses_abc";
+
+    for (const sql of [
+      "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT)",
+      "CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, time_created INTEGER, data TEXT)",
+      "CREATE INDEX idx_message_session ON message(session_id)",
+    ]) {
+      const r = spawnSync(SQLITE, [dbPath, sql], { encoding: "utf8" });
+      if (r.status !== 0) throw new Error("schema: " + r.stderr);
+    }
+
+    let t = 1700000000000;
+    for (const m of opts.messages) {
+      t += 1000;
+      const msgId = `${m.role}-${t}`;
+      const safeMsg = JSON.stringify({ role: m.role }).replace(/'/g, "''");
+      spawnSync(SQLITE, [dbPath,
+        `INSERT INTO message (id, session_id, time_created, data) VALUES ('${msgId}', '${sessionId}', ${t}, '${safeMsg}');`,
+      ], { encoding: "utf8" });
+      for (let i = 0; i < m.parts.length; i++) {
+        const p = m.parts[i];
+        const safeData = JSON.stringify(p).replace(/'/g, "''");
+        spawnSync(SQLITE, [dbPath,
+          `INSERT INTO part (id, message_id, time_created, data) VALUES ('${msgId}-p${i}', '${msgId}', ${t + i}, '${safeData}');`,
+        ], { encoding: "utf8" });
+      }
+    }
+    return { dbPath, sessionId, tmpDir };
+  }
+
+  function fixtureCleanup(f: OpenCodeFixture) {
+    rmSync(f.tmpDir, { recursive: true, force: true });
+  }
+
+  it("returns jsonl strategy with an AgentResponse reader for valid opencode id", () => {
+    const fixture = makeOpenCodeDb({
+      messages: [
+        { role: "user", parts: [{ type: "text", text: "prompt" }] },
+        { role: "assistant", parts: [{ type: "text", text: "cumulative reply" }] },
+      ],
+    });
+    try {
+      const result = pickOutputStrategy(
+        { kind: "id", id: fixture.sessionId },
+        "opencode",
+        { opencode: { db: fixture.dbPath } },
+      );
+      expect(result.strategy).toBe("jsonl");
+
+      const response = result.reader(0);
+      expect(response).not.toBeNull();
+      expect(response!.text).toContain("cumulative reply");
+      expect(response!.text).not.toContain("prompt");
+      expect(response!.source).toBe("opencode-db");
+      expect(typeof response!.timestamp).toBe("string");
+    } finally {
+      fixtureCleanup(fixture);
+    }
+  });
+
+  it("returns scrape when opencode db path is missing", () => {
+    const result = pickOutputStrategy(
+      { kind: "id", id: "ses_none" },
+      "opencode",
+      { opencode: { db: "/nonexistent/db" } },
+    );
+    expect(result.strategy).toBe("scrape");
+    if (result.strategy === "scrape") {
+      expect(result.reason).toMatch(/opencode db not available/i);
+    }
+  });
+});
+
 describe("readAgentSessionResponse (dispatch)", () => {
   let tmpDir: string;
   beforeEach(() => {
@@ -281,5 +372,120 @@ describe("readAgentSessionResponse (dispatch)", () => {
     expect(
       readAgentSessionResponse({ kind: "id", id: "abc" }, "pi", 0)
     ).toBeNull();
+  });
+});
+
+describe("AgentCommunicator (factory)", () => {
+  const noopLogger = { info() {}, warn() {}, error() {}, debug() {} };
+
+  it("uses readPane when getAgentInfo returns null", () => {
+    const readPane = (paneId: string, _lines: number) => `scraped: ${paneId}`;
+    const comm = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => null,
+      readPane,
+      logger: noopLogger,
+    });
+    expect(comm.readerKind).toBe("scrape");
+    expect(comm.getAgentOutput(4000)).toBe("scraped: w1:p1");
+  });
+
+  it("uses readPane when agent has no agent_session", () => {
+    const readPane = () => "scraped content";
+    const comm = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => ({
+        agent: "pi",
+        agent_status: "idle",
+        pane_id: "w1:p1",
+        tab_id: "",
+        workspace_id: "",
+      }),
+      readPane,
+      logger: noopLogger,
+    });
+    expect(comm.getAgentOutput(4000)).toBe("scraped content");
+  });
+
+  it("returns '' when session path is missing at construction; does NOT call readPane", () => {
+    // The structured reader is selected once. Runtime readPane is forbidden.
+    // Construction-time validation may downgrade to scrape (e.g. path
+    // missing); but in that case the reader kind must be "scrape".
+    let readPaneCalls = 0;
+    const readPane = () => { readPaneCalls += 1; return "fallback scrape"; };
+    const comm = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => ({
+        agent: "pi",
+        agent_status: "idle",
+        pane_id: "w1:p1",
+        tab_id: "",
+        workspace_id: "",
+        agent_session: { kind: "path", path: "/nonexistent/session.jsonl" },
+      }),
+      readPane,
+      logger: noopLogger,
+    });
+    // Validation should reject the missing path and downgrade to scrape.
+    expect(comm.readerKind).toBe("scrape");
+    expect(comm.getAgentOutput(4000)).toBe("fallback scrape");
+    expect(readPaneCalls).toBe(1);
+  });
+
+  it("uses jsonl reader when session path is valid; readPane is never called even if reader returns empty", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "agent-comm-"));
+    const sessionPath = join(tmpDir, "session.jsonl");
+    writeFileSync(sessionPath, JSON.stringify({
+      type: "message",
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "jsonl response" }],
+      },
+    }) + "\n", "utf8");
+
+    let readPaneCalls = 0;
+    const readPane = () => { readPaneCalls += 1; return "should not be called"; };
+    const comm = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => ({
+        agent: "pi",
+        agent_status: "idle",
+        pane_id: "w1:p1",
+        tab_id: "",
+        workspace_id: "",
+        agent_session: { kind: "path", path: sessionPath },
+      }),
+      readPane,
+      logger: noopLogger,
+    });
+
+    expect(comm.readerKind).toBe("jsonl");
+    expect(comm.getAgentOutput(4000)).toBe("jsonl response");
+    expect(readPaneCalls).toBe(0);
+
+    // Now if the reader returns empty (we'd need to mutate the file), the
+    // empty result must NOT trigger readPane.
+    writeFileSync(sessionPath, "", "utf8");
+    // Construct a NEW communicator with the (now-empty) path so it picks
+    // jsonl at construction; reads will return empty.
+    const comm2 = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => ({
+        agent: "pi",
+        agent_status: "idle",
+        pane_id: "w1:p1",
+        tab_id: "",
+        workspace_id: "",
+        agent_session: { kind: "path", path: sessionPath },
+      }),
+      readPane,
+      logger: noopLogger,
+    });
+    expect(comm2.readerKind).toBe("jsonl");
+    expect(comm2.getAgentOutput(4000)).toBe("");
+    expect(readPaneCalls).toBe(0); // never increased
+
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 });

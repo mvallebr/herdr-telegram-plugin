@@ -3,7 +3,9 @@ import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
 import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
-import { getAgents, readPane, sendText } from "./herdr-client.js";
+import { getAgents, readPane, sendText, getAgentInfo, sendEscape } from "./herdr-client.js";
+import { createAgentCommunicator } from "./agent-sessions.js";
+import { cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -11,10 +13,7 @@ import { startWatcher } from "./watcher.js";
 import { FollowManager } from "./follow-manager.js";
 import { TurnDispatcher } from "./turn-dispatcher.js";
 import { parseActionCallback } from "./keyboards.js";
-import { formatLastReadback } from "./commands.js";
-import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
-import { formatStatus } from "./commands.js";
-import { sendEscape } from "./herdr-client.js";
+import { getLastReadback, formatStatus } from "./commands.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -126,6 +125,11 @@ export async function startDaemon(
     turns,
     follows,
     follows_default_minutes: cfg.followTimeoutMinutes,
+    agentPaths: cfg.agentPaths,
+    opencodeReadOptions: {
+      includeTools: cfg.opencodeIncludeTools,
+      includeThoughts: cfg.opencodeIncludeThoughts,
+    },
     onFollowStart: (threadId: number) => {
       // Idempotent: stop any existing loop first.
       followLoops.get(threadId)?.cancel();
@@ -201,16 +205,30 @@ export async function startDaemon(
     log.error("Unhandled bot error", { message: err.message, name: err.name });
   });
 
-  /** Send the last few lines of each pane's output as the first message in its topic. */
+  /*   * Send the last few lines of each pane's output as the first message in its topic. */
   async function seedTopics(
     newMap: Map<number, typeof state.thread_mappings[keyof typeof state.thread_mappings]>,
     chatId: number
   ): Promise<void> {
     for (const [threadId, mapping] of newMap.entries()) {
       try {
-        const output = readPane(mapping.pane_id, 5);
-        if (output.trim()) {
-          const truncated = output.length > 2000 ? output.slice(-2000) : output;
+        const comm = createAgentCommunicator({
+          paneId: mapping.pane_id,
+          getAgentInfo,
+          readPane,
+          agentPaths: cfg.agentPaths,
+          opencodeReadOptions: {
+            includeTools: cfg.opencodeIncludeTools,
+            includeThoughts: cfg.opencodeIncludeThoughts,
+          },
+          logger: log,
+        });
+        const output = comm.getAgentOutput(5);
+        // Apply same cleaning as /last — strip status bars and filter out
+        // terminal chrome that the OpenCode TUI captures into its SQLite log.
+        const cleaned = cleanPaneOutput(stripStatusBar(output));
+        if (cleaned.trim()) {
+          const truncated = cleaned.length > 2000 ? cleaned.slice(-2000) : cleaned;
           await tg.sendMessage(chatId, threadId, `📋 *${mapping.label}*\n\n\`\`\`\n${truncated}\n\`\`\``);
         }
       } catch {
@@ -239,7 +257,14 @@ export async function startDaemon(
       saveStateCallback,
       15_000,
       watcherController.signal,
-      deps
+      {
+        ...deps,
+        agentPaths: cfg.agentPaths,
+        opencodeReadOptions: {
+          includeTools: cfg.opencodeIncludeTools,
+          includeThoughts: cfg.opencodeIncludeThoughts,
+        },
+      }
     );
     log.info("watcher: lazily started after pair/reconcile");
   }
@@ -590,9 +615,25 @@ export async function startDaemon(
             await ctx.answerCallbackQuery({ text: "Reading last snapshot…" });
             try {
               await ctx.api.sendMessage(ctx.chat!.id, "Reading last snapshot…\u200B", { message_thread_id: threadId });
-              const raw = readPane(mapping.pane_id, 4000);
-              const cleaned = cleanPaneOutput(stripStatusBar(raw));
-              await ctx.api.sendMessage(ctx.chat!.id, formatLastReadback({ mapping, rawPane: cleaned, busy: turns.isBusy(mapping.pane_id), now: () => new Date().toISOString(), truncateAt: 3000 }), { message_thread_id: threadId });
+              const comm = createAgentCommunicator({
+                paneId: mapping.pane_id,
+                getAgentInfo,
+                readPane,
+                agentPaths: cfg.agentPaths,
+                opencodeReadOptions: {
+                  includeTools: cfg.opencodeIncludeTools,
+                  includeThoughts: cfg.opencodeIncludeThoughts,
+                },
+                logger: log,
+              });
+              const body = getLastReadback({
+                mapping,
+                communicator: comm,
+                busy: turns.isBusy(mapping.pane_id),
+                now: () => new Date().toISOString(),
+                truncateAt: 3000,
+              });
+              await ctx.api.sendMessage(ctx.chat!.id, body, { message_thread_id: threadId });
             } catch (e) {
               log.error("Last readback failed", { threadId, message: e instanceof Error ? e.message : String(e) });
             }

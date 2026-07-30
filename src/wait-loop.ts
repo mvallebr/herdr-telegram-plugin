@@ -1,10 +1,18 @@
 import type { Config } from "./config.js";
 import type { TelegramClient } from "./telegram-client.js";
-import { sendText, readPane } from "./herdr-client.js";
-import { createAgentWrapper, ScreenScrapeWrapper } from "./agent-wrappers.js";
-import { coordinateTurn } from "./turn-coordinator.js";
-import type { AgentWrapper } from "./agent-wrapper.js";
-import { TelegramTurnReporter } from "./telegram-reporter.js";
+import { sendText, readPane, getAgentInfo } from "./herdr-client.js";
+import type { AgentCommunicator } from "./agent-sessions.js";
+import { createAgentCommunicator } from "./agent-sessions.js";
+// Re-export legacy wait-loop output-format helpers from output-format.ts
+// so callers that import from wait-loop keep working.
+export {
+  cleanPaneOutput,
+  stripStatusBar,
+  isNaturalLanguageLine,
+  extractResponseSince,
+  extractScreenResponse,
+  extractScreenDelta,
+} from "./output-format.js";
 
 export function shouldThrottle(lastSentAt: number, throttleMs: number): boolean {
   return Date.now() - lastSentAt < throttleMs;
@@ -17,85 +25,6 @@ export function formatElapsed(totalSec: number): string {
   if (h > 0) return `${h}h ${m}m ${s}s`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-/** Strip context-mode banners and terminal chrome from scraped output. */
-export function cleanPaneOutput(content: string): string {
-  let clean = content.replace(/<session_state[\s\S]*?<\/session_state>/g, "");
-  // Terminal UIs (notably OpenCode) prefix otherwise useful prompt/output
-  // lines with a vertical border. Remove that chrome before line filtering so
-  // the submitted-prompt anchor remains available for extraction.
-  clean = clean.replace(/^[\s┃│▏▕]+/gm, "");
-  clean = clean.split("\n").filter((line) => !line.includes("context-mode active")).join("\n");
-  return clean.split("\n").filter(isNaturalLanguageLine).join("\n").trim();
-}
-
-export function isNaturalLanguageLine(line: string): boolean {
-  if (!line || line.length > 300) return false;
-  if (/^\d[\d,.]*\s+tokens$/.test(line.trim()) || /^LSPs? are disabled$/.test(line.trim())) return false;
-  if (/[─━═]{20,}/.test(line) || /^ctx_\w+ /.test(line) || /^<\/?[a-z_]/i.test(line.trim())) return false;
-  const stripped = line.replace(/\x1b\[[0-9;]*m/g, "");
-  // Reject other control characters (keep printable Unicode incl. emoji, scripts).
-  if (/\p{C}/u.test(stripped)) return false;
-  return !/[─━═|~^$%\\·•]/.test(stripped);
-}
-
-/** Remove terminal status lines that refresh independently of agent output. */
-export function stripStatusBar(content: string): string {
-  const lines = content.split("\n");
-  while (lines.length) {
-    const last = lines.at(-1)!;
-    if (
-      last.trim() === "" ||
-      /^[─━═]{20,}/.test(last.trim()) ||
-      /^.{3,} · /.test(last.trim()) ||
-      /^Model: /.test(last.trim()) ||
-      /^\S+\s+\S+\s+[^\s]+\$$/.test(last.trim())
-    ) lines.pop();
-    else break;
-  }
-  return lines.join("\n");
-}
-
-/** Return only content after the last occurrence of the submitted prompt. */
-export function extractResponseSince(content: string, userInput: string): string {
-  const lines = content.split("\n");
-  const userLines = userInput.split("\n").filter((line) => line.trim());
-  const anchor = userLines.at(-1) ?? userInput;
-  let index = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].includes(anchor)) { index = i; break; }
-    // Some terminal UIs append status text to the prompt line or wrap its
-    // tail. The first 80 chars remain a unique, safe turn anchor.
-    if (anchor.length > 80 && lines[i].includes(anchor.slice(0, 80))) { index = i; break; }
-  }
-  if (index < 0) return "";
-  const after = lines.slice(index + 1);
-  while (after.length && (after[0].trim() === "")) after.shift();
-  return stripStatusBar(after.join("\n"));
-}
-
-/** Scrape only a response unambiguously anchored to the submitted prompt. */
-export function extractScreenResponse(content: string, userInput: string): string {
-  // Locate the prompt before filtering. Long OpenCode prompt lines can carry
-  // terminal metadata and exceed the prose filter, but remain the safest
-  // correlation anchor for this turn.
-  const dechromed = content.replace(/^[\s┃│▏▕]+/gm, "");
-  return cleanPaneOutput(extractResponseSince(dechromed, userInput));
-}
-
-/**
- * Fallback when a terminal UI removes the submitted prompt after accepting
- * it. Returns only the changed suffix when a stable snapshot has a shared
- * prefix; callers must use it only for content observed after `submit`.
- */
-export function extractScreenDelta(before: string, after: string): string {
-  const oldLines = before.split("\n");
-  const newLines = after.split("\n");
-  let shared = 0;
-  while (shared < oldLines.length && shared < newLines.length && oldLines[shared] === newLines[shared]) shared += 1;
-  if (shared === 0 || shared === newLines.length) return "";
-  return cleanPaneOutput(newLines.slice(shared).join("\n"));
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -132,6 +61,9 @@ export interface RunAgentTurnOptions {
    *  Working and Final keyboards toggle between "Unfollow" and "Follow
    *  5m / 30m" based on this. */
   hasFollow?: boolean;
+  /** Optional test override for the AgentCommunicator. If not provided,
+   *  a production communicator is created with getAgentInfo + readPane. */
+  communicator?: AgentCommunicator;
 }
 
 /**
@@ -159,6 +91,19 @@ export async function runAgentTurn(
   // Submit the prompt immediately — pass-through to the pane.
   (opts.deps?.sendText ?? sendText)(paneId, text);
 
+  // Use the injected communicator (tests) or create a production one.
+  const communicator =
+    opts.communicator ?? createAgentCommunicator({
+      paneId,
+      getAgentInfo,
+      readPane,
+      agentPaths: cfg.agentPaths,
+      opencodeReadOptions: {
+        includeTools: cfg.opencodeIncludeTools,
+        includeThoughts: cfg.opencodeIncludeThoughts,
+      },
+    });
+
   // Lazily require to avoid the spawnSync cost when tests inject mocks.
   const { runObserveLoop } = await import("./observe-loop.js");
   // Inline import to avoid a circular dep at module load.
@@ -182,7 +127,12 @@ export async function runAgentTurn(
       workingKeyboard: () => workingKeyboard(threadId, opts.hasFollow ?? false),
       finalKeyboard: () => finalKeyboard(threadId, opts.hasFollow ?? false),
     },
-    deps: opts.deps as Record<string, unknown> | undefined,
+    communicator,
+    deps: {
+      sendMessage: (c, t, text, opts2) => tg.sendMessage(c, t, text, opts2),
+      sleep: opts.deps?.sleep ?? sleep,
+      now: opts.deps?.now ?? (() => Date.now()),
+    },
   });
 }
 
@@ -229,10 +179,23 @@ export async function runAgentFollowLoop(opts: {
   /** Whether the thread has an active follow subscription. The Working
    *  and Final keyboards surface "Unfollow" based on this. */
   hasFollow?: boolean;
+  /** Optional test override for the AgentCommunicator. */
+  communicator?: AgentCommunicator;
 }): Promise<void> {
   const { runObserveLoop } = await import("./observe-loop.js");
   const { workingKeyboard, finalKeyboard } = await import("./keyboards.js");
   const hasFollow = opts.hasFollow ?? true;
+  const communicator =
+    opts.communicator ?? createAgentCommunicator({
+      paneId: opts.paneId,
+      getAgentInfo,
+      readPane,
+      agentPaths: opts.cfg.agentPaths,
+      opencodeReadOptions: {
+        includeTools: opts.cfg.opencodeIncludeTools,
+        includeThoughts: opts.cfg.opencodeIncludeThoughts,
+      },
+    });
   await runObserveLoop({
     paneId: opts.paneId,
     threadId: opts.threadId,
@@ -258,6 +221,11 @@ export async function runAgentFollowLoop(opts: {
       workingKeyboard: () => workingKeyboard(opts.threadId, hasFollow),
       finalKeyboard: () => finalKeyboard(opts.threadId, hasFollow),
     },
-    deps: opts.deps as Record<string, unknown> | undefined,
+    communicator,
+    deps: {
+      sendMessage: (c, t, text, opts2) => opts.deps?.sendMessage?.(c, t, text, opts2) ?? opts.tg.sendMessage(c, t, text, opts2),
+      sleep: opts.deps?.sleep ?? sleep,
+      now: opts.deps?.now ?? (() => Date.now()),
+    },
   });
 }
