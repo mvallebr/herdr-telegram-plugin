@@ -2,7 +2,7 @@ import { TelegramClient } from "./telegram-client.js";
 import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
-import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
+import { runAgentTurn, runAgentFollowLoop, cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
 import { getAgents, readPane, sendText, getAgentInfo, sendEscape } from "./herdr-client.js";
 import { AgentCommunicator } from "./agent-sessions.js";
 import { loadConfig } from "./config.js";
@@ -209,8 +209,11 @@ export async function startDaemon(
       try {
         const comm = new AgentCommunicator(mapping.pane_id, getAgentInfo, readPane, cfg.agentPaths);
         const output = comm.getAgentOutput(5);
-        if (output.trim()) {
-          const truncated = output.length > 2000 ? output.slice(-2000) : output;
+        // Apply same cleaning as /last — strip status bars and filter out
+        // terminal chrome that the OpenCode TUI captures into its SQLite log.
+        const cleaned = cleanPaneOutput(stripStatusBar(output));
+        if (cleaned.trim()) {
+          const truncated = cleaned.length > 2000 ? cleaned.slice(-2000) : cleaned;
           await tg.sendMessage(chatId, threadId, `📋 *${mapping.label}*\n\n\`\`\`\n${truncated}\n\`\`\``);
         }
       } catch {
