@@ -1,12 +1,10 @@
-import { Bot, type Context, InlineKeyboard } from "grammy";
+import { Bot, type Context } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
 import { getAgents, sendText, sendEscape } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
-import type { DaemonState } from "./types.js";
 import { loadState, saveState } from "./state.js";
 import { stripStatusBar, cleanPaneOutput } from "./output-format.js";
-import type { FollowManager } from "./follow-manager.js";
 import type { PaneAgent } from "./pane-agent.js";
 import type { AgentCommunicator } from "./agent-sessions.js";
 
@@ -27,30 +25,12 @@ export function formatStatus(opts: {
   uptime: string;
   paired: boolean;
   panesCount: number;
-  follows?: Array<{
-    threadId: number;
-    mapping: ThreadMapping;
-    expiresAt: number;
-    timeoutMs: number;
-    now: number;
-  }>;
 }): string {
   const lines = [
     `Bridge uptime: ${opts.uptime}`,
     `Paired: ${opts.paired ? "yes" : "no"}`,
     `Active panes: ${opts.panesCount}`,
   ];
-  if (opts.follows && opts.follows.length > 0) {
-    lines.push("");
-    lines.push("Active follows:");
-    for (const f of opts.follows) {
-      const label =
-        f.timeoutMs === 0
-          ? "manual (no timeout)"
-          : `${Math.max(0, Math.ceil((f.expiresAt - f.now) / 60_000))} min left`;
-      lines.push(`  thread ${f.threadId} (${f.mapping.label}) — ${label}`);
-    }
-  }
   return lines.join("\n");
 }
 
@@ -64,12 +44,6 @@ export interface CommandDeps {
   knownTopics?: Record<number, { name: string; created_at: string }>;
   /** Stops the tab watcher (called on /unpair). */
   stopWatcher?: () => void;
-  /** Optional dispatcher, retained for status/reaction compatibility. */
-  turns?: { isBusy(paneId: string): boolean; abort(paneId: string): boolean };
-  /** Legacy follow hooks are retained for compatibility with callers. */
-  follows?: FollowManager;
-  onFollowStart?: (threadId: number) => void;
-  onFollowStop?: (threadId: number) => void;
   /** Default minutes when /follow is invoked without an explicit argument. */
   follows_default_minutes?: number;
   /** Resolve the PaneAgent that owns a given pane. The daemon wires this. */
@@ -135,7 +109,7 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
         "/topics — list bound topic ids (use /delete <id> to remove)",
         "/delete <id> — delete a forum topic by its thread id",
         "/unpair — reset pairing (re-authorize with /pair)",
-        "/status — bridge uptime and connection info (incl. active follows)",
+        "/status — bridge uptime and connection info",
         "/interrupt — send Ctrl+C to this thread's agent (hard interrupt)",
         "/stop — send ESC to this thread's agent (soft cancel of current operation)",
         "/trust — send 'trust, always allow' to this thread's agent",
@@ -160,21 +134,10 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     const h = Math.floor(uptime / 3600);
     const m = Math.floor((uptime % 3600) / 60);
     const s = uptime % 60;
-    const now = Date.now();
-    const followsSnapshot = deps.follows
-      ? deps.follows.listAll().map((f) => ({
-          threadId: f.threadId,
-          mapping: f.mapping,
-          expiresAt: f.expiresAt,
-          timeoutMs: f.timeoutMs,
-          now,
-        }))
-      : undefined;
     await ctx.reply(formatStatus({
       uptime: `${h}h ${m}m ${s}s`,
       paired: isPaired(state),
       panesCount: deps.map.size,
-      follows: followsSnapshot,
     }));
   });
 
@@ -197,10 +160,11 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     // sequence and silently swallowed; send-keys routes the named key
     // through the terminal input pipeline and triggers the real handler.
     //
-    // Also aborts the in-flight turn so queued user messages can proceed.
-    // Without this, a stuck turn (e.g. agent outputting in a way that
-    // never stabilises for the coordinator's stability window) blocks
-    // every subsequent message for up to max_total_wait_s.
+    // PaneAgent.stop() aborts the in-flight loop so the next user
+    // message starts a fresh controller. Without this, a stuck turn
+    // (e.g. agent outputting in a way that never stabilises for the
+    // loop's stability window) would keep the loop alive until the
+    // next idle detection.
     const threadId = ctx.message?.message_thread_id;
     if (!threadId) return;
     const mapping = findMapping(threadId, deps.map);
@@ -208,13 +172,8 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
     const agent = deps.getPaneAgent?.(mapping.pane_id);
     if (!agent) { await ctx.reply("Pane agent unavailable."); return; }
     sendEscape(mapping.pane_id);
-    const wasBusy = deps.turns?.abort(mapping.pane_id) ?? false;
     agent.stop();
-    await ctx.reply(
-      wasBusy
-        ? `Stopped ${mapping.label} and released the in-progress turn. The queue will now process your pending messages.`
-        : `Stopped ${mapping.label}.`
-    );
+    await ctx.reply(`Stopped ${mapping.label}.`);
   });
 
   bot.command("trust", async (ctx) => {
@@ -242,7 +201,7 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
        const body = getLastReadback({
          mapping,
          communicator: agent ? ({ getAgentOutput: (n: number) => agent.getLastOutput(), getLatestOutput: () => agent.getLastOutput() } as AgentCommunicator) : (() => { throw new Error("Pane agent unavailable"); })(),
-         busy: deps.turns?.isBusy(mapping.pane_id) ?? false,
+         busy: agent?.isLoopActive() ?? false,
          now: () => new Date().toISOString(),
          truncateAt: 3000,
        });

@@ -1,5 +1,5 @@
 import { TelegramClient } from "./telegram-client.js";
-import { registerCommands, type CommandDeps } from "./commands.js";
+import { registerCommands, getLastReadback, formatStatus, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
 import { PaneAgent } from "./pane-agent.js";
@@ -11,9 +11,7 @@ import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
-import { TurnDispatcher } from "./turn-dispatcher.js";
 import { parseActionCallback } from "./keyboards.js";
-import { getLastReadback, formatStatus } from "./commands.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -111,7 +109,6 @@ export async function startDaemon(
     thread_mappings: rawMappings,
   });
 
-  const turns = new TurnDispatcher();
   const paneAgents = new Map<string, PaneAgent>();
   const getPaneAgent = (paneId: string): PaneAgent | undefined => {
     let agent = paneAgents.get(paneId);
@@ -140,7 +137,6 @@ export async function startDaemon(
     chatId: state.authorized_chat_id ?? 0,
     startTime: Date.now(),
     knownTopics: state.known_topics,
-    turns,
     getPaneAgent,
     follows_default_minutes: cfg.followTimeoutMinutes,
     saveMappings: () => {
@@ -465,19 +461,12 @@ export async function startDaemon(
       return;
     }
 
-    if (turns.isBusy(mapping.pane_id)) {
-      // Legacy hint retained for callers that still want the reaction on
-      // busy turns. PaneAgent now owns the actual turn loop.
-      try {
-        await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
-      } catch {
-        // reactions may be unavailable in some chats; ignore.
-      }
-    }
-
     const paneAgent = getPaneAgent(mapping.pane_id);
     if (!paneAgent) return;
     if (paneAgent.isLoopActive()) {
+      // PaneAgent owns the loop; surface the 👀 hint whenever the loop is
+      // already running so the user knows the message will be appended
+      // to the in-flight turn rather than starting a new one.
       try { await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]); } catch { /* unavailable */ }
     }
     paneAgent.handleMessage(text);

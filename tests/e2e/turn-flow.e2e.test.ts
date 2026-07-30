@@ -49,9 +49,9 @@ const capture = {
 };
 
 function patchTelegramClientPrototype(): void {
-  // The daemon's runObserveLoop calls deps.sendMessage which is built
-  // from TelegramClient.prototype.sendMessage when no override is
-  // provided. Patching the prototype covers that path. JavaScript
+  // The daemon's emitPaneEvent handler calls tg.sendMessage directly
+  // (PaneAgent emits OutputEvents; the daemon turns them into Telegram
+  // messages). Patching the prototype covers that path. JavaScript
   // regular functions called as methods receive `this` via the
   // binding, NOT as a positional argument — so the parameter list
   // starts with chatId (the first real arg of tg.sendMessage).
@@ -202,7 +202,7 @@ async function setupRig(): Promise<TestRig> {
   process.env.MOCK_HERDR_STATE = herdr.statePath;
   resetHerdrBinCache();
 
-  // Patch the prototype for runObserveLoop's deps.sendMessage path, and
+  // Patch the prototype for the daemon's tg.sendMessage path, and
   // pass a custom fetch to startDaemon so grammy never hits the network.
   patchTelegramClientPrototype();
   const customFetch = makeTelegramFetch();

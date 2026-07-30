@@ -1,6 +1,6 @@
 /**
- * Output diff primitives shared between the observe loop and the
- * per-pane `AgentCommunicator`.
+ * Output diff primitives shared between `ObserveLoopController` and
+ * the per-pane `AgentCommunicator`.
  *
  * History: these helpers used to live inside `observe-loop.ts`. As of
  * Task 2 of the PaneAgent refactor, the diff state moves into
@@ -8,7 +8,7 @@
  * avoid consuming it). To avoid a circular dep between the loop and
  * the communicator, the pure helpers are extracted here.
  *
- * Behavioural contract (preserved from `observe-loop.ts`):
+ * Behavioural contract:
  *
  *   - `tailOf(s, n)` returns the trailing `n` characters of `s`, or
  *     the whole string when `s` is shorter than `n`.

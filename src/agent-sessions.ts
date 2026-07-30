@@ -571,7 +571,7 @@ export interface AgentCommunicatorDeps {
   sqliteDriver?: SqliteDriver;
   /**
    * Per-agent reader options (e.g. include_tools / include_thoughts for
-   * OpenCode). Wired in from cfg at the daemon/wait-loop entry points.
+   * OpenCode). Wired in from cfg at the daemon entry point.
    */
   opencodeReadOptions?: OpenCodeReadOptions;
 }
@@ -719,10 +719,9 @@ export class AgentCommunicator {
     const unseen = deriveUnseen(snapshot, this.sentTail);
     if (unseen.length > 0) {
       // Re-anchor on the LITERAL current snapshot (not on the unseen
-      // suffix) — same rationale as observe-loop's chunk emit path:
-      // trailing-newline stripping on scrape snapshots can offset by
-      // a single `\n`, and substring anchoring against the snapshot
-      // itself always matches on the next poll.
+      // suffix) — trailing-newline stripping on scrape snapshots can
+      // offset by a single `\n`, and substring anchoring against the
+      // snapshot itself always matches on the next poll.
       this.sentTail = tailOf(snapshot, SENT_TAIL_MAX);
     }
     return unseen;
