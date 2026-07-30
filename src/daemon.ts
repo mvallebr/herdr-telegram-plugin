@@ -318,22 +318,31 @@ export async function startDaemon(
       log.info("reconcile via message handler", { chatId: ctx.chat.id });
       if (!isPaired(state) || !state.authorized_chat_id) { await ctx.reply("Not paired."); return; }
       const chatId = state.authorized_chat_id;
-      await ctx.reply("Reconciling...");
-      state.known_topics = state.known_topics ?? {};
-      const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
-      for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
-      const raw: DaemonState["thread_mappings"] = {};
-      for (const [tid, m] of newMap.entries()) raw[tid] = m;
-      // Seed known_tabs to prevent watcher from creating duplicates
-      state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
-      saveState(statePath, { ...state, thread_mappings: raw });
-      seedTopics(newMap, chatId).catch(() => {});
-      const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
-      const parts = [`Reconciled: ${newMap.size} panes mapped.`];
-      if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} dups: ${result.deleted.join(", ")}`);
-      if (result?.created.length) parts.push(`Created: ${result.created.join(", ")}`);
-      if (result?.failed.length) parts.push(`Failed: ${result.failed.join(", ")}`);
-      await ctx.reply(parts.join("\n"));
+      try {
+        await ctx.reply("Reconciling...");
+        state.known_topics = state.known_topics ?? {};
+        const newMap = await reconcile(chatId, tg, deps.map, state.known_topics);
+        for (const [tid, m] of newMap.entries()) deps.map.set(tid, m);
+        const raw: DaemonState["thread_mappings"] = {};
+        for (const [tid, m] of newMap.entries()) raw[tid] = m;
+        // Seed known_tabs to prevent watcher from creating duplicates
+        state.known_tabs = seedKnownTabs(newMap, getAgents(), state.known_tabs ?? {});
+        saveState(statePath, { ...state, thread_mappings: raw });
+        seedTopics(newMap, chatId).catch(() => {});
+        const result = (reconcile as any).lastResult as { created: string[]; deleted: string[]; failed: string[]; total: number } | undefined;
+        const parts = [`Reconciled: ${newMap.size} panes mapped.`];
+        if (result?.deleted.length) parts.push(`Deleted ${result.deleted.length} dups: ${result.deleted.join(", ")}`);
+        if (result?.created.length) parts.push(`Created: ${result.created.join(", ")}`);
+        if (result?.failed.length) parts.push(`Failed: ${result.failed.join(", ")}`);
+        await ctx.reply(parts.join("\n"));
+      } catch (err: any) {
+        log.error("reconcile failed", { chatId, message: err?.message ?? String(err) });
+        try {
+          await ctx.reply(`⚠️ Reconcile failed: ${err?.message ?? String(err)}`);
+        } catch {
+          // If Telegram delivery itself failed, the log entry is the only record.
+        }
+      }
       return;
     }
     // /cleanup — list all tracked topics
