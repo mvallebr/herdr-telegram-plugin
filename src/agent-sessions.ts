@@ -790,7 +790,7 @@ export function readOpenCodeCumulative(
   }
 }
 
-class OpenCodeDbReader implements AgentOutputReader {
+export class OpenCodeDbReader implements AgentOutputReader {
   readonly kind = "opencode-db";
   constructor(
     private readonly dbPath: string,

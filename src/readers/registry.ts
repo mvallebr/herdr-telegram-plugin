@@ -1,6 +1,12 @@
 import type { AgentOutputReader, AgentReaderRequest } from "./types.js";
 import { stripStatusBar } from "../output-format.js";
-import { findCodexSessionPath } from "../agent-sessions.js";
+import {
+  OpenCodeDbReader,
+  defaultSqliteDriver,
+  findCodexSessionPath,
+  getAgentDataPath,
+  validateOpenCodeDb,
+} from "../agent-sessions.js";
 import { CodexJsonlReader, PiJsonlReader, validatePathSession } from "./jsonl.js";
 
 class ScrapeReader implements AgentOutputReader {
@@ -56,6 +62,27 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
     } else {
       return new CodexJsonlReader(path, req.logger, req.paneId);
     }
+  }
+
+  if (req.session?.kind === "id" && req.agentName === "opencode") {
+    const dbPath = getAgentDataPath("opencode", "db", req.agentPaths);
+    const driver = req.sqliteDriver ?? defaultSqliteDriver;
+    const reason = validateOpenCodeDb(dbPath, req.session.id, driver);
+    if (!reason) {
+      return new OpenCodeDbReader(
+        dbPath!,
+        req.session.id,
+        driver,
+        req.logger,
+        req.paneId,
+        req.opencodeReadOptions,
+      );
+    }
+    req.logger.warn("structured source unavailable; falling back to scrape", {
+      paneId: req.paneId,
+      agent: req.agentName,
+      reason,
+    });
   }
 
   return new ScrapeReader(req.paneId, req.readPane);
