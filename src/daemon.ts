@@ -124,6 +124,7 @@ export async function startDaemon(
     turns,
     follows,
     follows_default_minutes: cfg.followTimeoutMinutes,
+    agentPaths: cfg.agentPaths,
     onFollowStart: (threadId: number) => {
       // Idempotent: stop any existing loop first.
       followLoops.get(threadId)?.cancel();
