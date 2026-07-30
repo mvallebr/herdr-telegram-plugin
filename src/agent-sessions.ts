@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createLogger, type Logger } from "./logger.js";
-import { stripStatusBar } from "./output-format.js";
+import { createAgentOutputReader } from "./readers/registry.js";
 
 // Use createRequire so we can `require("node:sqlite")` from this ESM
 // module without bundler or async-loading ceremony. node:sqlite is built
@@ -141,119 +141,6 @@ function matchesPrompt(text: string, prompt?: string): boolean {
  *   {"type":"message", "timestamp":"<iso>", "message":{"role":"assistant"|"user",
  *     "content":[{"type":"text"|"thinking", "text":...}]}}
  */
-export function readPiSessionResponse(
-  jsonlPath: string,
-  sinceMs: number,
-  prompt?: string
-): AgentResponse | null {
-  if (!existsSync(jsonlPath)) return null;
-  let raw: string;
-  try {
-    raw = readFileSync(jsonlPath, "utf8");
-  } catch {
-    return null;
-  }
-  const lines = raw.split("\n");
-  let last: AgentResponse | null = null;
-  let matchedPrompt = !prompt;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    let ev: any;
-    try {
-      ev = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (ev?.type !== "message") continue;
-    const msg = ev.message;
-    if (!msg) continue;
-    const ts = ev.timestamp;
-    const tsMs = typeof ts === "string" ? Date.parse(ts) : 0;
-    if (sinceMs > 0 && tsMs > 0 && tsMs < sinceMs) continue;
-    if (msg.role === "user") {
-      matchedPrompt = matchesPrompt(extractTextFromContent(msg.content), prompt);
-      continue;
-    }
-    if (msg.role !== "assistant" || !matchedPrompt) continue;
-    const text = extractTextFromContent(msg.content);
-    if (!text) continue;
-    last = { text, timestamp: ts, source: "pi-jsonl" };
-    if (prompt) return last;
-  }
-  return last;
-}
-
-/**
- * Read Codex's final `response_item.payload.message` from its rollout jsonl.
- *
- * Codex writes user-visible commentary as assistant messages too.  Those are
- * intermediate progress notes, not the completed answer for a turn, so they
- * must never be forwarded by the Telegram bridge.
- */
-export function readCodexSessionResponse(jsonlPath: string, sinceMs: number, prompt?: string): AgentResponse | null {
-  if (!existsSync(jsonlPath)) return null;
-  let raw: string;
-  try {
-    raw = readFileSync(jsonlPath, "utf8");
-  } catch {
-    return null;
-  }
-  let last: AgentResponse | null = null;
-  let matchedPrompt = !prompt;
-  for (const line of raw.split("\n")) {
-    try {
-      const ev = JSON.parse(line);
-      if (ev?.type !== "response_item" || ev?.payload?.type !== "message") continue;
-      const ts = ev.timestamp;
-      const tsMs = typeof ts === "string" ? Date.parse(ts) : 0;
-      if (sinceMs > 0 && tsMs > 0 && tsMs < sinceMs) continue;
-      if (ev.payload.role === "user") {
-        matchedPrompt = matchesPrompt(extractTextFromContent(ev.payload.content), prompt);
-        continue;
-      }
-      if (ev.payload.role !== "assistant" || ev.payload.phase !== "final_answer" || !matchedPrompt) continue;
-      const text = extractTextFromContent(ev.payload.content);
-      if (text) last = { text, timestamp: ts, source: "codex-jsonl" };
-      if (last && prompt) return last;
-    } catch {
-      // A session can be mid-write; ignore malformed/incomplete records.
-    }
-  }
-  return last;
-}
-
-/**
- * Read Codex commentary for the current prompt. Commentary is deliberately
- * separate from `readCodexSessionResponse`: it is safe only as a labelled
- * progress preview, never as a terminal answer.
- */
-export function readCodexSessionProgress(jsonlPath: string, sinceMs: number, prompt?: string): AgentResponse | null {
-  if (!existsSync(jsonlPath)) return null;
-  let raw: string;
-  try { raw = readFileSync(jsonlPath, "utf8"); } catch { return null; }
-  let last: AgentResponse | null = null;
-  let matchedPrompt = !prompt;
-  for (const line of raw.split("\n")) {
-    try {
-      const ev = JSON.parse(line);
-      if (ev?.type !== "response_item" || ev?.payload?.type !== "message") continue;
-      const tsMs = typeof ev.timestamp === "string" ? Date.parse(ev.timestamp) : 0;
-      if (sinceMs > 0 && tsMs > 0 && tsMs < sinceMs) continue;
-      if (ev.payload.role === "user") {
-        matchedPrompt = matchesPrompt(extractTextFromContent(ev.payload.content), prompt);
-        continue;
-      }
-      if (ev.payload.role !== "assistant" || !matchedPrompt || ev.payload.phase === "final_answer") continue;
-      const text = extractTextFromContent(ev.payload.content);
-      if (text) last = { text, timestamp: ev.timestamp, source: "codex-jsonl" };
-    } catch {
-      // A session can be mid-write; retry next poll.
-    }
-  }
-  return last;
-}
-
 const codexSessionCache = new Map<string, string>();
 
 /** Resolve Herdr's Codex session id to its local rollout file. */
@@ -282,130 +169,13 @@ export function findCodexSessionPath(sessionId: string): string | null {
   return found;
 }
 
-/**
- * Generic fallback that tries `readPiSessionResponse` — works for pi, omp
- * (both use the same session format per `herdr integration status` docs).
- * Other agents with future structured logs can plug in here.
- */
-export function readAgentSessionResponse(
-  ref: AgentSessionRef,
-  agentName: string,
-  sinceMs: number,
-  prompt?: string
-): AgentResponse | null {
-  if (!ref) return null;
-  if (ref.kind === "path") {
-    // Future: dispatch on agentName for different formats.
-    switch (agentName) {
-      case "pi":
-      case "omp":
-        return readPiSessionResponse(ref.path, sinceMs, prompt);
-      case "codex":
-        return readCodexSessionResponse(ref.path, sinceMs, prompt);
-      default:
-        // Try pi format anyway — most agents that emit session files use
-        // a similar shape (role, content).  Caller may still fall back to
-        // screen scraping if the result is empty/garbage.
-        return readPiSessionResponse(ref.path, sinceMs, prompt) ?? readCodexSessionResponse(ref.path, sinceMs, prompt);
-    }
-  }
-  if (ref.kind === "id" && agentName === "codex") {
-    const path = findCodexSessionPath(ref.id);
-    return path ? readCodexSessionResponse(path, sinceMs, prompt) : null;
-  }
-  return null;
-}
-
-/** Read an optional, non-final progress preview from a structured session. */
-export function readAgentSessionProgress(
-  ref: AgentSessionRef,
-  agentName: string,
-  sinceMs: number,
-  prompt?: string
-): AgentResponse | null {
-  if (agentName !== "codex" || !ref) return null;
-  if (ref.kind === "path") return readCodexSessionProgress(ref.path, sinceMs, prompt);
-  const path = findCodexSessionPath(ref.id);
-  return path ? readCodexSessionProgress(path, sinceMs, prompt) : null;
-}
-
-/**
- * Decide whether to use the jsonl-based reader or fall back to screen scrape.
- *
- * Returns:
- *  - { strategy: "jsonl", reader } if a usable session ref exists
- *  - { strategy: "scrape", reason } otherwise
- */
-export function pickOutputStrategy(
-  ref: AgentSessionRef,
-  agentName: string,
-  agentPaths?: Record<string, Record<string, string>>,
-): { strategy: "jsonl"; reader: (sinceMs: number, prompt?: string) => AgentResponse | null } | {
-  strategy: "scrape";
-  reason: string;
-} {
-  if (!ref) {
-    return { strategy: "scrape", reason: "no agent_session reported by herdr" };
-  }
-  if (ref.kind !== "path") {
-    if (ref.kind === "id" && agentName === "codex") {
-      const path = findCodexSessionPath(ref.id);
-      if (path) {
-        return { strategy: "jsonl", reader: (sinceMs, prompt) => readCodexSessionResponse(path, sinceMs, prompt) };
-      }
-    }
-    if (ref.kind === "id" && agentName === "opencode") {
-      const dbPath = getAgentDataPath("opencode", "db", agentPaths);
-      const driver: SqliteDriver = defaultSqliteDriver;
-      const reason = validateOpenCodeDb(dbPath, ref.id, driver);
-      if (!reason) {
-        return {
-          strategy: "jsonl",
-          reader: (_sinceMs: number, _prompt?: string): AgentResponse | null => {
-            const text = readOpenCodeCumulative(dbPath!, ref.id, driver);
-            return text
-              ? { text, timestamp: new Date().toISOString(), source: "opencode-db" }
-              : null;
-          },
-        };
-      }
-      return { strategy: "scrape", reason: `opencode db not available: ${reason}` };
-    }
-    return { strategy: "scrape", reason: "agent_session is an id, not a path" };
-  }
-  if (!existsSync(ref.path)) {
-    return {
-      strategy: "scrape",
-      reason: `session path does not exist: ${ref.path}`,
-    };
-  }
-  // Optional sanity check: file must be readable and non-empty
-  try {
-    const stat = statSync(ref.path);
-    if (!stat.isFile() || stat.size === 0) {
-      return {
-        strategy: "scrape",
-        reason: `session path is empty or not a file: ${ref.path}`,
-      };
-    }
-  } catch {
-    return { strategy: "scrape", reason: `cannot stat session path: ${ref.path}` };
-  }
-  return {
-    strategy: "jsonl",
-    reader: (sinceMs: number, prompt?: string) => readAgentSessionResponse(ref, agentName, sinceMs, prompt),
-  };
-}
-
 // --- AgentOutputReader interface --------------------------------------------
 
 /**
  * Single, source-agnostic reader selected ONCE at AgentCommunicator
- * construction. Implementations:
- *  - `ScrapeReader(paneId, readPane)` — terminal screen scrape via herdr.
- *  - `JsonlReader(ref, agentName)` — pi / omp / codex session file.
- *  - `OpenCodeDbReader(sessionId, dbPath, runner)` — SQLite via the
- *    `sqlite3` CLI, parsed via -json mode output.
+ * construction. Implementations live in `./readers/` and are selected
+ * by `./readers/registry.ts` — see `createAgentOutputReader`. The class
+ * itself is still exposed here because `AgentCommunicator` depends on it.
  *
  * Once selected, runtime read errors return "" (NOT a fallback).
  */
@@ -420,49 +190,8 @@ export interface AgentOutputReader {
   read(_maxLines: number): string;
 }
 
-/** Screen-scrape reader — wraps the injected readPane callback. */
-class ScrapeReader implements AgentOutputReader {
-  readonly kind = "scrape";
-  constructor(
-    private readonly paneId: string,
-    private readonly readPane: (paneId: string, lines: number) => string,
-  ) {}
-  read(maxLines: number): string {
-    try {
-      // stripStatusBar lives here at the scrape boundary rather than in
-      // observe-loop's readSnapshot to avoid corrupting structured reader
-      // output that happens to match terminal-status patterns (e.g.
-      // "Model: …").
-      return stripStatusBar(this.readPane(this.paneId, maxLines));
-    } catch {
-      return "";
-    }
-  }
-}
-
-/** Jsonl reader for pi / omp / codex sessions. */
-class JsonlReader implements AgentOutputReader {
-  readonly kind = "jsonl";
-  constructor(
-    private readonly ref: Extract<AgentSessionRef, { kind: "path" }>,
-    private readonly agentName: string,
-    private readonly logger: Logger,
-    private readonly paneId: string,
-  ) {}
-  read(_maxLines: number): string {
-    try {
-      const response = readAgentSessionResponse(this.ref, this.agentName, 0);
-      return response?.text ?? "";
-    } catch (err) {
-      this.logger.warn("jsonl structured read failed", {
-        paneId: this.paneId,
-        agent: this.agentName,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      return "";
-    }
-  }
-}
+/** Screen-scrape reader moved to `./readers/registry.ts` so all reader
+ *  selection lives in one place. See `createAgentOutputReader`. */
 
 // --- OpenCode SQLite reader ------------------------------------------------
 
@@ -790,7 +519,7 @@ export function readOpenCodeCumulative(
   }
 }
 
-class OpenCodeDbReader implements AgentOutputReader {
+export class OpenCodeDbReader implements AgentOutputReader {
   readonly kind = "opencode-db";
   constructor(
     private readonly dbPath: string,
@@ -844,10 +573,17 @@ export interface AgentCommunicatorDeps {
 const fallbackLog: Logger = createLogger("agent-sessions");
 
 /**
- * Selection-once factory. Caller-facing behaviour:
- *   - If validation of the structured source fails, log a single warning
- *     (pane, agent, reason) and fall back to a scrape reader.
- *   - If validation succeeds, pick the structured reader permanently.
+ * Selection-once factory. Delegates reader selection to
+ * `./readers/registry.ts` — all agent-specific logic (pi/omp/codex/opencode
+ * validation, scrape fallback, warn reasons) lives there. This function
+ * only knows about the communicator class and the request shape.
+ *
+ * Caller-facing behaviour (unchanged):
+ *   - If validation of the structured source fails, the registry logs a
+ *     single warning (pane, agent, reason) and falls back to a scrape reader.
+ *   - If validation succeeds, the registry picks the structured reader
+ *     permanently.
+ *   - Runtime empty reads do NOT trigger a fallback.
  *
  * Production code MUST go through this factory instead of `new AgentCommunicator`.
  * The class itself remains exported for tests + seam-based construction.
@@ -857,84 +593,17 @@ export function createAgentCommunicator(depsIn: AgentCommunicatorDeps): AgentCom
   const log: Logger = deps.logger ?? fallbackLog;
 
   const info = safeGetAgentInfo(deps);
-  const session = info?.agent_session;
-  const agent = info?.agent ?? "?";
-
-  // Helper to build a scrape communicator with a one-shot warn logged.
-  const scrapeWithWarn = (reason: string): AgentCommunicator => {
-    log.warn("structured source unavailable; falling back to scrape", {
-      paneId: deps.paneId,
-      agent,
-      reason,
-    });
-    return new AgentCommunicator(
-      new ScrapeReader(deps.paneId, deps.readPane),
-      log,
-    );
-  };
-
-  // No structured session at all → scrape (no warn — that's the default path)
-  if (!session) {
-    return new AgentCommunicator(
-      new ScrapeReader(deps.paneId, deps.readPane),
-      log,
-    );
-  }
-
-  // Path-based sessions: validate the file exists and is a regular file.
-  // Empty files are accepted — the reader will simply return "" until the
-  // agent writes content. The contract is: selection is permanent once made;
-  // runtime empty is not a fallback trigger.
-  if (session.kind === "path") {
-    if (!existsSync(session.path)) {
-      return scrapeWithWarn(`session path does not exist: ${session.path}`);
-    }
-    try {
-      const st = statSync(session.path);
-      if (!st.isFile()) {
-        return scrapeWithWarn(`session path is not a regular file: ${session.path}`);
-      }
-    } catch (err) {
-      return scrapeWithWarn(`cannot stat session path: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    return new AgentCommunicator(
-      new JsonlReader(session, agent, log, deps.paneId),
-      log,
-    );
-  }
-
-  // Id-based sessions: dispatch by agent name.
-  if (session.kind === "id") {
-    if (agent === "opencode") {
-      const dbPath = getAgentDataPath("opencode", "db", deps.agentPaths);
-      const driver: SqliteDriver = deps.sqliteDriver ?? defaultSqliteDriver;
-      const reason = validateOpenCodeDb(dbPath, session.id, driver);
-      if (reason) return scrapeWithWarn(reason);
-      // Validation passed — pick the structured reader permanently.
-      return new AgentCommunicator(
-        new OpenCodeDbReader(
-          dbPath!, session.id, driver, log, deps.paneId,
-          deps.opencodeReadOptions,
-        ),
-        log,
-      );
-    }
-    if (agent === "codex") {
-      const path = findCodexSessionPath(session.id);
-      if (!path) return scrapeWithWarn(`codex session not on disk: ${session.id}`);
-      return new AgentCommunicator(
-        new JsonlReader({ kind: "path", path }, agent, log, deps.paneId),
-        log,
-      );
-    }
-    return scrapeWithWarn(`agent_session is an id, not a path (agent=${agent})`);
-  }
-
-  // Defensive — exhaustive union
-  return new AgentCommunicator(
-    new ScrapeReader(deps.paneId, deps.readPane),
-    log,
-  );
+  const reader = createAgentOutputReader({
+    paneId: deps.paneId,
+    agentName: info?.agent ?? "?",
+    session: info?.agent_session,
+    readPane: deps.readPane,
+    agentPaths: deps.agentPaths,
+    opencodeReadOptions: deps.opencodeReadOptions,
+    sqliteDriver: deps.sqliteDriver,
+    logger: log,
+  });
+  return new AgentCommunicator(reader, log);
 }
 
 function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_session?: AgentSessionRef } | null {
