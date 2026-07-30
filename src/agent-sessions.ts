@@ -364,14 +364,22 @@ export function readOpenCodeSessionResponse(
     if (!dbPath || !existsSync(dbPath)) return null;
 
     // Use sqlite3 CLI to query the database synchronously
+    // Strategy: get the last 20 messages, then expand their parts. Sessions
+    // can have thousands of parts (tool calls, reasoning, etc.) — looking at
+    // the most recent N messages keeps the query bounded while ensuring we
+    // see the latest assistant response.
     const { execSync } = require("node:child_process");
     const query = `
       SELECT m.id, m.time_created, p.data
       FROM message m
       JOIN part p ON p.message_id = m.id
-      WHERE m.session_id = '${sessionId}'
+      WHERE m.id IN (
+        SELECT id FROM message
+        WHERE session_id = '${sessionId}'
+        ORDER BY time_created DESC
+        LIMIT 20
+      )
       ORDER BY m.time_created DESC, p.time_created ASC
-      LIMIT 50
     `;
     const output = execSync(
       `sqlite3 ${dbPath} "${query.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
