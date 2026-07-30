@@ -1,4 +1,5 @@
 import type { AgentOutputReader, AgentReaderRequest } from "./types.js";
+import { stripStatusBar } from "../output-format.js";
 
 class ScrapeReader implements AgentOutputReader {
   readonly kind = "scrape";
@@ -9,7 +10,7 @@ class ScrapeReader implements AgentOutputReader {
 
   read(maxLines: number): string {
     try {
-      return this.readPane(this.paneId, maxLines);
+      return stripStatusBar(this.readPane(this.paneId, maxLines));
     } catch {
       return "";
     }

@@ -21,3 +21,16 @@ describe("createAgentOutputReader — unknown agent", () => {
     expect(reader.read(100)).toBe("scraped");
   });
 });
+
+describe("ScrapeReader", () => {
+  it("strips terminal status bars at the scrape boundary", () => {
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1",
+      agentName: "agy",
+      session: undefined,
+      readPane: () => "real output\nModel: something",
+      logger,
+    });
+    expect(reader.read(100)).toBe("real output");
+  });
+});
