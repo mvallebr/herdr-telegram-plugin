@@ -21,6 +21,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createLogger, type Logger } from "./logger.js";
 import { createAgentOutputReader } from "./readers/registry.js";
+import { sendText } from "./herdr-client.js";
 import {
   SENT_TAIL_MAX,
   tailOf,
@@ -608,7 +609,7 @@ export function createAgentCommunicator(depsIn: AgentCommunicatorDeps): AgentCom
     sqliteDriver: deps.sqliteDriver,
     logger: log,
   });
-  return new AgentCommunicator(reader, log);
+  return new AgentCommunicator(reader, log, deps.paneId);
 }
 
 function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_session?: AgentSessionRef } | null {
@@ -630,13 +631,22 @@ function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_
 export class AgentCommunicator {
   /** Short identifier of the active reader ("scrape" | "jsonl" | "opencode-db"). */
   readonly readerKind: string;
+  /**
+   * Pane id this communicator is bound to. Required for `sendInput`.
+   * Optional in the constructor purely so existing direct-construction
+   * test sites (which don't exercise input) keep working unchanged —
+   * the factory always supplies a value.
+   */
+  readonly paneId: string;
 
   constructor(
     reader: AgentOutputReader,
     private readonly logger: Logger = fallbackLog,
+    paneId?: string,
   ) {
     this.readerKind = reader.kind;
     this.reader = reader;
+    this.paneId = paneId ?? "";
   }
 
   private readonly reader: AgentOutputReader;
@@ -730,6 +740,25 @@ export class AgentCommunicator {
    */
   getLatestOutput(): string {
     return this.getAgentOutput(4000);
+  }
+
+  /**
+   * Forward `text` to the pane as agent input (via herdr's
+   * `pane run` bridge). Equivalent to the user typing in the TUI.
+   * Synchronous — herdr returns once the input has been delivered to
+   * the pane's stdin.
+   *
+   * Throws if the communicator was built without a `paneId` (only
+   * possible via direct constructor — the factory always supplies one).
+   * `PaneAgent` calls this from `handleMessage`.
+   */
+  sendInput(text: string): void {
+    if (!this.paneId) {
+      throw new Error(
+        "AgentCommunicator.sendInput requires a paneId — use createAgentCommunicator()"
+      );
+    }
+    sendText(this.paneId, text);
   }
 }
 
