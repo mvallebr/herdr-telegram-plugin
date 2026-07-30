@@ -1,6 +1,7 @@
 import type { AgentOutputReader, AgentReaderRequest } from "./types.js";
 import { stripStatusBar } from "../output-format.js";
-import { PiJsonlReader, validatePathSession } from "./jsonl.js";
+import { findCodexSessionPath } from "../agent-sessions.js";
+import { CodexJsonlReader, PiJsonlReader, validatePathSession } from "./jsonl.js";
 
 class ScrapeReader implements AgentOutputReader {
   readonly kind = "scrape";
@@ -29,6 +30,31 @@ export function createAgentOutputReader(req: AgentReaderRequest): AgentOutputRea
       });
     } else {
       return new PiJsonlReader(req.session.path, req.logger, req.paneId, req.agentName);
+    }
+  }
+
+  if (req.session?.kind === "path" && req.agentName === "codex") {
+    const reason = validatePathSession(req.session.path);
+    if (!reason) {
+      return new CodexJsonlReader(req.session.path, req.logger, req.paneId);
+    }
+    req.logger.warn("structured source unavailable; falling back to scrape", {
+      paneId: req.paneId,
+      agent: req.agentName,
+      reason,
+    });
+  }
+
+  if (req.session?.kind === "id" && req.agentName === "codex") {
+    const path = findCodexSessionPath(req.session.id);
+    if (!path) {
+      req.logger.warn("structured source unavailable; falling back to scrape", {
+        paneId: req.paneId,
+        agent: req.agentName,
+        reason: `codex session not on disk: ${req.session.id}`,
+      });
+    } else {
+      return new CodexJsonlReader(path, req.logger, req.paneId);
     }
   }
 

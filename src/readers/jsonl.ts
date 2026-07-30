@@ -60,6 +60,49 @@ export class PiJsonlReader implements AgentOutputReader {
   }
 }
 
+export function readCodexCumulativeSnapshot(path: string): string {
+  if (!existsSync(path)) return "";
+  const raw = readFileSync(path, "utf8");
+  const chunks: string[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let ev: any;
+    try {
+      ev = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (ev?.type !== "response_item" || ev?.payload?.type !== "message") continue;
+    if (ev.payload.role !== "assistant") continue;
+    const text = extractTextFromContent(ev.payload.content);
+    if (text) chunks.push(text);
+  }
+  return chunks.join("\n\n").trim();
+}
+
+export class CodexJsonlReader implements AgentOutputReader {
+  readonly kind = "codex-jsonl";
+  constructor(
+    private readonly path: string,
+    private readonly logger: Logger,
+    private readonly paneId: string,
+  ) {}
+
+  read(_maxLines: number): string {
+    try {
+      return readCodexCumulativeSnapshot(this.path);
+    } catch (err) {
+      this.logger.warn("codex jsonl read failed", {
+        paneId: this.paneId,
+        agent: "codex",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      return "";
+    }
+  }
+}
+
 export function validatePathSession(path: string): string | null {
   if (!existsSync(path)) return `session path does not exist: ${path}`;
   try {

@@ -16,6 +16,39 @@ function makeRequest(path: string, agent = "pi") {
   };
 }
 
+describe("CodexJsonlReader cumulative output", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "codex-reader-"));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("concatenates assistant rollout messages and excludes user prompts", () => {
+    const path = join(dir, "rollout.jsonl");
+    const events = [
+      { type: "response_item", timestamp: "2026-01-01T00:00:00.000Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "user prompt" }] } },
+      { type: "response_item", timestamp: "2026-01-01T00:00:01.000Z", payload: { type: "message", role: "assistant", phase: "commentary", content: [{ type: "output_text", text: "progress note" }] } },
+      { type: "response_item", timestamp: "2026-01-01T00:00:02.000Z", payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "final answer" }] } },
+    ];
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n"), "utf8");
+
+    const reader = createAgentOutputReader({
+      paneId: "w1:p1",
+      agentName: "codex",
+      session: { kind: "path", path } as const,
+      readPane: () => "SHOULD NOT BE CALLED",
+      logger,
+    });
+
+    const out = reader.read(100);
+    expect(reader.kind).toBe("codex-jsonl");
+    expect(out).toBe("progress note\n\nfinal answer");
+    expect(out).not.toContain("user prompt");
+  });
+});
+
 describe("PiJsonlReader cumulative output", () => {
   let dir: string;
   beforeEach(() => {
