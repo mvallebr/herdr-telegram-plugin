@@ -250,9 +250,15 @@ export async function startDaemon(
         }
         // Reply before deleting topics (deleting the current topic would break ctx.reply)
         await ctx.reply(`Unpairing...`);
-        // Delete all bot-created topics before resetting state
-        const kt = state.known_topics ?? {};
-        const tids = Object.keys(kt).map(Number);
+        // Delete every bot-owned topic before resetting state. We must use
+        // the union of known_topics + thread_mappings keys: known_topics is
+        // a denormalised cache ("topics the bot has ever created in this
+        // chat") and its invariant with thread_mappings is not strictly
+        // enforced — a topic bound via /reconcile may live only in
+        // thread_mappings. Iterating known_topics alone would leave orphans.
+        const tids = new Set<number>();
+        for (const k of Object.keys(state.known_topics ?? {})) tids.add(Number(k));
+        for (const k of Object.keys(state.thread_mappings ?? {})) tids.add(Number(k));
         let deleted = 0;
         for (const tid of tids) {
           try {
