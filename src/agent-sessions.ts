@@ -13,6 +13,54 @@ import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// --- Agent data paths ------------------------------------------------------
+
+/**
+ * Default per-agent data store paths. Each key is an agent name (e.g.
+ * "opencode", "codex"); each value is a map from data kind to the default
+ * path on disk, computed from $HOME. Callers can override these via the
+ * config.toml [agents.<name>] section.
+ */
+export function defaultAgentPaths(): Record<string, Record<string, string>> {
+  const home = process.env.HOME ?? homedir();
+  return {
+    opencode: {
+      db: join(home, ".local/share/opencode/opencode.db"),
+    },
+    codex: {
+      // Codex sessions live under ~/.codex/sessions — path is resolved
+      // dynamically by findCodexSessionPath, so no static default needed.
+    },
+    pi: {
+      // Pi sessions are referenced directly via agent_session.path.
+    },
+    omp: {
+      // Omp sessions are referenced directly via agent_session.path.
+    },
+  };
+}
+
+/**
+ * Resolve the path for an agent's data store. Looks up the agent's
+ * configured override in `agentPaths`, falling back to the default path
+ * computed from $HOME.
+ *
+ * Returns null when no path is known for the agent/key pair.
+ */
+export function getAgentDataPath(
+  agentName: string,
+  key: string,
+  agentPaths?: Record<string, Record<string, string>>,
+): string | null {
+  // Check user override first
+  if (agentPaths?.[agentName]?.[key]) {
+    return agentPaths[agentName][key];
+  }
+  // Fall back to default
+  const defaults = defaultAgentPaths();
+  return defaults[agentName]?.[key] ?? null;
+}
+
 export type AgentSessionRef =
   | { kind: "path"; path: string }
   | { kind: "id"; id: string }
@@ -250,7 +298,8 @@ export function readAgentSessionProgress(
  */
 export function pickOutputStrategy(
   ref: AgentSessionRef,
-  agentName: string
+  agentName: string,
+  agentPaths?: Record<string, Record<string, string>>,
 ): { strategy: "jsonl"; reader: (sinceMs: number, prompt?: string) => AgentResponse | null } | {
   strategy: "scrape";
   reason: string;
@@ -264,6 +313,9 @@ export function pickOutputStrategy(
       if (path) {
         return { strategy: "jsonl", reader: (sinceMs, prompt) => readCodexSessionResponse(path, sinceMs, prompt) };
       }
+    }
+    if (ref.kind === "id" && agentName === "opencode") {
+      return { strategy: "jsonl", reader: (sinceMs, prompt) => readOpenCodeSessionResponse(ref.id, sinceMs, prompt, agentPaths) };
     }
     return { strategy: "scrape", reason: "agent_session is an id, not a path" };
   }
@@ -289,4 +341,138 @@ export function pickOutputStrategy(
     strategy: "jsonl",
     reader: (sinceMs: number, prompt?: string) => readAgentSessionResponse(ref, agentName, sinceMs, prompt),
   };
+}
+
+/**
+ * Read the latest response from an OpenCode session using `opencode export`.
+ *
+ * OpenCode doesn't expose a jsonl file on disk, but it does provide
+ * `opencode export <sessionID>` which returns structured session data
+ * including all messages with their parts. We extract the most recent
+ * assistant text from the exported data.
+ */
+export function readOpenCodeSessionResponse(
+  sessionId: string,
+  sinceMs: number,
+  prompt?: string,
+  agentPaths?: Record<string, Record<string, string>>,
+): AgentResponse | null {
+  try {
+    // Read directly from the OpenCode SQLite database instead of
+    // running `opencode export` (which is slow and produces multi-MB output).
+    const dbPath = getAgentDataPath("opencode", "db", agentPaths);
+    if (!dbPath || !existsSync(dbPath)) return null;
+
+    // Use sqlite3 CLI to query the database synchronously
+    const { execSync } = require("node:child_process");
+    const query = `
+      SELECT m.id, m.time_created, p.data
+      FROM message m
+      JOIN part p ON p.message_id = m.id
+      WHERE m.session_id = '${sessionId}'
+      ORDER BY m.time_created DESC, p.time_created ASC
+      LIMIT 50
+    `;
+    const output = execSync(
+      `sqlite3 ${dbPath} "${query.replace(/"/g, '\\"').replace(/\n/g, ' ')}"`,
+      { encoding: "utf8", timeout: 5000 }
+    );
+
+    // Parse the output — sqlite3 CLI returns one row per line by default
+    const lines = output.trim().split("\n").filter(Boolean);
+    if (lines.length === 0) return null;
+
+    // Find the most recent message with text content
+    let currentMessageId: string | null = null;
+    let currentTimestamp: number | null = null;
+    let textParts: string[] = [];
+
+    for (const line of lines) {
+      // sqlite3 output format: id|timestamp|data
+      const parts = line.split("|");
+      if (parts.length < 3) continue;
+
+      const [msgId, timestamp, dataJson] = parts;
+      if (msgId !== currentMessageId) {
+        // New message — check if previous had text
+        if (textParts.length > 0 && currentTimestamp) {
+          const text = textParts.join("\n").trim();
+          if (text) {
+            return {
+              text,
+              timestamp: new Date(currentTimestamp).toISOString(),
+              source: "opencode",
+            };
+          }
+        }
+        currentMessageId = msgId;
+        currentTimestamp = parseInt(timestamp, 10);
+        textParts = [];
+      }
+
+      try {
+        const data = JSON.parse(dataJson);
+        if (data.type === "text" && data.text) {
+          textParts.push(data.text);
+        }
+      } catch {}
+    }
+
+    // Check the last message
+    if (textParts.length > 0 && currentTimestamp) {
+      const text = textParts.join("\n").trim();
+      if (text) {
+        return {
+          text,
+          timestamp: new Date(currentTimestamp).toISOString(),
+          source: "opencode",
+        };
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Encapsulates communication with a single agent pane.
+ *
+ * Decides at construction time whether to use the structured jsonl session
+ * log (pi, omp, codex) or fall back to screen scraping. Callers (observe-loop,
+ * seedTopics, etc.) depend on this abstraction rather than readPane directly,
+ * so the output strategy is chosen in one place.
+ */
+export class AgentCommunicator {
+  private readonly strategy: ReturnType<typeof pickOutputStrategy>;
+
+  constructor(
+    private readonly paneId: string,
+    private readonly getAgentInfo: (target: string) => { agent?: string; agent_session?: AgentSessionRef } | null,
+    private readonly readPane: (paneId: string, lines: number) => string,
+    private readonly agentPaths?: Record<string, Record<string, string>>,
+  ) {
+    const info = getAgentInfo(paneId);
+    this.strategy = pickOutputStrategy(
+      info?.agent_session,
+      info?.agent ?? "?",
+      agentPaths,
+    );
+  }
+
+  /**
+   * Read the current output from the agent.
+   *
+   * When a jsonl session log is available and returns content, that content
+   * is used directly. Otherwise, falls back to screen scraping the pane.
+   */
+  getAgentOutput(maxLines: number): string {
+    if (this.strategy.strategy === "jsonl") {
+      const response = this.strategy.reader(0);
+      if (response?.text) return response.text;
+      // jsonl returned no content — fall through to screen scrape.
+    }
+    return this.readPane(this.paneId, maxLines);
+  }
 }

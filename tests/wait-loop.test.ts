@@ -10,6 +10,7 @@ import {
   runAgentFollowLoop,
   type WaitLoopDeps,
 } from "../src/wait-loop.js";
+import { AgentCommunicator } from "../src/agent-sessions.js";
 
 function makeFakeTg() {
   return {
@@ -239,6 +240,26 @@ describe("extractScreenDelta", () => {
   });
 });
 
+const USER_INPUT = "hi";
+
+// Helper to create a mock AgentCommunicator that wraps the test's deps.
+function makeCommunicator(deps: Partial<WaitLoopDeps>): AgentCommunicator {
+  return new AgentCommunicator(
+    "w1:pX",
+    () => null,
+    deps.readPane ?? (() => ""),
+  );
+}
+
+// Helper to create deps for the observe-loop.
+function makeObserveDeps(deps: Partial<WaitLoopDeps>) {
+  return {
+    sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+    sleep: deps.sleep ?? (() => Promise.resolve()),
+    now: deps.now ?? (() => Date.now()),
+  };
+}
+
 describe("runAgentTurn (PR #10 observe-loop engine)", () => {
   function makeFakeClock(startMs = 0) {
     let now = startMs;
@@ -248,8 +269,6 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
       set: (ms: number) => { now = ms; },
     };
   }
-
-  const USER_INPUT = "hi";
 
   // PR #10 changed the engine from coordinateTurn+wrapper+reporter to
   // runObserveLoop with an idle stop condition. Output format is now:
@@ -277,7 +296,11 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     };
     const tg = makeFakeTg();
     await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
       maxOutputLines: 50,
       pollIntervalMs: 100,
       stabilityWindowMs: 100,
@@ -309,7 +332,11 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     };
     const tg = makeFakeTg();
     await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
       maxOutputLines: 50,
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
@@ -340,7 +367,11 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     };
     const tg = makeFakeTg();
     await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
       maxOutputLines: 50,
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
@@ -365,7 +396,11 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     };
     const tg = makeFakeTg();
     await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
       maxOutputLines: 50,
       pollIntervalMs: 100,
       stabilityWindowMs: 200,
@@ -393,7 +428,11 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     };
     const tg = makeFakeTg();
     await runAgentTurn("w1:pX", 1, USER_INPUT, dummyCfg, tg as any, 100, {
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
       maxOutputLines: 100,
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
@@ -423,27 +462,35 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
     let readCalls = 0;
     const sent: Array<{ chatId: number; threadId: number; text: string }> = [];
     const sleeps: number[] = [];
+    const deps: Partial<WaitLoopDeps> = {
+      readPane: () => {
+        const idx = readCalls++;
+        return paneSequence[Math.min(idx, paneSequence.length - 1)];
+      },
+      sendMessage: async (chatId: number, threadId: number, text: string) => {
+        sent.push({ chatId, threadId, text });
+        return sent.length;
+      },
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+        clock.advance(ms);
+      },
+      now: clock.now,
+      sendText: () => {},
+    };
+    const communicator = {
+      getAgentOutput: (_paneId: string, _maxLines: number) => deps.readPane?.("w1:pZ", 4000) ?? "",
+      sendMessage: deps.sendMessage,
+      sleep: deps.sleep,
+      now: deps.now,
+    } as unknown as AgentCommunicator;
     return {
       paneSequence,
       readCalls: () => readCalls,
       sent,
       sleeps,
-      deps: {
-        readPane: () => {
-          const idx = readCalls++;
-          return paneSequence[Math.min(idx, paneSequence.length - 1)];
-        },
-        sendMessage: async (chatId: number, threadId: number, text: string) => {
-          sent.push({ chatId, threadId, text });
-          return sent.length;
-        },
-        sleep: async (ms: number) => {
-          sleeps.push(ms);
-          clock.advance(ms);
-        },
-        now: clock.now,
-        sendText: () => {},
-      } as Partial<WaitLoopDeps>,
+      deps,
+      communicator,
     };
   }
 
@@ -474,7 +521,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     const deltas = fixture.sent.filter((m) => m.text.includes("agent") || m.text.includes("more stuff"));
     expect(deltas.length).toBeGreaterThanOrEqual(2);
@@ -495,7 +543,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     expect(fixture.sent.every((m) =>
       m.text.startsWith("⏳ Working") ||
@@ -518,7 +567,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     const labelled = fixture.sent.find((m) => m.text.match(/pane scrolled/));
     expect(labelled).toBeDefined();
@@ -540,7 +590,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     const delta = fixture.sent.find((m) => m.text.startsWith("…"));
     expect(delta).toBeDefined();
@@ -561,7 +612,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     const delta = fixture.sent.find((m) => m.text.includes("agent: response goes here"));
     expect(delta).toBeDefined();
@@ -583,7 +635,8 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       tg: {} as any,
       chatId: 100,
       expiresAt,
-      deps: fixture.deps as WaitLoopDeps,
+      communicator: fixture.communicator,
+      deps: fixture.deps,
     });
     const delta = fixture.sent.find((m) => m.text.includes("agent: hello"));
     expect(delta).toBeDefined();
@@ -618,6 +671,7 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       chatId: 100,
       expiresAt,
       deps: deps as WaitLoopDeps,
+      communicator: makeCommunicator(deps),
     });
     const deltas = sent.filter((m) => !m.text.startsWith("⏳ Working"));
     expect(deltas.some((m) => m.text.includes("new line"))).toBe(true);
@@ -653,7 +707,11 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       chatId: 100,
       expiresAt,
       signal: controller.signal,
-      deps,
+      deps: {
+        ...deps,
+        sendMessage: deps.sendMessage ?? (() => Promise.resolve(1)),
+      },
+      communicator: makeCommunicator(deps),
     });
     expect(fixture.sent.some((m) => m.text.includes("Follow cancelled"))).toBe(true);
   });

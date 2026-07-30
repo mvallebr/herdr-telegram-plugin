@@ -20,6 +20,11 @@ export interface Config {
    *  message before expiring. 0 = no timeout, manual /unsubscribe required.
    *  Default 30. */
   followTimeoutMinutes: number;
+  /** Per-agent paths to data stores. Each key is an agent name (e.g. "opencode",
+   *  "codex"); value is a map from data key to path. Default paths are inferred
+   *  from $HOME (e.g. ~/.local/share/opencode/opencode.db). Override per-agent
+   *  paths via [agents] section in config.toml. */
+  agentPaths: Record<string, Record<string, string>>;
 }
 
 function parseTomlLine(line: string): [string, string] | null {
@@ -46,15 +51,32 @@ export function loadConfig(configDir?: string): Config {
   let fileProgressIntervalMs = 15_000;
   let fileStabilityWindowMs = 30_000;
   let fileFollowTimeoutMinutes = 30;
+  let fileAgentPaths: Record<string, Record<string, string>> = {};
 
   if (fs.existsSync(filePath)) {
     const lines = fs.readFileSync(filePath, "utf8").split("\n");
     let inTelegram = false;
+    let inAgents = false;
+    let currentAgent: string | null = null;
     for (const raw of lines) {
       const line = raw.trim();
       if (!line || line.startsWith("#")) continue;
-      if (line === "[telegram]") { inTelegram = true; continue; }
-      if (line.startsWith("[")) { inTelegram = false; continue; }
+      if (line === "[telegram]") { inTelegram = true; inAgents = false; continue; }
+      if (line.startsWith("[agents.") && line.endsWith("]")) {
+        // e.g. [agents.opencode]
+        inTelegram = false;
+        inAgents = true;
+        currentAgent = line.slice(8, -1);
+        if (!fileAgentPaths[currentAgent]) fileAgentPaths[currentAgent] = {};
+        continue;
+      }
+      if (line === "[agents]") {
+        inTelegram = false;
+        inAgents = true;
+        currentAgent = null;
+        continue;
+      }
+      if (line.startsWith("[")) { inTelegram = false; inAgents = false; currentAgent = null; continue; }
       const kv = parseTomlLine(line);
       if (!kv) continue;
       if (inTelegram) {
@@ -67,6 +89,9 @@ export function loadConfig(configDir?: string): Config {
         else if (kv[0] === "progress_interval_ms") fileProgressIntervalMs = parseInt(kv[1], 10);
         else if (kv[0] === "stability_window_ms") fileStabilityWindowMs = parseInt(kv[1], 10);
         else if (kv[0] === "follow_timeout_minutes") fileFollowTimeoutMinutes = parseInt(kv[1], 10);
+      } else if (inAgents && currentAgent) {
+        // Per-agent data paths, e.g. db = "/path/to/db"
+        fileAgentPaths[currentAgent][kv[0]] = kv[1];
       } else if (kv[0] === "bot_token") {
         fileBotToken = kv[1];
       }
@@ -95,5 +120,6 @@ export function loadConfig(configDir?: string): Config {
     progressIntervalMs: fileProgressIntervalMs,
     stabilityWindowMs: fileStabilityWindowMs,
     followTimeoutMinutes: fileFollowTimeoutMinutes,
+    agentPaths: fileAgentPaths,
   };
 }

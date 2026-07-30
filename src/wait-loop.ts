@@ -1,10 +1,11 @@
 import type { Config } from "./config.js";
 import type { TelegramClient } from "./telegram-client.js";
-import { sendText, readPane } from "./herdr-client.js";
+import { sendText, readPane, getAgentInfo } from "./herdr-client.js";
 import { createAgentWrapper, ScreenScrapeWrapper } from "./agent-wrappers.js";
 import { coordinateTurn } from "./turn-coordinator.js";
 import type { AgentWrapper } from "./agent-wrapper.js";
 import { TelegramTurnReporter } from "./telegram-reporter.js";
+import { AgentCommunicator } from "./agent-sessions.js";
 
 export function shouldThrottle(lastSentAt: number, throttleMs: number): boolean {
   return Date.now() - lastSentAt < throttleMs;
@@ -132,6 +133,9 @@ export interface RunAgentTurnOptions {
    *  Working and Final keyboards toggle between "Unfollow" and "Follow
    *  5m / 30m" based on this. */
   hasFollow?: boolean;
+  /** Optional test override for the AgentCommunicator. If not provided,
+   *  a production communicator is created with getAgentInfo + readPane. */
+  communicator?: AgentCommunicator;
 }
 
 /**
@@ -159,6 +163,9 @@ export async function runAgentTurn(
   // Submit the prompt immediately — pass-through to the pane.
   (opts.deps?.sendText ?? sendText)(paneId, text);
 
+  // Use the injected communicator (tests) or create a production one.
+  const communicator = opts.communicator ?? new AgentCommunicator(paneId, getAgentInfo, readPane, cfg.agentPaths);
+
   // Lazily require to avoid the spawnSync cost when tests inject mocks.
   const { runObserveLoop } = await import("./observe-loop.js");
   // Inline import to avoid a circular dep at module load.
@@ -182,7 +189,12 @@ export async function runAgentTurn(
       workingKeyboard: () => workingKeyboard(threadId, opts.hasFollow ?? false),
       finalKeyboard: () => finalKeyboard(threadId, opts.hasFollow ?? false),
     },
-    deps: opts.deps as Record<string, unknown> | undefined,
+    communicator,
+    deps: {
+      sendMessage: (c, t, text, opts2) => tg.sendMessage(c, t, text, opts2),
+      sleep: opts.deps?.sleep ?? sleep,
+      now: opts.deps?.now ?? (() => Date.now()),
+    },
   });
 }
 
@@ -229,10 +241,13 @@ export async function runAgentFollowLoop(opts: {
   /** Whether the thread has an active follow subscription. The Working
    *  and Final keyboards surface "Unfollow" based on this. */
   hasFollow?: boolean;
+  /** Optional test override for the AgentCommunicator. */
+  communicator?: AgentCommunicator;
 }): Promise<void> {
   const { runObserveLoop } = await import("./observe-loop.js");
   const { workingKeyboard, finalKeyboard } = await import("./keyboards.js");
   const hasFollow = opts.hasFollow ?? true;
+  const communicator = opts.communicator ?? new AgentCommunicator(opts.paneId, getAgentInfo, readPane, opts.cfg.agentPaths);
   await runObserveLoop({
     paneId: opts.paneId,
     threadId: opts.threadId,
@@ -258,6 +273,11 @@ export async function runAgentFollowLoop(opts: {
       workingKeyboard: () => workingKeyboard(opts.threadId, hasFollow),
       finalKeyboard: () => finalKeyboard(opts.threadId, hasFollow),
     },
-    deps: opts.deps as Record<string, unknown> | undefined,
+    communicator,
+    deps: {
+      sendMessage: (c, t, text, opts2) => opts.deps?.sendMessage?.(c, t, text, opts2) ?? opts.tg.sendMessage(c, t, text, opts2),
+      sleep: opts.deps?.sleep ?? sleep,
+      now: opts.deps?.now ?? (() => Date.now()),
+    },
   });
 }

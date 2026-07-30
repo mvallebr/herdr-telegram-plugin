@@ -9,19 +9,7 @@
 import type { TelegramClient } from "./telegram-client.js";
 import type { Config } from "./config.js";
 import { stripStatusBar } from "./wait-loop.js";
-import { readPane as herdrReadPane } from "./herdr-client.js";
-
-export interface ObserveLoopDeps {
-  readPane: (paneId: string, lines: number) => string;
-  sendMessage: (
-    chatId: number,
-    threadId: number,
-    text: string,
-    opts?: { disable_notification?: boolean; reply_markup?: unknown }
-  ) => Promise<number>;
-  sleep: (ms: number) => Promise<void>;
-  now: () => number;
-}
+import type { AgentCommunicator } from "./agent-sessions.js";
 
 // --- Stop conditions -------------------------------------------------------
 
@@ -68,6 +56,17 @@ export interface ObserveOutputFormatter {
 
 // --- Public entry point ----------------------------------------------------
 
+export interface ObserveLoopDeps {
+  sendMessage: (
+    chatId: number,
+    threadId: number,
+    text: string,
+    opts?: { disable_notification?: boolean; reply_markup?: unknown }
+  ) => Promise<number>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+}
+
 export interface RunObserveLoopOptions {
   paneId: string;
   threadId: number;
@@ -78,21 +77,16 @@ export interface RunObserveLoopOptions {
   output: ObserveOutputFormatter;
   signal?: AbortSignal;
   maxOutputLines?: number;
-  deps?: Partial<ObserveLoopDeps>;
+  communicator: AgentCommunicator;
+  deps: ObserveLoopDeps;
 }
 
 export async function runObserveLoop(opts: RunObserveLoopOptions): Promise<void> {
-  const deps: ObserveLoopDeps = {
-    readPane: opts.deps?.readPane ?? defaultReadPane,
-    sendMessage: opts.deps?.sendMessage ?? defaultSendMessage(opts.tg),
-    sleep: opts.deps?.sleep ?? defaultSleep,
-    now: opts.deps?.now ?? (() => Date.now()),
-  };
-
+  const { communicator, deps } = opts;
   const maxLines = opts.maxOutputLines ?? 4_000;
   const tickMs = opts.cfg.progressIntervalMs;
 
-  let lastSnapshot = readSnapshot(opts.paneId, maxLines, deps);
+  let lastSnapshot = readSnapshot(opts.paneId, maxLines, communicator);
   // Tracks the most recent non-empty delta we emitted. When the agent
   // finishes by clearing the pane (a common pattern in pi/codex), the
   // post-clean snapshot is empty, but the actual response is what we
@@ -114,7 +108,7 @@ export async function runObserveLoop(opts: RunObserveLoopOptions): Promise<void>
       return;
     }
 
-    const current = readSnapshot(opts.paneId, maxLines, deps);
+    const current = readSnapshot(opts.paneId, maxLines, communicator);
     const elapsedSec = Math.floor((deps.now() - startedAt) / 1000);
 
     // A pane clear (e.g. agent redraw) is a real change, but the agent
@@ -214,9 +208,9 @@ async function finalize(
   });
 }
 
-function readSnapshot(paneId: string, maxLines: number, deps: ObserveLoopDeps): string {
+function readSnapshot(paneId: string, maxLines: number, communicator: AgentCommunicator): string {
   try {
-    return stripStatusBar(deps.readPane(paneId, maxLines));
+    return stripStatusBar(communicator.getAgentOutput(maxLines));
   } catch {
     return "";
   }
@@ -225,28 +219,4 @@ function readSnapshot(paneId: string, maxLines: number, deps: ObserveLoopDeps): 
 function computeFollowExpiresInMs(c: FollowStopCondition, now: number): number | undefined {
   const v = c.expiresAt();
   return v === null ? undefined : Math.max(0, v - now);
-}
-
-// --- Defaults --------------------------------------------------------------
-
-function defaultReadPane(paneId: string, lines: number): string {
-  // Static import at the top of the module. Unit tests always inject
-  // deps?.readPane so this path is never reached in tests; no spawnSync
-  // cost is paid unless production code actually runs.
-  return herdrReadPane(paneId, lines);
-}
-
-function defaultSendMessage(tg: TelegramClient) {
-  return async (
-    chatId: number,
-    threadId: number,
-    text: string,
-    opts?: { disable_notification?: boolean; reply_markup?: unknown },
-  ): Promise<number> => {
-    return tg.sendMessage(chatId, threadId, text, opts);
-  };
-}
-
-function defaultSleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

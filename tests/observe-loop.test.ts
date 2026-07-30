@@ -3,8 +3,8 @@ import {
   runObserveLoop,
   type ObserveOutputFormatter,
   type RunObserveLoopOptions,
-  type ObserveLoopDeps,
 } from "../src/observe-loop.js";
+import { AgentCommunicator } from "../src/agent-sessions.js";
 import type { TelegramClient } from "../src/telegram-client.js";
 
 // Build a controllable clock so tests don't have to await real sleep timers.
@@ -16,32 +16,38 @@ function fakeClock(start = 0) {
   };
 }
 
-// A fake ReadPane that returns whatever sequence the test set up. Each item
+// A fake getAgentOutput that returns whatever sequence the test set up. Each item
 // is one poll; empty string = "no content yet".
-function makeReadPane(sequence: string[]) {
+function makeGetAgentOutput(sequence: string[]) {
   let i = 0;
-  return () => sequence[Math.min(i++, sequence.length - 1)] ?? "";
+  return (_paneId: string, _maxLines: number) => sequence[Math.min(i++, sequence.length - 1)] ?? "";
 }
 
-// Build a deps object with a configurable pane sequence and message log.
+// Build a communicator + deps with a configurable pane sequence and message log.
 // sleep() queues promises; the test resolves them via step(). This lets
 // the loop drive itself through iterations without real-time waits.
 function makeDeps(sequence: string[], clock: ReturnType<typeof fakeClock>) {
   const sent: { text: string; opts?: { disable_notification?: boolean; reply_markup?: unknown } }[] = [];
   const pending: Array<() => void> = [];
+  const communicator = new AgentCommunicator(
+    "w1:p1",
+    () => null,  // getAgentInfo mock — no agent_session, so getAgentOutput uses readPane fallback
+    makeGetAgentOutput(sequence),
+  );
+  const deps = {
+    sendMessage: async (_c: number, _t: number, text: string, opts?: { disable_notification?: boolean; reply_markup?: unknown }) => {
+      sent.push({ text, opts });
+      return 1;
+    },
+    sleep: async (_ms: number) => {
+      return new Promise<void>((resolve) => pending.push(resolve));
+    },
+    now: clock.now,
+  };
   return {
     sent,
-    deps: {
-      readPane: makeReadPane(sequence),
-      sendMessage: async (_c: number, _t: number, text: string, opts?: { disable_notification?: boolean; reply_markup?: unknown }) => {
-        sent.push({ text, opts });
-        return 1;
-      },
-      sleep: async (_ms: number) => {
-        return new Promise<void>((resolve) => pending.push(resolve));
-      },
-      now: clock.now,
-    } satisfies ObserveLoopDeps,
+    communicator,
+    deps,
     step() {
       // Resolve one outstanding sleep and advance the clock by tickMs.
       const next = pending.shift();
@@ -113,6 +119,7 @@ describe("runObserveLoop — idle stop condition", () => {
         paneDelta: (d) => `[delta] ${d}`,
         finalMessage: (text) => `[final] ${text}`,
       }),
+      communicator: f.communicator,
       deps: f.deps,
     });
     await f.drive();
@@ -143,6 +150,7 @@ describe("runObserveLoop — idle stop condition", () => {
         paneDelta: (d) => `DELTA:${d}`,
         finalMessage: () => "final!",
       }),
+      communicator: f.communicator,
       deps: f.deps,
     });
     await f.drive();
@@ -166,6 +174,7 @@ describe("runObserveLoop — idle stop condition", () => {
         finalMessage: () => "(should not fire)",
         abortedMessage: () => "ABORTED via signal",
       }, controller.signal),
+      communicator: f.communicator,
       deps: f.deps,
     });
     // Drive a few iterations, then abort and let the loop finish.
@@ -201,6 +210,7 @@ describe("runObserveLoop — follow stop condition", () => {
         finalMessage: (text) => `[final] ${text}`,
         finalKeyboard: () => ({ inline_keyboard: [[{ text: "End", callback_data: "x" }]] }),
       }),
+      communicator: f.communicator,
       deps: f.deps,
     });
     await f.drive();
@@ -229,6 +239,7 @@ describe("runObserveLoop — follow stop condition", () => {
         finalMessage: () => "(final)",
         abortedMessage: () => "(manual abort)",
       }, controller.signal),
+      communicator: f.communicator,
       deps: f.deps,
     });
     // 3 ticks then abort
@@ -264,6 +275,7 @@ describe("runObserveLoop — output formatter hooks", () => {
           return { inline_keyboard: [[{ text: "Follow 5m", callback_data: "act:follow:5:1" }]] };
         },
       }),
+      communicator: f.communicator,
       deps: f.deps,
     });
     await f.drive();
@@ -298,6 +310,7 @@ describe("runObserveLoop — output formatter hooks", () => {
         paneDelta: (delta) => `[delta] ${delta}`,
         finalMessage: (text) => `[final] ${text}`,
       }),
+      communicator: f.communicator,
       deps: f.deps,
     });
     await f.drive();

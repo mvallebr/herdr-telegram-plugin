@@ -1,12 +1,13 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
-import { getAgents, readPane, sendText, sendEscape } from "./herdr-client.js";
+import { getAgents, readPane, sendText, sendEscape, getAgentInfo } from "./herdr-client.js";
 import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
 import { loadState, saveState } from "./state.js";
 import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
 import type { FollowManager } from "./follow-manager.js";
+import { AgentCommunicator } from "./agent-sessions.js";
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
@@ -75,6 +76,8 @@ export interface CommandDeps {
   /** Optional hook called by /unfollow after dropping a subscription, so
    *  the daemon can stop the background poll loop. */
   onFollowStop?: (threadId: number) => void;
+  /** Per-agent data store paths from config. Passed to AgentCommunicator. */
+  agentPaths?: Record<string, Record<string, string>>;
 }
 
 /** Format the body of a /last readback. Pure function: easy to unit-test. */
@@ -95,6 +98,34 @@ export function formatLastReadback(opts: {
     ? "\n\n_(painel imprimindo — pode estar parcial)_"
     : "";
   return `[${ts}] ${opts.mapping.label}\n\n${truncated}${busyHint}`;
+}
+
+/**
+ * Read the last snapshot for a bound thread, preferring the agent's
+ * structured jsonl/SQLite session log when available. Returns whatever the
+ * communicator produces — if no structured source is available, the
+ * communicator itself falls back to screen scraping.
+ *
+ * Returns the formatted readback string ready to send to Telegram.
+ */
+export function getLastReadback(opts: {
+  mapping: ThreadMapping;
+  /** AgentCommunicator instance — owns the read strategy decision. */
+  communicator: AgentCommunicator;
+  busy: boolean;
+  now: () => string;
+  truncateAt: number;
+  maxLines?: number;
+}): string {
+  const rawPane = opts.communicator.getAgentOutput(opts.maxLines ?? 4_000);
+
+  return formatLastReadback({
+    mapping: opts.mapping,
+    rawPane,
+    busy: opts.busy,
+    now: opts.now,
+    truncateAt: opts.truncateAt,
+  });
 }
 
 export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
@@ -207,23 +238,24 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
       await ctx.reply("No pane for this topic.");
       return;
     }
-    let raw: string;
     try {
-      // Match wait-loop's max scan lines (ScreenScrapeWrapper expands up to 4000)
-      // so /last can show recent output that scrolled off a 500-line buffer.
-      raw = readPane(mapping.pane_id, 4_000);
+      const comm = new AgentCommunicator(
+        mapping.pane_id,
+        getAgentInfo,
+        readPane,
+        deps.agentPaths,
+      );
+      const body = getLastReadback({
+        mapping,
+        communicator: comm,
+        busy: deps.turns?.isBusy(mapping.pane_id) ?? false,
+        now: () => new Date().toISOString(),
+        truncateAt: 3000,
+      });
+      await ctx.reply(body);
     } catch (err: any) {
       await ctx.reply(`Failed to read pane: ${err.message}`);
-      return;
     }
-    const body = formatLastReadback({
-      mapping,
-      rawPane: raw,
-      busy: deps.turns?.isBusy(mapping.pane_id) ?? false,
-      now: () => new Date().toISOString(),
-      truncateAt: 3000,
-    });
-    await ctx.reply(body);
   });
 
   bot.command("bind", async (ctx) => {

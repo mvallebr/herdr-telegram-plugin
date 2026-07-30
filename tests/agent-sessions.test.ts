@@ -8,6 +8,7 @@ import {
   readCodexSessionProgress,
   readAgentSessionResponse,
   pickOutputStrategy,
+  AgentCommunicator,
 } from "../src/agent-sessions.js";
 
 describe("readPiSessionResponse", () => {
@@ -281,5 +282,66 @@ describe("readAgentSessionResponse (dispatch)", () => {
     expect(
       readAgentSessionResponse({ kind: "id", id: "abc" }, "pi", 0)
     ).toBeNull();
+  });
+});
+
+describe("AgentCommunicator", () => {
+  it("uses readPane when getAgentInfo returns null", () => {
+    const readPane = (paneId: string, _lines: number) => `scraped: ${paneId}`;
+    const comm = new AgentCommunicator("w1:p1", () => null, readPane);
+    expect(comm.getAgentOutput(4000)).toBe("scraped: w1:p1");
+  });
+
+  it("uses readPane when agent has no agent_session", () => {
+    const readPane = () => "scraped content";
+    const comm = new AgentCommunicator("w1:p1", () => ({
+      agent: "pi",
+      agent_status: "idle",
+      pane_id: "w1:p1",
+      tab_id: "",
+      workspace_id: "",
+    }), readPane);
+    expect(comm.getAgentOutput(4000)).toBe("scraped content");
+  });
+
+  it("falls back to readPane when jsonl reader returns null", () => {
+    const readPane = () => "fallback scrape";
+    // getAgentInfo returns a session ref with a non-existent path
+    const comm = new AgentCommunicator("w1:p1", () => ({
+      agent: "pi",
+      agent_status: "idle",
+      pane_id: "w1:p1",
+      tab_id: "",
+      workspace_id: "",
+      agent_session: { kind: "path", path: "/nonexistent/session.jsonl" },
+    }), readPane);
+    expect(comm.getAgentOutput(4000)).toBe("fallback scrape");
+  });
+
+  it("uses jsonl reader when session path is valid", () => {
+    // Create a temp jsonl file with a valid pi session
+    const tmpDir = mkdtempSync(join(tmpdir(), "agent-comm-"));
+    const sessionPath = join(tmpDir, "session.jsonl");
+    writeFileSync(sessionPath, JSON.stringify({
+      type: "message",
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "jsonl response" }],
+      },
+    }) + "\n", "utf8");
+
+    const readPane = () => "should not be called";
+    const comm = new AgentCommunicator("w1:p1", () => ({
+      agent: "pi",
+      agent_status: "idle",
+      pane_id: "w1:p1",
+      tab_id: "",
+      workspace_id: "",
+      agent_session: { kind: "path", path: sessionPath },
+    }), readPane);
+
+    expect(comm.getAgentOutput(4000)).toBe("jsonl response");
+    rmSync(tmpDir, { recursive: true, force: true });
   });
 });
