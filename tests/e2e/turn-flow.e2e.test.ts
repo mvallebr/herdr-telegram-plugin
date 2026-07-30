@@ -389,4 +389,125 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
     expect(followToast).toBeDefined();
     expect(followToast!.text.toLowerCase()).toContain("timer reset");
   });
+
+  it("defers /follow while a turn is running and starts the follow loop only after the turn finalises", async () => {
+    // Bug: onFollowStart unconditionally spawned a parallel follow loop
+    // when /follow arrived mid-turn. Both loops then polled the same
+    // pane and emitted duplicate Working ticks + pane deltas to the
+    // same Telegram thread.
+    //
+    // Fix: the FollowCoordinator records /follow as deferred while a
+    // turn is running, and promotes the deferred follow only after the
+    // turn finalises. The follow loop's Working tick carries the
+    // ", follow expires in …" suffix (timeout=5min), which the turn
+    // loop's tick does not — so the suffix is the strongest signal
+    // that a second loop is running on the same pane.
+    //
+    // Note on tick filtering: observe-loop's paneDelta chunks end with
+    // `\n\n⏳ Working (Xs).`, so they include the marker mid-message
+    // (not at the start). We filter by `.includes("⏳ Working")` rather
+    // than `.startsWith(...)`.
+    //
+    // We trigger /follow via the `act:follow:N:THREAD_ID` callback —
+    // this is the same code path the /follow command uses (it calls
+    // deps.onFollowStart), but the callback bypasses grammy command
+    // routing so the test is deterministic.
+
+    // Pane content that grows for many polls so the first turn stays
+    // alive across several Working ticks.
+    const growing: string[] = ["start\n"];
+    for (let i = 0; i < 40; i++) {
+      growing.push(growing[i] + `line ${i + 1}\n`);
+    }
+    rig.herdr.setPaneContent(rig.paneId, growing);
+
+    // Start a turn.
+    await rig.dispatch(buildMessageUpdate(1, "olá agente"));
+    for (let i = 0; i < 10; i++) await rig.tick(50);
+
+    // Sanity: Working ticks are flowing, and NONE carry the follow
+    // suffix yet (no follow loop is running).
+    const initialTicks = capture.sent.filter((m) => m.text.includes("⏳ Working"));
+    expect(initialTicks.length).toBeGreaterThan(0);
+    expect(initialTicks.filter((m) => m.text.includes("follow expires"))).toHaveLength(0);
+
+    // While the turn is mid-flight, click the Follow 5m inline button
+    // (equivalent to issuing /follow 5). The follow subscription is
+    // created (so its timer is owned) but the follow loop must be
+    // deferred — not started in parallel with the turn.
+    await rig.dispatch(buildCallbackUpdate(2, 1, `act:follow:5:${THREAD_ID}`));
+    for (let i = 0; i < 8; i++) await rig.tick(50);
+
+    // KEY ASSERTION (RED in the buggy version): no NEW Working tick
+    // may carry the "follow expires" suffix while the turn is still
+    // running. The buggy daemon would have started a parallel follow
+    // loop on /follow, and its ticks would include the suffix.
+    const midTicks = capture.sent.filter((m) => m.text.includes("⏳ Working"));
+    const midFollowTicks = midTicks.filter((m) => m.text.includes("follow expires"));
+    expect(midFollowTicks).toHaveLength(0);
+
+    // Now let the pane stabilise so the turn finalises (idle stability
+    // window = 200ms with 50ms tick = ~4 polls of no byte change).
+    const stableContent = growing[growing.length - 1];
+    rig.herdr.setPaneContent(rig.paneId, Array(8).fill(stableContent));
+    for (let i = 0; i < 30; i++) await rig.tick(50);
+
+    // The turn should have emitted its Final (✅), and the deferred
+    // follow loop should now be promoted — emitting Working ticks
+    // with the "follow expires" suffix.
+    const finals = capture.sent.filter((m) => m.text.startsWith("✅"));
+    expect(finals).toHaveLength(1);
+
+    const finalTicks = capture.sent.filter((m) => m.text.includes("⏳ Working"));
+    const followExpiresTicks = finalTicks.filter((m) => m.text.includes("follow expires"));
+    expect(followExpiresTicks.length).toBeGreaterThan(0);
+
+    // Stop the follow loop so it doesn't leak into the next test
+    // (the 5-minute timeout keeps it running otherwise, and its
+    // tg.sendMessage calls pollute the shared `capture.sent`).
+    await rig.dispatch(buildCallbackUpdate(99, 1, `act:unfollow:${THREAD_ID}`));
+    for (let i = 0; i < 4; i++) await rig.tick(50);
+  });
+
+  it("clears a deferred follow when /unfollow arrives mid-turn", async () => {
+    // Sibling test to the defer-then-promote flow: if /unfollow arrives
+    // while a follow is deferred (turn still running), the deferred
+    // entry must be cleared so the follow loop is NOT promoted after
+    // the turn finalises. Without this, /unfollow would be silently
+    // overridden once the turn ends — surprising for the user.
+
+    const growing: string[] = ["start\n"];
+    for (let i = 0; i < 40; i++) {
+      growing.push(growing[i] + `line ${i + 1}\n`);
+    }
+    rig.herdr.setPaneContent(rig.paneId, growing);
+
+    // Start a turn.
+    await rig.dispatch(buildMessageUpdate(1, "olá agente"));
+    for (let i = 0; i < 10; i++) await rig.tick(50);
+
+    // Click Follow 5m — subscription registered, follow loop deferred.
+    await rig.dispatch(buildCallbackUpdate(2, 1, `act:follow:5:${THREAD_ID}`));
+    for (let i = 0; i < 4; i++) await rig.tick(50);
+
+    // Click Unfollow — should clear the deferred entry. The follow
+    // subscription is removed too.
+    await rig.dispatch(buildCallbackUpdate(3, 2, `act:unfollow:${THREAD_ID}`));
+    for (let i = 0; i < 4; i++) await rig.tick(50);
+
+    // Now let the pane stabilise so the turn finalises.
+    const stableContent = growing[growing.length - 1];
+    rig.herdr.setPaneContent(rig.paneId, Array(8).fill(stableContent));
+    for (let i = 0; i < 25; i++) await rig.tick(50);
+
+    // Turn should have emitted a Final; follow loop must NOT have
+    // been promoted (no follow-expires ticks should appear, because
+    // /unfollow cleared the deferred entry).
+    const finals = capture.sent.filter((m) => m.text.startsWith("✅"));
+    expect(finals).toHaveLength(1);
+
+    const finalTicks = capture.sent.filter((m) => m.text.includes("⏳ Working"));
+    const followExpiresTicks = finalTicks.filter((m) => m.text.includes("follow expires"));
+    expect(followExpiresTicks).toHaveLength(0);
+  });
 });

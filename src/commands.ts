@@ -74,8 +74,10 @@ export interface CommandDeps {
    *  the daemon can spawn the background poll loop. */
   onFollowStart?: (threadId: number) => void;
   /** Optional hook called by /unfollow after dropping a subscription, so
-   *  the daemon can stop the background poll loop. */
-  onFollowStop?: (threadId: number) => void;
+   *  the daemon can stop the background poll loop. The daemon passes the
+   *  resolved paneId (looked up before the subscription is removed) so
+   *  it can clear any coordinator state for that pane. */
+  onFollowStop?: (threadId: number, paneId?: string) => void;
   /** Per-agent data store paths from config. Passed to AgentCommunicator. */
   agentPaths?: Record<string, Record<string, string>>;
   /** OpenCode read options (include_tools / include_thoughts). */
@@ -408,8 +410,13 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
       await ctx.reply("Subscriptions not available.");
       return;
     }
-    const had = deps.follows.remove(threadId);
-    deps.onFollowStop?.(threadId);
+    // Look up the subscription BEFORE removing so we can hand its
+    // paneId to onFollowStop — the daemon uses it to clear any
+    // coordinator state for the pane (deferred follow etc.).
+    const sub = deps.follows.get(threadId);
+    const had = sub !== null;
+    if (had) deps.follows.remove(threadId);
+    deps.onFollowStop?.(threadId, sub?.mapping.pane_id);
     // Clear the 👀 reaction if we had set one.
     if (had) {
       try {

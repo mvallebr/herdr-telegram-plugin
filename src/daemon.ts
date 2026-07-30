@@ -12,6 +12,7 @@ import { createLogger, type Logger } from "./logger.js";
 import { startWatcher } from "./watcher.js";
 import { FollowManager } from "./follow-manager.js";
 import { TurnDispatcher } from "./turn-dispatcher.js";
+import { FollowCoordinator } from "./follow-coordinator.js";
 import { parseActionCallback } from "./keyboards.js";
 import { getLastReadback, formatStatus } from "./commands.js";
 import type { DaemonState } from "./types.js";
@@ -116,6 +117,77 @@ export async function startDaemon(
   /** Active background follow loops, keyed by threadId. Cancel the runner to stop. */
   const followLoops = new Map<number, { cancel: () => void }>();
 
+  /**
+   * Owns "at most one output observer per pane" semantics. When a turn
+   * loop is running for a pane and /follow arrives, the follow is
+   * recorded as deferred — its subscription is still owned by
+   * FollowManager (so its timer ticks), but the actual follow loop is
+   * not spawned until the turn loop finalises. See
+   * `./follow-coordinator.ts` for the full state machine.
+   *
+   * The `startFollow` callback fires only when the active loop for the
+   * pane has cleared (and the subscription is still alive), so it
+   * always re-enters `startFollowLoop` with a clean slate.
+   */
+  const coordinator = new FollowCoordinator({
+    startFollow: (threadId) => startFollowLoop(threadId),
+    hasFollow: (threadId) => follows.get(threadId) !== null,
+  });
+
+  /**
+   * Spawn a follow loop for the threadId. Extracted from onFollowStart
+   * so the coordinator's startFollow callback can invoke it without
+   * infinite recursion: by the time the coordinator fires
+   * startFollow, the active loop state has been cleared and the call
+   * always re-enters with a clean pane.
+   */
+  function startFollowLoop(threadId: number): void {
+    const sub = follows.get(threadId);
+    if (!sub) return;
+    const mapping = sub.mapping;
+    const paneId = mapping.pane_id;
+    // Idempotent: stop any existing loop first.
+    followLoops.get(threadId)?.cancel();
+    const controller = new AbortController();
+    if (!coordinator.beginLoop(paneId, "follow", () => controller.abort())) {
+      // Defensive: another loop took the slot between the coordinator's
+      // finishLoop and this call. Defer and let the next finishLoop
+      // handle promotion.
+      coordinator.deferFollow(paneId, threadId);
+      return;
+    }
+    followLoops.set(threadId, { cancel: () => controller.abort() });
+    // Fire and forget — the loop runs in background.
+    void (async () => {
+      try {
+        await runAgentFollowLoop({
+          paneId: mapping.pane_id,
+          threadId,
+          cfg,
+          tg,
+          chatId: state.authorized_chat_id!,
+          signal: controller.signal,
+          // The closure re-reads the subscription each tick so user
+          // messages (which call follows.touch) push the deadline out.
+          expiresAt: () => {
+            const current = follows.get(threadId);
+            return current ? current.expiresAt : null;
+          },
+          onExpired: () => { follows.remove(threadId); },
+        });
+      } catch (err) {
+        log.error("Follow loop crashed", {
+          paneId: mapping.pane_id,
+          threadId,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        followLoops.delete(threadId);
+        coordinator.finishLoop(paneId);
+      }
+    })();
+  }
+
   const deps: CommandDeps = {
     map,
     stateDir: statePath,
@@ -131,45 +203,29 @@ export async function startDaemon(
       includeThoughts: cfg.opencodeIncludeThoughts,
     },
     onFollowStart: (threadId: number) => {
-      // Idempotent: stop any existing loop first.
-      followLoops.get(threadId)?.cancel();
       const sub = follows.get(threadId);
       if (!sub) return;
-      const mapping = sub.mapping;
-      const controller = new AbortController();
-      followLoops.set(threadId, { cancel: () => controller.abort() });
-      // Fire and forget — the loop runs in background.
-      void (async () => {
-        try {
-          await runAgentFollowLoop({
-            paneId: mapping.pane_id,
-            threadId,
-            cfg,
-            tg,
-            chatId: state.authorized_chat_id!,
-            signal: controller.signal,
-            // The closure re-reads the subscription each tick so user
-            // messages (which call follows.touch) push the deadline out.
-            expiresAt: () => {
-              const current = follows.get(threadId);
-              return current ? current.expiresAt : null;
-            },
-            onExpired: () => { follows.remove(threadId); },
-          });
-        } catch (err) {
-          log.error("Follow loop crashed", {
-            paneId: mapping.pane_id,
-            threadId,
-            message: err instanceof Error ? err.message : String(err),
-          });
-        } finally {
-          followLoops.delete(threadId);
-        }
-      })();
+      const paneId = sub.mapping.pane_id;
+      // If a loop (turn or follow) is already running for this pane,
+      // defer. The active loop's `finishLoop` will promote the
+      // deferred follow once the loop clears — provided the
+      // subscription is still alive at that point.
+      if (coordinator.isActive(paneId)) {
+        coordinator.deferFollow(paneId, threadId);
+        log.info("follow: deferred until active loop finishes", {
+          threadId, paneId,
+          activeKind: coordinator.activeKind(paneId),
+        });
+        return;
+      }
+      startFollowLoop(threadId);
     },
-    onFollowStop: (threadId: number) => {
+    onFollowStop: (threadId: number, paneId?: string) => {
       followLoops.get(threadId)?.cancel();
       followLoops.delete(threadId);
+      // Clear any deferred follow for the pane — otherwise it would
+      // promote to an active loop after the current turn finalises.
+      if (paneId) coordinator.cancel(paneId);
     },
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
@@ -416,8 +472,18 @@ export async function startDaemon(
       label: mapping?.label,
     });
     if (!mapping) return; // unbound thread — ignore
+    // /digest is itself a turn — same observer-uniqueness rule applies.
+    if (coordinator.isActive(mapping.pane_id)) {
+      await ctx.reply("A loop is already running for this pane — try again when it finishes.");
+      return;
+    }
     await ctx.reply(`Asking *${mapping.label}* for a summary...`, { parse_mode: "Markdown" });
     void turns.start(mapping.pane_id, async (signal) => {
+      const paneId = mapping.pane_id;
+      if (!coordinator.beginLoop(paneId, "turn", () => {})) {
+        log.warn("digest: coordinator rejected beginLoop (race?)", { paneId });
+        return;
+      }
       try {
         await runAgentTurn(
           mapping.pane_id, threadId,
@@ -434,6 +500,8 @@ export async function startDaemon(
         if (!signal.aborted) {
           await tg.sendMessage(state.authorized_chat_id!, threadId, "⚠️ The bridge could not complete this digest. Please try again.");
         }
+      } finally {
+        coordinator.finishLoop(paneId);
       }
     });
   });
@@ -515,7 +583,7 @@ export async function startDaemon(
     // turn look silently swallowed — the queue serialises per pane but
     // gives no feedback until the current turn finalises. /stop aborts
     // the in-progress turn and releases the queue immediately.
-    if (turns.isBusy(mapping.pane_id)) {
+    if (turns.isBusy(mapping.pane_id) || coordinator.isActive(mapping.pane_id)) {
       try {
         await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
       } catch {
@@ -530,8 +598,13 @@ export async function startDaemon(
     // already-running turn continues and observes the new lines; the
     // follow timer is reset either way. 👀 confirms to the user that we
     // saw the message and the agent will pick it up.
+    //
+    // FollowCoordinator: also check the coordinator so a running FOLLOW
+    // loop (no turn is busy from TurnDispatcher's perspective, but a
+    // follow loop is polling the same pane) doesn't get doubled by a
+    // new turn. Symmetric to the onFollowStart deferred path.
     if (deps.follows) deps.follows.touch(threadId);
-    if (turns.isBusy(mapping.pane_id)) {
+    if (turns.isBusy(mapping.pane_id) || coordinator.isActive(mapping.pane_id)) {
       try {
         sendText(mapping.pane_id, text);
         await ctx.api.setMessageReaction(ctx.chat!.id, ctx.message!.message_id, [{ type: "emoji", emoji: "👀" }]);
@@ -541,6 +614,15 @@ export async function startDaemon(
       return;
     }
     void turns.start(mapping.pane_id, async (signal) => {
+      const paneId = mapping.pane_id;
+      // Register the turn with the coordinator. The pass-through branch
+      // above already gates on coordinator.isActive, so beginLoop
+      // should succeed — the check is defensive against a race where
+      // something else just took the slot.
+      if (!coordinator.beginLoop(paneId, "turn", () => {})) {
+        log.warn("turn: coordinator rejected beginLoop (race?)", { paneId });
+        return;
+      }
       try {
         await runAgentTurn(mapping.pane_id, threadId, text, cfg, tg, chatId, { signal });
       } catch (err) {
@@ -552,6 +634,10 @@ export async function startDaemon(
         if (!signal.aborted) {
           await tg.sendMessage(chatId, threadId, "⚠️ The bridge could not complete this agent turn. Please try again.");
         }
+      } finally {
+        // finishLoop promotes any deferred follow whose subscription
+        // is still active. If no deferred follow is set, it's a no-op.
+        coordinator.finishLoop(paneId);
       }
     });
   });
@@ -583,8 +669,12 @@ export async function startDaemon(
             await ctx.answerCallbackQuery({ text: wasBusy ? "Stopped." : "Nothing in flight." });
             return;
           case "unfollow":
-            if (deps.follows?.remove(threadId)) {
-              deps.onFollowStop?.(threadId);
+            // Capture the subscription before removal so the daemon
+            // gets the paneId — needed to clear coordinator state for
+            // the pane (deferred follow etc.).
+            const subForUnfollow = deps.follows?.get(threadId);
+            if (subForUnfollow && deps.follows?.remove(threadId)) {
+              deps.onFollowStop?.(threadId, subForUnfollow.mapping.pane_id);
             }
             await ctx.answerCallbackQuery({ text: "Unfollowed." });
             return;
