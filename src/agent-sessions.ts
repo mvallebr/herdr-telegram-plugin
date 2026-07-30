@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createLogger, type Logger } from "./logger.js";
-import { stripStatusBar } from "./output-format.js";
+import { createAgentOutputReader } from "./readers/registry.js";
 
 // Use createRequire so we can `require("node:sqlite")` from this ESM
 // module without bundler or async-loading ceremony. node:sqlite is built
@@ -401,11 +401,9 @@ export function pickOutputStrategy(
 
 /**
  * Single, source-agnostic reader selected ONCE at AgentCommunicator
- * construction. Implementations:
- *  - `ScrapeReader(paneId, readPane)` — terminal screen scrape via herdr.
- *  - `JsonlReader(ref, agentName)` — pi / omp / codex session file.
- *  - `OpenCodeDbReader(sessionId, dbPath, runner)` — SQLite via the
- *    `sqlite3` CLI, parsed via -json mode output.
+ * construction. Implementations live in `./readers/` and are selected
+ * by `./readers/registry.ts` — see `createAgentOutputReader`. The class
+ * itself is still exposed here because `AgentCommunicator` depends on it.
  *
  * Once selected, runtime read errors return "" (NOT a fallback).
  */
@@ -420,49 +418,8 @@ export interface AgentOutputReader {
   read(_maxLines: number): string;
 }
 
-/** Screen-scrape reader — wraps the injected readPane callback. */
-class ScrapeReader implements AgentOutputReader {
-  readonly kind = "scrape";
-  constructor(
-    private readonly paneId: string,
-    private readonly readPane: (paneId: string, lines: number) => string,
-  ) {}
-  read(maxLines: number): string {
-    try {
-      // stripStatusBar lives here at the scrape boundary rather than in
-      // observe-loop's readSnapshot to avoid corrupting structured reader
-      // output that happens to match terminal-status patterns (e.g.
-      // "Model: …").
-      return stripStatusBar(this.readPane(this.paneId, maxLines));
-    } catch {
-      return "";
-    }
-  }
-}
-
-/** Jsonl reader for pi / omp / codex sessions. */
-class JsonlReader implements AgentOutputReader {
-  readonly kind = "jsonl";
-  constructor(
-    private readonly ref: Extract<AgentSessionRef, { kind: "path" }>,
-    private readonly agentName: string,
-    private readonly logger: Logger,
-    private readonly paneId: string,
-  ) {}
-  read(_maxLines: number): string {
-    try {
-      const response = readAgentSessionResponse(this.ref, this.agentName, 0);
-      return response?.text ?? "";
-    } catch (err) {
-      this.logger.warn("jsonl structured read failed", {
-        paneId: this.paneId,
-        agent: this.agentName,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      return "";
-    }
-  }
-}
+/** Screen-scrape reader moved to `./readers/registry.ts` so all reader
+ *  selection lives in one place. See `createAgentOutputReader`. */
 
 // --- OpenCode SQLite reader ------------------------------------------------
 
@@ -844,10 +801,17 @@ export interface AgentCommunicatorDeps {
 const fallbackLog: Logger = createLogger("agent-sessions");
 
 /**
- * Selection-once factory. Caller-facing behaviour:
- *   - If validation of the structured source fails, log a single warning
- *     (pane, agent, reason) and fall back to a scrape reader.
- *   - If validation succeeds, pick the structured reader permanently.
+ * Selection-once factory. Delegates reader selection to
+ * `./readers/registry.ts` — all agent-specific logic (pi/omp/codex/opencode
+ * validation, scrape fallback, warn reasons) lives there. This function
+ * only knows about the communicator class and the request shape.
+ *
+ * Caller-facing behaviour (unchanged):
+ *   - If validation of the structured source fails, the registry logs a
+ *     single warning (pane, agent, reason) and falls back to a scrape reader.
+ *   - If validation succeeds, the registry picks the structured reader
+ *     permanently.
+ *   - Runtime empty reads do NOT trigger a fallback.
  *
  * Production code MUST go through this factory instead of `new AgentCommunicator`.
  * The class itself remains exported for tests + seam-based construction.
@@ -857,84 +821,17 @@ export function createAgentCommunicator(depsIn: AgentCommunicatorDeps): AgentCom
   const log: Logger = deps.logger ?? fallbackLog;
 
   const info = safeGetAgentInfo(deps);
-  const session = info?.agent_session;
-  const agent = info?.agent ?? "?";
-
-  // Helper to build a scrape communicator with a one-shot warn logged.
-  const scrapeWithWarn = (reason: string): AgentCommunicator => {
-    log.warn("structured source unavailable; falling back to scrape", {
-      paneId: deps.paneId,
-      agent,
-      reason,
-    });
-    return new AgentCommunicator(
-      new ScrapeReader(deps.paneId, deps.readPane),
-      log,
-    );
-  };
-
-  // No structured session at all → scrape (no warn — that's the default path)
-  if (!session) {
-    return new AgentCommunicator(
-      new ScrapeReader(deps.paneId, deps.readPane),
-      log,
-    );
-  }
-
-  // Path-based sessions: validate the file exists and is a regular file.
-  // Empty files are accepted — the reader will simply return "" until the
-  // agent writes content. The contract is: selection is permanent once made;
-  // runtime empty is not a fallback trigger.
-  if (session.kind === "path") {
-    if (!existsSync(session.path)) {
-      return scrapeWithWarn(`session path does not exist: ${session.path}`);
-    }
-    try {
-      const st = statSync(session.path);
-      if (!st.isFile()) {
-        return scrapeWithWarn(`session path is not a regular file: ${session.path}`);
-      }
-    } catch (err) {
-      return scrapeWithWarn(`cannot stat session path: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    return new AgentCommunicator(
-      new JsonlReader(session, agent, log, deps.paneId),
-      log,
-    );
-  }
-
-  // Id-based sessions: dispatch by agent name.
-  if (session.kind === "id") {
-    if (agent === "opencode") {
-      const dbPath = getAgentDataPath("opencode", "db", deps.agentPaths);
-      const driver: SqliteDriver = deps.sqliteDriver ?? defaultSqliteDriver;
-      const reason = validateOpenCodeDb(dbPath, session.id, driver);
-      if (reason) return scrapeWithWarn(reason);
-      // Validation passed — pick the structured reader permanently.
-      return new AgentCommunicator(
-        new OpenCodeDbReader(
-          dbPath!, session.id, driver, log, deps.paneId,
-          deps.opencodeReadOptions,
-        ),
-        log,
-      );
-    }
-    if (agent === "codex") {
-      const path = findCodexSessionPath(session.id);
-      if (!path) return scrapeWithWarn(`codex session not on disk: ${session.id}`);
-      return new AgentCommunicator(
-        new JsonlReader({ kind: "path", path }, agent, log, deps.paneId),
-        log,
-      );
-    }
-    return scrapeWithWarn(`agent_session is an id, not a path (agent=${agent})`);
-  }
-
-  // Defensive — exhaustive union
-  return new AgentCommunicator(
-    new ScrapeReader(deps.paneId, deps.readPane),
-    log,
-  );
+  const reader = createAgentOutputReader({
+    paneId: deps.paneId,
+    agentName: info?.agent ?? "?",
+    session: info?.agent_session,
+    readPane: deps.readPane,
+    agentPaths: deps.agentPaths,
+    opencodeReadOptions: deps.opencodeReadOptions,
+    sqliteDriver: deps.sqliteDriver,
+    logger: log,
+  });
+  return new AgentCommunicator(reader, log);
 }
 
 function safeGetAgentInfo(deps: AgentCommunicatorDeps): { agent?: string; agent_session?: AgentSessionRef } | null {

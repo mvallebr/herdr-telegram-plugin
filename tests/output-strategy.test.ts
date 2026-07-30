@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { createAgentCommunicator, type AgentCommunicatorDeps } from "../src/agent-sessions.js";
+import { createAgentOutputReader } from "../src/readers/registry.js";
 
 // --- Helpers ---------------------------------------------------------------
 
@@ -325,6 +326,38 @@ describe("createAgentCommunicator — factory contract", () => {
     };
     const comm = createAgentCommunicator(deps);
     expect(comm.readerKind).toBe("scrape");
+  });
+});
+
+describe("createAgentCommunicator delegates to registry", () => {
+  it("uses registry-selected reader kind for agy/no session", () => {
+    const comm = createAgentCommunicator({
+      paneId: "w1:p1",
+      getAgentInfo: () => ({
+        agent: "agy",
+        agent_session: undefined,
+      }),
+      readPane: () => "scrape-output",
+    });
+    // registry must select ScrapeReader for unknown agents with no session
+    expect(comm.readerKind).toBe("scrape");
+    expect(comm.getAgentOutput(10)).toContain("scrape-output");
+
+    // And the registry independently agrees: creating a reader for the same
+    // (paneId, agentName, session) tuple yields a reader of the same kind.
+    const direct = createAgentOutputReader({
+      paneId: "w1:p1",
+      agentName: "agy",
+      session: undefined,
+      readPane: () => "scrape-output",
+      logger: {
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        debug: () => {},
+      },
+    });
+    expect(direct.kind).toBe(comm.readerKind);
   });
 });
 

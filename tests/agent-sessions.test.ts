@@ -460,7 +460,7 @@ describe("AgentCommunicator (factory)", () => {
       logger: noopLogger,
     });
 
-    expect(comm.readerKind).toBe("jsonl");
+    expect(comm.readerKind).toBe("pi-jsonl");
     expect(comm.getAgentOutput(4000)).toBe("jsonl response");
     expect(readPaneCalls).toBe(0);
 
@@ -482,7 +482,7 @@ describe("AgentCommunicator (factory)", () => {
       readPane,
       logger: noopLogger,
     });
-    expect(comm2.readerKind).toBe("jsonl");
+    expect(comm2.readerKind).toBe("pi-jsonl");
     expect(comm2.getAgentOutput(4000)).toBe("");
     expect(readPaneCalls).toBe(0); // never increased
 
