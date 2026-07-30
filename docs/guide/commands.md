@@ -75,15 +75,16 @@ original goal, progress, blockers, next steps.
 
 ### Plain text
 
-Any non-command message in a bound topic is forwarded to the corresponding herdr agent pane. The agent receives it as keyboard input and its terminal output is sent back.
+Any non-command message in a bound topic is forwarded to the corresponding herdr agent pane. The agent receives it as keyboard input and its output is sent back.
 
-```
+```text
 (you type)     "what's the status?"
-(bot replies)  ⏳ Working (3s): [agent thinking...]
-(bot replies)  ✅ (8s): Tests are all passing, just need to...
+(bot replies)  ⏳ Working (3s).
+(bot replies)  [new output chunks]
+(bot replies)  ✅ [recent output]
 ```
 
-Messages sent while the previous turn is still in progress are **queued** (per pane). The bridge reacts with 👀 so you can see your message landed. `/stop` aborts the in-progress turn and releases the queue immediately so your queued message is processed right away.
+There is one active turn per pane. Messages sent while a turn is already active are forwarded to the agent and the existing turn continues. The bridge reacts with 👀 so you can see your message landed. `/stop` aborts the active turn.
 
 ### /last
 
@@ -101,13 +102,11 @@ The snapshot is truncated to the last 3000 chars (with a `(... N chars omitted)`
 
 ### /stop
 
-Send ESC to the agent in the current topic — the same effect as pressing ESC inside the agent's terminal UI. Use it to soft-cancel an in-flight operation (tool call, generation) without killing the agent process. Does **not** interrupt a `/follow` subscription on the same thread.
+Send ESC to the agent in the current topic — the same effect as pressing ESC inside the agent's terminal UI. It also aborts the active turn for that pane, if one exists.
 
-If the pane already has a turn in progress (the bridge is still waiting for the previous response to stabilise), `/stop` also **aborts the in-flight turn and releases the queue**, so the next message you send gets processed immediately instead of being held behind the stuck turn. The reply will say so explicitly:
-
-```
+```text
 /stop
-→ Stopped Echo and released the in-progress turn. The queue will now process your pending messages.
+→ Stopped Echo.
 ```
 
 For a harder interrupt (SIGINT-style) that kills the current operation, use `/interrupt` instead.
@@ -116,39 +115,42 @@ For a harder interrupt (SIGINT-style) that kills the current operation, use `/in
 
 ### /follow [minutes]
 
-Subscribe to pane updates without sending a prompt. Useful when you want to keep listening to agent activity after your last message — for example, watching a long-running tool call finish, or being notified when the agent emits a `final` or `blocked` response while you're away.
+Follow pane output for a period of time. Follow is not a separate background loop; it updates the stop condition of the single active turn for the pane.
 
-The subscription:
+The stop condition is:
 
-- **Lasts `minutes` after your last message** (default from `follow_timeout_minutes` in config, usually 30).
-- **Resets the timer on each message you send** to the same topic.
-- **Emits "Subscription expired"** when the timer runs out.
-- **Can be disabled** by passing `0` — you must `/unfollow` to stop.
-
+```text
+stop = deadline_reached AND (NOT wait_until_idle OR is_idle)
 ```
+
+In practical terms:
+
+- `/follow N` without a user message keeps listening until the deadline.
+- If you send a message during the turn, the turn also requires the agent to become idle.
+- `/follow 0` sets the deadline to now; without a pending message it ends immediately.
+
+```text
 /follow
-→ Following Echo. expires in 30 min from your last message.
+→ Following Echo.
 
 /follow 60
-→ Following Echo. expires in 60 min from your last message.
+→ Following Echo.
 
 /follow 0
-→ Following Echo. no timeout — /unfollow to stop.
+→ Following Echo.
 ```
 
-The bot reacts with 👀 on the `/follow` message as visual confirmation. Re-running `/follow` on the same thread replaces the active subscription with the new timeout.
-
-In follow mode, the bridge publishes only `final` and `blocked` events from the agent — no `Working` heartbeats, no preview spam. On expiration, you'll receive `⏱️ Subscription expired — /follow to listen again.`
+Re-running `/follow` replaces the current deadline.
 
 ### /unfollow
 
-Stop the active subscription on the current thread.
+Remove the follow deadline from the active turn.
 
-```
+```text
 /unfollow
 → Unfollowed.
 ```
 
-Subscriptions are **in-memory**: they do not survive a daemon restart. After a restart you'll need to re-run `/follow` to resume monitoring.
+If a user message arrived during the turn, the turn continues until the agent becomes idle. If no message arrived, the turn can end immediately because the deadline condition is no longer pending.
 
-The bot clears the 👀 reaction when you `/unfollow` an active subscription.
+Follow state is in-memory and does not survive a daemon restart.
