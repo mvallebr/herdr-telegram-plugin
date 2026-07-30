@@ -10,7 +10,10 @@ import {
   runAgentFollowLoop,
   type WaitLoopDeps,
 } from "../src/wait-loop.js";
-import { AgentCommunicator } from "../src/agent-sessions.js";
+import {
+  createAgentCommunicator,
+  type AgentCommunicator,
+} from "../src/agent-sessions.js";
 
 function makeFakeTg() {
   return {
@@ -244,11 +247,12 @@ const USER_INPUT = "hi";
 
 // Helper to create a mock AgentCommunicator that wraps the test's deps.
 function makeCommunicator(deps: Partial<WaitLoopDeps>): AgentCommunicator {
-  return new AgentCommunicator(
-    "w1:pX",
-    () => null,
-    deps.readPane ?? (() => ""),
-  );
+  return createAgentCommunicator({
+    paneId: "w1:pX",
+    getAgentInfo: () => null,
+    readPane: deps.readPane ?? (() => ""),
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+  });
 }
 
 // Helper to create deps for the observe-loop.
@@ -412,7 +416,10 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
     expect(tg.sent[tg.sent.length - 1].text).toContain(USER_INPUT);
   });
 
-  it("truncates deltas that exceed Telegram's 4096-char limit", async () => {
+  it("chunks content that exceeds Telegram's 3000-char limit into multiple messages each ending with a Working marker", async () => {
+    // After PR #11 we no longer truncate with ellipsis — we CHUNK the
+    // unseen content into 3 KB Telegram-friendly messages, each ending
+    // with `\n\n⏳ Working (Xs).`. The suffix counts toward the 3000 cap.
     const longLine =
       "The agent responded with a detailed explanation about the topic. ".repeat(2);
     const longResponse = USER_INPUT + "\n" + Array(60).fill(longLine).join("\n");
@@ -437,11 +444,16 @@ describe("runAgentTurn (PR #10 observe-loop engine)", () => {
       pollIntervalMs: 10,
       stabilityWindowMs: 50,
     });
-    // The first delta is the appended junk; the observe-loop truncates to
-    // the last 3000 chars and prepends an ellipsis when it exceeds 3000.
-    const delta = tg.sent.find((m) => m.text.includes("\u2026"));
-    expect(delta).toBeDefined();
-    expect(delta!.text.length).toBeLessThanOrEqual(3100);
+    // At least one chunk carries the appended long response.
+    // A chunk ends with `\n\n⏳ Working (Xs).` — match by the
+    // `\n\n\u23F3 Working ` substring that ONLY chunks carry.
+    const chunks = tg.sent.filter((m) => /\n\n\u23F3 Working /.test(m.text));
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    // Each chunk's total body (including its `\n\n⏳ Working (Xs).`
+    // suffix) is bounded — soft upper bound to absorb formatter changes.
+    for (const c of chunks) {
+      expect(c.text.length).toBeLessThanOrEqual(3_050);
+    }
   });
 });
 
@@ -553,7 +565,11 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
     )).toBe(true);
   });
 
-  it("emits a labelled tail when the prefix diverges (pane scrolled)", async () => {
+  it("suppresses the old 'pane scrolled' marker — divergent prefix emits no delta when no overlap exists", async () => {
+    // After PR #11 we dropped the "(pane scrolled)" label entirely. A
+    // divergent prefix means we cannot safely emit anything without
+    // risking duplication. The user sees only Working ticks; the Final
+    // (if they trigger one) can recap the latest observed state.
     const clock = makeFakeClock(0);
     const statusBar = "───── MiniMax/medium ─────";
     const baseline = "a\nb\nc\n" + statusBar;
@@ -570,13 +586,21 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       communicator: fixture.communicator,
       deps: fixture.deps,
     });
-    const labelled = fixture.sent.find((m) => m.text.match(/pane scrolled/));
-    expect(labelled).toBeDefined();
-    expect(labelled?.text).not.toContain("a\nb\nc");
-    expect(labelled?.text).toContain("[tool output]");
+    // No "(pane scrolled)" marker anymore.
+    expect(fixture.sent.every((m) => !/pane scrolled/.test(m.text))).toBe(true);
+    // No mid-turn delta fires (the divergent prefix has no overlap).
+    const deltas = fixture.sent.filter((m) =>
+      !m.text.startsWith("⏳ Working") &&
+      !m.text.includes("Follow ended") &&
+      !m.text.includes("Subscription expired"),
+    );
+    expect(deltas).toEqual([]);
   });
 
-  it("truncates huge suffixes to last 3000 chars with ellipsis prefix", async () => {
+  it("chunks huge suffixes across multiple messages each <=3000 chars, no ellipsis prefix", async () => {
+    // After PR #11 we do not truncate with an ellipsis. We chunk instead.
+    // Each chunk ends with `\n\n⏳ Working (Xs).` and fits within the
+    // 3000-char Telegram limit (suffix counted).
     const clock = makeFakeClock(0);
     const fixture = makeFollowDeps([
       "base\n",
@@ -593,9 +617,14 @@ describe("runAgentFollowLoop (PR #10 observe-loop engine)", () => {
       communicator: fixture.communicator,
       deps: fixture.deps,
     });
-    const delta = fixture.sent.find((m) => m.text.startsWith("…"));
-    expect(delta).toBeDefined();
-    expect(delta!.text.length).toBeLessThanOrEqual(3100);
+    const chunks = fixture.sent.filter((m) => m.text.match(/\n\n\u23F3 Working /));
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    // Total per-chunk size (incl. suffix) stays under 3050.
+    for (const c of chunks) {
+      expect(c.text.length).toBeLessThanOrEqual(3_050);
+    }
+    // No ellipsis-prefixed truncations.
+    expect(fixture.sent.every((m) => !m.text.startsWith("\u2026"))).toBe(true);
   });
 
   it("strips status bar from baseline and polls (does not discard recent lines)", async () => {

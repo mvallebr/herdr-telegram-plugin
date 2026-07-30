@@ -5,9 +5,9 @@ import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import type { DaemonState } from "./types.js";
 import { loadState, saveState } from "./state.js";
-import { cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
+import { stripStatusBar, cleanPaneOutput } from "./output-format.js";
 import type { FollowManager } from "./follow-manager.js";
-import { AgentCommunicator } from "./agent-sessions.js";
+import { createAgentCommunicator, type AgentCommunicator } from "./agent-sessions.js";
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
@@ -78,6 +78,11 @@ export interface CommandDeps {
   onFollowStop?: (threadId: number) => void;
   /** Per-agent data store paths from config. Passed to AgentCommunicator. */
   agentPaths?: Record<string, Record<string, string>>;
+  /** OpenCode read options (include_tools / include_thoughts). */
+  opencodeReadOptions?: {
+    includeTools?: boolean;
+    includeThoughts?: boolean;
+  };
 }
 
 /** Format the body of a /last readback. Pure function: easy to unit-test. */
@@ -239,12 +244,13 @@ export function registerCommands(bot: Bot<Context>, deps: CommandDeps): void {
       return;
     }
     try {
-      const comm = new AgentCommunicator(
-        mapping.pane_id,
+      const comm = createAgentCommunicator({
+        paneId: mapping.pane_id,
         getAgentInfo,
         readPane,
-        deps.agentPaths,
-      );
+        agentPaths: deps.agentPaths,
+        opencodeReadOptions: deps.opencodeReadOptions,
+      });
       const body = getLastReadback({
         mapping,
         communicator: comm,

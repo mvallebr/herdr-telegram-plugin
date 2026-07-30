@@ -1,7 +1,7 @@
 import type { DaemonState, PaneInfo, ThreadMapping } from "./types.js";
 import type { TelegramClient } from "./telegram-client.js";
 import { getAgents, readPane, getAgentInfo } from "./herdr-client.js";
-import { AgentCommunicator } from "./agent-sessions.js";
+import { createAgentCommunicator } from "./agent-sessions.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("watcher");
@@ -18,7 +18,11 @@ export async function syncTabs(
   chatId: number,
   tg: TelegramClient,
   state: DaemonState,
-  deps?: { map: Map<number, ThreadMapping>; agentPaths?: Record<string, Record<string, string>> }
+  deps?: {
+    map: Map<number, ThreadMapping>;
+    agentPaths?: Record<string, Record<string, string>>;
+    opencodeReadOptions?: { includeTools?: boolean; includeThoughts?: boolean };
+  }
 ): Promise<{ changed: boolean; added: string[]; removed: string[]; renamed: string[] }> {
   const panes = getAgents();
   const knownTabs = state.known_tabs ?? {};
@@ -69,7 +73,14 @@ export async function syncTabs(
         deps?.map.set(threadId, mapping);
         // Seed with last 5 lines
         try {
-          const comm = new AgentCommunicator(pane.pane_id, getAgentInfo, readPane, agentPaths);
+          const comm = createAgentCommunicator({
+            paneId: pane.pane_id,
+            getAgentInfo,
+            readPane,
+            agentPaths,
+            opencodeReadOptions: deps?.opencodeReadOptions,
+            logger: log,
+          });
           const seed = comm.getAgentOutput(5);
           const trimmed = seed
             .split("\n")
@@ -250,7 +261,14 @@ export function startWatcher(
   saveState: () => void,
   intervalMs: number = 30_000,
   abortSignal?: AbortSignal,
-  deps?: { map: Map<number, ThreadMapping>; agentPaths?: Record<string, Record<string, string>> }
+  deps?: {
+    map: Map<number, ThreadMapping>;
+    agentPaths?: Record<string, Record<string, string>>;
+    opencodeReadOptions?: {
+      includeTools?: boolean;
+      includeThoughts?: boolean;
+    };
+  }
 ): void {
   let tickCount = 0;
   const HEALTH_CHECK_EVERY = 2; // every 2 ticks (2 * 30s = 1min)

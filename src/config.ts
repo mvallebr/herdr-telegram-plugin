@@ -25,6 +25,12 @@ export interface Config {
    *  from $HOME (e.g. ~/.local/share/opencode/opencode.db). Override per-agent
    *  paths via [agents] section in config.toml. */
   agentPaths: Record<string, Record<string, string>>;
+  /** [agents.opencode] include_tools = true — surface compact tool summaries
+   *  prefixed `🔧` in the cumulative snapshot. Default false. */
+  opencodeIncludeTools: boolean;
+  /** [agents.opencode] include_thoughts = true — surface reasoning/thinking
+   *  parts prefixed `💭` in the cumulative snapshot. Default false. */
+  opencodeIncludeThoughts: boolean;
 }
 
 function parseTomlLine(line: string): [string, string] | null {
@@ -52,6 +58,8 @@ export function loadConfig(configDir?: string): Config {
   let fileStabilityWindowMs = 30_000;
   let fileFollowTimeoutMinutes = 30;
   let fileAgentPaths: Record<string, Record<string, string>> = {};
+  let fileOpencodeIncludeTools = false;
+  let fileOpencodeIncludeThoughts = false;
 
   if (fs.existsSync(filePath)) {
     const lines = fs.readFileSync(filePath, "utf8").split("\n");
@@ -91,7 +99,13 @@ export function loadConfig(configDir?: string): Config {
         else if (kv[0] === "follow_timeout_minutes") fileFollowTimeoutMinutes = parseInt(kv[1], 10);
       } else if (inAgents && currentAgent) {
         // Per-agent data paths, e.g. db = "/path/to/db"
-        fileAgentPaths[currentAgent][kv[0]] = kv[1];
+        if (currentAgent === "opencode") {
+          if (kv[0] === "include_tools") fileOpencodeIncludeTools = kv[1] === "true";
+          else if (kv[0] === "include_thoughts") fileOpencodeIncludeThoughts = kv[1] === "true";
+          else fileAgentPaths[currentAgent][kv[0]] = kv[1];
+        } else {
+          fileAgentPaths[currentAgent][kv[0]] = kv[1];
+        }
       } else if (kv[0] === "bot_token") {
         fileBotToken = kv[1];
       }
@@ -121,5 +135,7 @@ export function loadConfig(configDir?: string): Config {
     stabilityWindowMs: fileStabilityWindowMs,
     followTimeoutMinutes: fileFollowTimeoutMinutes,
     agentPaths: fileAgentPaths,
+    opencodeIncludeTools: fileOpencodeIncludeTools,
+    opencodeIncludeThoughts: fileOpencodeIncludeThoughts,
   };
 }

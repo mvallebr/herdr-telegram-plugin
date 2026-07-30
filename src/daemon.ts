@@ -2,9 +2,10 @@ import { TelegramClient } from "./telegram-client.js";
 import { registerCommands, type CommandDeps } from "./commands.js";
 import { isPaired, updatePairing } from "./pairing.js";
 import { reconcile, findMapping, seedKnownTabs, restoreKnownTabMappings } from "./mapping.js";
-import { runAgentTurn, runAgentFollowLoop, cleanPaneOutput, stripStatusBar } from "./wait-loop.js";
+import { runAgentTurn, runAgentFollowLoop } from "./wait-loop.js";
 import { getAgents, readPane, sendText, getAgentInfo, sendEscape } from "./herdr-client.js";
-import { AgentCommunicator } from "./agent-sessions.js";
+import { createAgentCommunicator } from "./agent-sessions.js";
+import { cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -125,6 +126,10 @@ export async function startDaemon(
     follows,
     follows_default_minutes: cfg.followTimeoutMinutes,
     agentPaths: cfg.agentPaths,
+    opencodeReadOptions: {
+      includeTools: cfg.opencodeIncludeTools,
+      includeThoughts: cfg.opencodeIncludeThoughts,
+    },
     onFollowStart: (threadId: number) => {
       // Idempotent: stop any existing loop first.
       followLoops.get(threadId)?.cancel();
@@ -207,7 +212,17 @@ export async function startDaemon(
   ): Promise<void> {
     for (const [threadId, mapping] of newMap.entries()) {
       try {
-        const comm = new AgentCommunicator(mapping.pane_id, getAgentInfo, readPane, cfg.agentPaths);
+        const comm = createAgentCommunicator({
+          paneId: mapping.pane_id,
+          getAgentInfo,
+          readPane,
+          agentPaths: cfg.agentPaths,
+          opencodeReadOptions: {
+            includeTools: cfg.opencodeIncludeTools,
+            includeThoughts: cfg.opencodeIncludeThoughts,
+          },
+          logger: log,
+        });
         const output = comm.getAgentOutput(5);
         // Apply same cleaning as /last — strip status bars and filter out
         // terminal chrome that the OpenCode TUI captures into its SQLite log.
@@ -242,7 +257,14 @@ export async function startDaemon(
       saveStateCallback,
       15_000,
       watcherController.signal,
-      { ...deps, agentPaths: cfg.agentPaths }
+      {
+        ...deps,
+        agentPaths: cfg.agentPaths,
+        opencodeReadOptions: {
+          includeTools: cfg.opencodeIncludeTools,
+          includeThoughts: cfg.opencodeIncludeThoughts,
+        },
+      }
     );
     log.info("watcher: lazily started after pair/reconcile");
   }
@@ -593,12 +615,17 @@ export async function startDaemon(
             await ctx.answerCallbackQuery({ text: "Reading last snapshot…" });
             try {
               await ctx.api.sendMessage(ctx.chat!.id, "Reading last snapshot…\u200B", { message_thread_id: threadId });
-              const comm = new AgentCommunicator(
-                mapping.pane_id,
+              const comm = createAgentCommunicator({
+                paneId: mapping.pane_id,
                 getAgentInfo,
                 readPane,
-                cfg.agentPaths,
-              );
+                agentPaths: cfg.agentPaths,
+                opencodeReadOptions: {
+                  includeTools: cfg.opencodeIncludeTools,
+                  includeThoughts: cfg.opencodeIncludeThoughts,
+                },
+                logger: log,
+              });
               const body = getLastReadback({
                 mapping,
                 communicator: comm,

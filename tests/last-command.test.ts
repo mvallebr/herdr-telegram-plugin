@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { formatLastReadback, getLastReadback } from "../src/commands.js";
-import { AgentCommunicator } from "../src/agent-sessions.js";
+import { createAgentCommunicator, type AgentCommunicatorDeps } from "../src/agent-sessions.js";
 import type { ThreadMapping } from "../src/types.js";
 
 const ECHO_MAPPING: ThreadMapping = {
@@ -79,11 +82,104 @@ describe("formatLastReadback", () => {
   });
 });
 
+function makeComm(opts: {
+  paneId?: string;
+  agent: string;
+  path?: string;
+  readPane: (paneId: string, lines: number) => string;
+}): AgentCommunicatorDeps {
+  const paneId = opts.paneId ?? "w1:pZ";
+  return {
+    paneId,
+    getAgentInfo: () => ({
+      agent: opts.agent,
+      agent_status: "idle",
+      pane_id: paneId,
+      tab_id: "",
+      workspace_id: "",
+      agent_session: opts.path ? { kind: "path", path: opts.path } : undefined,
+    }),
+    readPane: opts.readPane,
+    logger: {
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+      debug: () => {},
+    },
+  };
+}
+
 describe("getLastReadback", () => {
-  it("delegates to AgentCommunicator.getAgentOutput", () => {
-    const getAgentInfo = vi.fn().mockReturnValue(null);
-    const readPane = vi.fn().mockReturnValue("scraped pane content\n");
-    const comm = new AgentCommunicator("w1:pZ", getAgentInfo, readPane);
+  it("delegates to the communicator's structured reader when it returns content", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "agent-comm-last-"));
+    const sessionPath = join(tmpDir, "session.jsonl");
+    writeFileSync(
+      sessionPath,
+      JSON.stringify({
+        type: "message",
+        timestamp: new Date().toISOString(),
+        message: { role: "assistant", content: [{ type: "text", text: "structured text from jsonl" }] },
+      }) + "\n",
+      "utf8",
+    );
+
+    const readPane = vi.fn(() => "SHOULD NOT APPEAR\n");
+    const comm = createAgentCommunicator(makeComm({
+      agent: "pi",
+      path: sessionPath,
+      readPane,
+    }));
+
+    const out = getLastReadback({
+      mapping: ECHO_MAPPING,
+      communicator: comm,
+      busy: false,
+      now: () => fixedTs,
+      truncateAt: 3000,
+    });
+
+    expect(readPane).not.toHaveBeenCalled();
+    expect(out).toContain("structured text from jsonl");
+    expect(out).not.toContain("SHOULD NOT APPEAR");
+
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("does NOT call readPane when jsonl reader returns empty (current contract: empty structured output)", () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "agent-comm-empty-"));
+    const sessionPath = join(tmpDir, "session.jsonl");
+    writeFileSync(sessionPath, "", "utf8");
+
+    const readPane = vi.fn(() => "fallback scrape\n");
+    const comm = createAgentCommunicator(makeComm({
+      agent: "pi",
+      path: sessionPath,
+      readPane,
+    }));
+
+    const out = getLastReadback({
+      mapping: ECHO_MAPPING,
+      communicator: comm,
+      busy: false,
+      now: () => fixedTs,
+      truncateAt: 3000,
+    });
+
+    // Strict: structured selection is permanent; empty structured output
+    // does NOT trigger readPane.
+    expect(readPane).not.toHaveBeenCalled();
+    expect(out).not.toContain("fallback scrape");
+    expect(out).toBeDefined();
+
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uses readPane when no agent_session is reported (scrape only)", () => {
+    const readPane = vi.fn(() => "scraped pane content\n");
+    const comm = createAgentCommunicator(makeComm({
+      agent: "unknown",
+      readPane,
+    }));
 
     const out = getLastReadback({
       mapping: ECHO_MAPPING,
@@ -99,43 +195,12 @@ describe("getLastReadback", () => {
     expect(out).toContain("Echo");
   });
 
-  it("uses jsonl reader output when available (no screen-scrape fallback)", () => {
-    const getAgentInfo = vi.fn().mockReturnValue({
-      agent: "pi",
-      agent_status: "idle",
-      pane_id: "w1:pZ",
-      tab_id: "",
-      workspace_id: "",
-      agent_session: { kind: "path", path: "/tmp/test-session.jsonl" },
-    });
-    // Mock existsSync to return true for the session path so jsonl is chosen
-    vi.doMock("node:fs", () => ({
-      existsSync: vi.fn().mockReturnValue(true),
-      statSync: vi.fn().mockReturnValue({ isFile: () => true, size: 100 }),
-      readFileSync: vi.fn().mockReturnValue(""),
-      readdirSync: vi.fn().mockReturnValue([]),
-    }));
-    const readPane = vi.fn().mockReturnValue("should NOT be called\n");
-    const comm = new AgentCommunicator("w1:pZ", getAgentInfo, readPane);
-
-    // The reader will be called and return null (no actual jsonl content),
-    // which is when AgentCommunicator falls back to readPane.
-    const out = getLastReadback({
-      mapping: ECHO_MAPPING,
-      communicator: comm,
-      busy: false,
-      now: () => fixedTs,
-      truncateAt: 3000,
-    });
-
-    expect(readPane).toHaveBeenCalled(); // fallback because jsonl was null
-    expect(out).toBeDefined();
-  });
-
   it("passes busy state through to formatLastReadback", () => {
-    const getAgentInfo = vi.fn().mockReturnValue(null);
-    const readPane = vi.fn().mockReturnValue("working\n");
-    const comm = new AgentCommunicator("w1:pZ", getAgentInfo, readPane);
+    const readPane = vi.fn(() => "working\n");
+    const comm = createAgentCommunicator(makeComm({
+      agent: "unknown",
+      readPane,
+    }));
 
     const out = getLastReadback({
       mapping: ECHO_MAPPING,
@@ -146,46 +211,5 @@ describe("getLastReadback", () => {
     });
 
     expect(out).toContain("(painel imprimindo");
-  });
-
-  it("does not call readPane when jsonl returns content (prefers structured)", () => {
-    const tmpDir = (require("node:fs") as typeof import("node:fs")).mkdtempSync(
-      require("node:path").join(require("node:os").tmpdir(), "agent-comm-last-")
-    );
-    const sessionPath = require("node:path").join(tmpDir, "session.jsonl");
-    require("node:fs").writeFileSync(
-      sessionPath,
-      JSON.stringify({
-        type: "message",
-        timestamp: new Date().toISOString(),
-        message: { role: "assistant", content: [{ type: "text", text: "structured text from jsonl" }] },
-      }) + "\n",
-      "utf8"
-    );
-
-    const getAgentInfo = vi.fn().mockReturnValue({
-      agent: "pi",
-      agent_status: "idle",
-      pane_id: "w1:pZ",
-      tab_id: "",
-      workspace_id: "",
-      agent_session: { kind: "path", path: sessionPath },
-    });
-    const readPane = vi.fn().mockReturnValue("SHOULD NOT APPEAR\n");
-    const comm = new AgentCommunicator("w1:pZ", getAgentInfo, readPane);
-
-    const out = getLastReadback({
-      mapping: ECHO_MAPPING,
-      communicator: comm,
-      busy: false,
-      now: () => fixedTs,
-      truncateAt: 3000,
-    });
-
-    expect(readPane).not.toHaveBeenCalled();
-    expect(out).toContain("structured text from jsonl");
-    expect(out).not.toContain("SHOULD NOT APPEAR");
-
-    require("node:fs").rmSync(tmpDir, { recursive: true, force: true });
   });
 });
