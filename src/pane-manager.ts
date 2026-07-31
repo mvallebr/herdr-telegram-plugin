@@ -40,6 +40,10 @@ export interface HealthCheckArgs {
   sendChatAction: (chatId: number, threadId: number) => Promise<unknown>;
 }
 
+export interface UnpairArgs {
+  deleteTopic: (chatId: number, threadId: number) => Promise<void>;
+}
+
 export interface PaneManagerDeps {
   getAgents: () => PaneInfo[];
   loadState: () => DaemonState;
@@ -64,12 +68,15 @@ export class PaneManager {
   >();
   private readonly currentState: DaemonState;
   private stopRepeating?: () => void;
+  private paneAgentsAvailable = true;
 
   constructor(private readonly deps: PaneManagerDeps) {
     this.currentState = deps.loadState();
   }
 
   getPaneAgent(paneId: string): PaneAgent | undefined {
+    if (!this.paneAgentsAvailable) return undefined;
+
     let agent = this.paneAgents.get(paneId);
     if (!agent) {
       agent = this.deps.agentFactory(paneId);
@@ -217,6 +224,48 @@ export class PaneManager {
       dead: settled.filter((entry): entry is DeadTopic => entry !== null),
       persisted: false,
     };
+  }
+
+  async unpair(args: UnpairArgs): Promise<{ deleted: number }> {
+    this.stop();
+    const chatId = this.currentState.authorized_chat_id;
+
+    const threadIds = new Set<number>();
+    for (const threadId of Object.keys(this.currentState.known_topics ?? {})) {
+      threadIds.add(Number(threadId));
+    }
+    for (const threadId of Object.keys(this.currentState.thread_mappings)) {
+      threadIds.add(Number(threadId));
+    }
+
+    let deleted = 0;
+    if (chatId !== null) {
+      for (const threadId of threadIds) {
+        try {
+          await args.deleteTopic(chatId, threadId);
+          deleted += 1;
+        } catch {
+          this.deps.logger?.warn("topic deletion failed during unpair", {
+            threadId,
+          });
+        }
+      }
+    }
+
+    this.markUnpaired();
+    return { deleted };
+  }
+
+  markUnpaired(): void {
+    this.paneAgents.clear();
+    this.paneAgentsAvailable = false;
+    this.currentState.authorized_chat_id = null;
+    this.currentState.paired_at = null;
+    this.currentState.thread_mappings = {};
+    this.currentState.known_topics = {};
+    this.currentState.known_tabs = {};
+    delete this.currentState.processed_update_ids;
+    this.deps.saveState(this.currentState);
   }
 
   /**

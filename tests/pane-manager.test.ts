@@ -476,4 +476,192 @@ describe("PaneManager", () => {
     });
     expect(saveState).toHaveBeenCalledOnce();
   });
+
+  it("unpair deletes every bot-owned topic exactly once", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 1234;
+    state.known_topics = {
+      42: { name: "Known only", created_at: "created" },
+      84: { name: "Known and mapped", created_at: "created" },
+    };
+    state.thread_mappings = {
+      84: {
+        pane_id: "workspace:pane-1",
+        label: "Known and mapped",
+        agent: "pi",
+        created_at: "created",
+      },
+      126: {
+        pane_id: "workspace:pane-2",
+        label: "Mapped only",
+        agent: "pi",
+        created_at: "created",
+      },
+    };
+    const deleteTopic = vi.fn(async () => undefined);
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = await manager.unpair({ deleteTopic });
+
+    expect(result).toEqual({ deleted: 3 });
+    expect(deleteTopic.mock.calls).toEqual([
+      [1234, 42],
+      [1234, 84],
+      [1234, 126],
+    ]);
+  });
+
+  it("unpair persists empty state", async () => {
+    const state: DaemonState = {
+      authorized_chat_id: 1234,
+      paired_at: "2026-07-30T12:00:00.000Z",
+      thread_mappings: {
+        42: {
+          pane_id: "workspace:pane-1",
+          label: "Pane One",
+          agent: "pi",
+          created_at: "created",
+        },
+      },
+      known_topics: {
+        42: { name: "Pane One", created_at: "created" },
+      },
+      known_tabs: {
+        "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+      },
+      processed_update_ids: [7, 8],
+    };
+    let persisted: DaemonState | undefined;
+    const saveState = vi.fn((saved: DaemonState) => {
+      persisted = structuredClone(saved);
+    });
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    await manager.unpair({ deleteTopic: async () => undefined });
+
+    const emptyUnpairedState: DaemonState = {
+      authorized_chat_id: null,
+      paired_at: null,
+      thread_mappings: {},
+      known_topics: {},
+      known_tabs: {},
+    };
+    expect(manager.state()).toEqual(emptyUnpairedState);
+    expect(persisted).toEqual(emptyUnpairedState);
+    expect(saveState).toHaveBeenCalledOnce();
+  });
+
+  it("unpair stops polling", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 1234;
+    const stopTimer = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      scheduleRepeating: () => stopTimer,
+    });
+    manager.start();
+
+    await manager.unpair({ deleteTopic: async () => undefined });
+
+    expect(stopTimer).toHaveBeenCalledOnce();
+  });
+
+  it("markUnpaired resets and persists state without deleting topics", () => {
+    const state: DaemonState = {
+      authorized_chat_id: 1234,
+      paired_at: "2026-07-30T12:00:00.000Z",
+      thread_mappings: {
+        42: {
+          pane_id: "workspace:pane-1",
+          label: "Pane One",
+          agent: "pi",
+          created_at: "created",
+        },
+      },
+      known_topics: {
+        42: { name: "Pane One", created_at: "created" },
+      },
+      known_tabs: {
+        "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+      },
+    };
+    const saveState = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    manager.markUnpaired();
+
+    expect(manager.state()).toEqual({
+      authorized_chat_id: null,
+      paired_at: null,
+      thread_mappings: {},
+      known_topics: {},
+      known_tabs: {},
+    });
+    expect(saveState).toHaveBeenCalledOnce();
+  });
+
+  it("does not return pane agents after unpair", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 1234;
+    const agentFactory = vi.fn(
+      (paneId: string) => ({ paneId }) as unknown as PaneAgent,
+    );
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory,
+    });
+    expect(manager.getPaneAgent("workspace:pane-1")).toBeDefined();
+
+    await manager.unpair({ deleteTopic: async () => undefined });
+
+    expect(manager.getPaneAgent("workspace:pane-1")).toBeUndefined();
+    expect(agentFactory).toHaveBeenCalledOnce();
+  });
+
+  it("unpair continues after an already-deleted topic and counts successful deletions", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 1234;
+    state.known_topics = {
+      42: { name: "Already gone", created_at: "created" },
+      84: { name: "Still present", created_at: "created" },
+    };
+    const deleteTopic = vi.fn(async (_chatId: number, threadId: number) => {
+      if (threadId === 42) throw new Error("TOPIC_ID_INVALID");
+    });
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = await manager.unpair({ deleteTopic });
+
+    expect(deleteTopic.mock.calls).toEqual([
+      [1234, 42],
+      [1234, 84],
+    ]);
+    expect(result).toEqual({ deleted: 1 });
+    expect(manager.state().authorized_chat_id).toBeNull();
+  });
 });
