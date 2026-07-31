@@ -51,6 +51,112 @@ describe("PaneManager", () => {
     expect(manager.state()).toEqual(loadedState);
   });
 
+  it("sync adds panes represented by known tabs to state", () => {
+    const state = emptyState();
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+    };
+    const pane = {
+      pane_id: "workspace:pane-1",
+      label: "Pane One",
+      agent: "opencode",
+      tab_id: "workspace:tab-1",
+      workspace_id: "workspace",
+      status: "idle" as const,
+    };
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    manager.sync();
+
+    expect(manager.mappings().get(42)).toMatchObject({
+      pane_id: pane.pane_id,
+      label: pane.label,
+      agent: pane.agent,
+    });
+    expect(manager.state().known_tabs?.[pane.tab_id]).toEqual({
+      label: pane.label,
+      thread_id: 42,
+    });
+  });
+
+  it("sync removes panes that are no longer present", () => {
+    const state = emptyState();
+    state.thread_mappings = {
+      42: { pane_id: "workspace:pane-1", label: "Pane One", agent: "pi", created_at: "created" },
+    };
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+    };
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = manager.sync();
+
+    expect(result.removed).toEqual(["workspace:pane-1"]);
+    expect(manager.mappings()).toEqual(new Map());
+    expect(manager.state().known_tabs).toEqual({});
+  });
+
+
+  it("sync updates a pane label when it is renamed", () => {
+    const state = emptyState();
+    state.thread_mappings = {
+      42: { pane_id: "workspace:pane-1", label: "Old Label", agent: "pi", created_at: "created" },
+    };
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Old Label", thread_id: 42 },
+    };
+    const manager = new PaneManager({
+      getAgents: () => [{
+        pane_id: "workspace:pane-1", label: "New Label", agent: "pi",
+        tab_id: "workspace:tab-1", workspace_id: "workspace", status: "idle",
+      }],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = manager.sync();
+
+    expect(result.renamed).toEqual(["workspace:pane-1"]);
+    expect(manager.mappings().get(42)?.label).toBe("New Label");
+    expect(manager.state().known_tabs?.["workspace:tab-1"]?.label).toBe("New Label");
+  });
+
+
+  it("sync persists the updated state", () => {
+    const state = emptyState();
+    state.thread_mappings = {
+      42: { pane_id: "workspace:pane-1", label: "Pane One", agent: "pi", created_at: "created" },
+    };
+    const saveState = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [{
+        pane_id: "workspace:pane-1", label: "Pane One", agent: "pi",
+        tab_id: "workspace:tab-1", workspace_id: "workspace", status: "idle",
+      }],
+      loadState: () => state,
+      saveState,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    manager.sync();
+
+    expect(saveState).toHaveBeenCalledOnce();
+    expect(saveState).toHaveBeenCalledWith(state);
+    expect(manager.mappings().get(42)?.created_at).toBe("created");
+  });
+
+
   it("converts loaded thread mappings to a Map with numeric thread ids", () => {
     const firstMapping: ThreadMapping = {
       pane_id: "workspace:pane-1",
