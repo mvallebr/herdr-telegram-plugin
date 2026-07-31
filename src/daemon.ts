@@ -399,6 +399,13 @@ export async function startDaemon(
       // visible. Mirror the resulting mappings into the command-side
       // `deps.map` so the rest of the daemon sees them.
       paneManager.poll();
+      // The hooks fired by `poll()` (e.g. the daemon's `onPaneAdded`,
+      // which calls `tg.createForumTopic` and then `restoreTopic`) are
+      // async. We MUST wait for them before reading `mappings()`, otherwise
+      // the count below would be snapshotted against the pre-hook state
+      // and read as zero even though topics were about to be created.
+      // `awaitInflight()` resolves once every in-flight hook settles.
+      await paneManager.awaitInflight();
       deps.map.clear();
       for (const [tid, m] of paneManager.mappings()) deps.map.set(tid, m);
       await ctx.reply(`Reconciled: ${deps.map.size} panes mapped.`);
@@ -416,6 +423,10 @@ export async function startDaemon(
         // creates the topic and seeds it), removals through `onPaneRemoved`,
         // and renames through `onPaneRenamed`.
         paneManager.poll();
+        // Wait for the hook work to settle so the count we report mirrors
+        // the freshly created Telegram topics. See the `/pair` handler for
+        // the same race-condition rationale.
+        await paneManager.awaitInflight();
         deps.map.clear();
         for (const [tid, m] of paneManager.mappings()) deps.map.set(tid, m);
         await ctx.reply(`Reconciled: ${deps.map.size} panes mapped.`);

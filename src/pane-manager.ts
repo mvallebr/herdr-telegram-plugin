@@ -2,14 +2,24 @@ import type { Logger } from "./logger.js";
 import type { PaneAgent } from "./pane-agent.js";
 import type { DaemonState, PaneInfo, ThreadMapping } from "./types.js";
 
+/**
+ * Lifecycle hooks fired by `poll()` after `sync()` classifies each pane as
+ * added / removed / renamed. Hooks MAY be async; the manager tracks every
+ * returned promise in an in-flight set so callers like `/pair` or
+ * `/reconcile` can `await paneManager.awaitInflight()` and observe the
+ * resulting state (e.g. freshly created Telegram topic mappings) before
+ * reporting back to the user.
+ *
+ * Returning `void` is allowed for hooks that complete synchronously.
+ */
 export interface PaneManagerHooks {
-  onPaneAdded?: (paneId: string) => void;
-  onPaneRemoved?: (paneId: string) => void;
+  onPaneAdded?: (paneId: string) => Promise<unknown> | void;
+  onPaneRemoved?: (paneId: string) => Promise<unknown> | void;
   onPaneRenamed?: (
     paneId: string,
     oldLabel: string,
     newLabel: string,
-  ) => void;
+  ) => Promise<unknown> | void;
 }
 
 export interface SyncResult {
@@ -77,6 +87,17 @@ export class PaneManager {
    * topics.
    */
   private readonly seenPanes = new Set<string>();
+  /**
+   * Promises returned by hooks fired from the most recent `poll()` (and
+   * any polls that have not yet had their hooks drain). Removed on settle.
+   * Used by `awaitInflight()` so the `/pair` and `/reconcile` handlers can
+   * wait for the daemon's `onPaneAdded` hook — which calls
+   * `tg.createForumTopic` and then `restoreTopic` — to write its mapping
+   * into state before the handler reports "Reconciled: N panes mapped."
+   * Without this, the count was snapshotted before the hooks completed
+   * and read as zero.
+   */
+  private readonly inFlightHooks = new Set<Promise<unknown>>();
   private currentState: DaemonState;
   private stopRepeating?: () => void;
   private paneAgentsAvailable = true;
@@ -124,27 +145,78 @@ export class PaneManager {
    * mutations (e.g. `/pair` flipping `authorized_chat_id`, `/bind` adding a
    * manual mapping) are visible. Without this, the manager would overwrite
    * those changes with its stale in-memory snapshot on the next save.
+   *
+   * Hooks are tracked via `track()` so `awaitInflight()` can wait for them
+   * to settle. Callers that want to observe side effects of the hook (e.g.
+   * the daemon's `onPaneAdded` writing a `thread_mappings` entry via
+   * `restoreTopic`) must `await` `awaitInflight()` before reading state.
    */
   poll(): SyncResult {
     this.currentState = this.deps.loadState();
     const result = this.sync();
     for (const paneId of result.added) {
-      this.deps.hooks?.onPaneAdded?.(paneId);
+      this.track(this.deps.hooks?.onPaneAdded?.(paneId));
     }
     for (const paneId of result.removed) {
-      this.deps.hooks?.onPaneRemoved?.(paneId);
+      this.track(this.deps.hooks?.onPaneRemoved?.(paneId));
     }
     for (const paneId of result.renamed) {
       const labels = this.renamedLabels.get(paneId);
       if (labels) {
-        this.deps.hooks?.onPaneRenamed?.(
-          paneId,
-          labels.oldLabel,
-          labels.newLabel,
+        this.track(
+          this.deps.hooks?.onPaneRenamed?.(
+            paneId,
+            labels.oldLabel,
+            labels.newLabel,
+          ),
         );
       }
     }
     return result;
+  }
+
+  /**
+   * Register a hook promise so `awaitInflight()` can observe it. The promise
+   * is removed from the in-flight set when it settles (success OR failure)
+   * so transient hook errors do not block subsequent awaits.
+   *
+   * The rejection is consumed here on purpose: the manager only owns the
+   * "are hooks done?" question. Surfacing hook errors to its callers would
+   * risk crashes in innocent contexts (e.g. the recurring 15-second poll,
+   * or the `/pair` reply path) for failures the hook itself is already
+   * responsible for logging. The daemon's `onPaneAdded`/`onPaneRemoved`/
+   * `onPaneRenamed` already wrap their bodies in try/catch and call
+   * `markFailedAdd` on transient Telegram failures, so this consumer is
+   * only the "last line of defence" against an unhandled rejection.
+   */
+  private track(promise: Promise<unknown> | void | undefined): void {
+    if (!promise) return;
+    this.inFlightHooks.add(promise);
+    promise
+      .catch(() => undefined)
+      .finally(() => {
+        this.inFlightHooks.delete(promise);
+      });
+  }
+
+  /**
+   * Resolve once every hook fired by `poll()` since the last `awaitInflight()`
+   * call has settled. Used by `/pair` and `/reconcile` to ensure that
+   * `tg.createForumTopic` + `restoreTopic` work initiated by the daemon's
+   * `onPaneAdded` hook has written its `thread_mappings` entry before the
+   * reply "Reconciled: N panes mapped." is sent. Without this, the count
+   * was snapshotted against stale state and read as zero even though the
+   * hook was about to mint the new topics a moment later.
+   *
+   * Loops in case hooks enqueue more hook work (rare but possible if a
+   * hook calls `poll()` itself). Resolves immediately if no hooks are
+   * currently in flight.
+   */
+  async awaitInflight(): Promise<void> {
+    while (this.inFlightHooks.size > 0) {
+      const snapshot = [...this.inFlightHooks];
+      await Promise.allSettled(snapshot);
+    }
   }
 
   sync(): SyncResult {

@@ -953,4 +953,150 @@ describe("PaneManager", () => {
     expect(result).toEqual({ deleted: 1 });
     expect(manager.state().authorized_chat_id).toBeNull();
   });
+
+  describe("awaitInflight", () => {
+    it("resolves immediately when no hooks are tracked", async () => {
+      const manager = new PaneManager({
+        getAgents: () => [],
+        loadState: emptyState,
+        saveState: () => undefined,
+        agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      });
+
+      // No poll() has fired any hooks; awaitInflight must not block.
+      await expect(manager.awaitInflight()).resolves.toBeUndefined();
+    });
+
+    it("waits for an async onPaneAdded hook to settle before resolving", async () => {
+      let resolveHook!: () => void;
+      const hookSettled = new Promise<void>((r) => { resolveHook = r; });
+      const onPaneAdded = vi.fn(async (_paneId: string) => {
+        await hookSettled;
+      });
+      const pane: PaneInfo = {
+        pane_id: "workspace:pane-async",
+        label: "Async Pane",
+        agent: "pi",
+        tab_id: "workspace:tab-async",
+        workspace_id: "workspace",
+        status: "idle",
+      };
+      const manager = new PaneManager({
+        getAgents: () => [pane],
+        loadState: emptyState,
+        saveState: () => undefined,
+        agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+        hooks: { onPaneAdded },
+      });
+
+      manager.poll();
+
+      // The hook has been invoked but awaits our manual `resolveHook()`.
+      // `awaitInflight()` must NOT resolve yet — otherwise the daemon's
+      // "/pair" reply would be sent before the topic is created.
+      let inflightResolved = false;
+      const inflight = manager.awaitInflight().then(() => {
+        inflightResolved = true;
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(inflightResolved).toBe(false);
+      expect(onPaneAdded).toHaveBeenCalledOnce();
+
+      // Settle the hook; awaitInflight must now resolve.
+      resolveHook();
+      await hookSettled;
+      await inflight;
+      expect(inflightResolved).toBe(true);
+    });
+
+    it("resolves even when a tracked hook rejects", async () => {
+      // Run the failing hook promise in the open and immediately attach
+      // a no-op `.catch` so Vitest's unhandled-rejection tracker does not
+      // trip while we drive the assertion. The manager still observes the
+      // settle via its own `track()` plumbing.
+      const hookCall = vi.fn(async (_paneId: string) => {
+        throw new Error("telegram exploded");
+      });
+      const pane: PaneInfo = {
+        pane_id: "workspace:pane-fail",
+        label: "Failing Pane",
+        agent: "pi",
+        tab_id: "workspace:tab-fail",
+        workspace_id: "workspace",
+        status: "idle",
+      };
+      const manager = new PaneManager({
+        getAgents: () => [pane],
+        loadState: emptyState,
+        saveState: () => undefined,
+        agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+        hooks: { onPaneAdded: hookCall },
+      });
+
+      manager.poll();
+      // The hook was invoked but its returned promise rejects. awaitInflight
+      // must NOT propagate that rejection — otherwise the daemon's /pair
+      // handler would crash. The hook itself owns the error logging; the
+      // manager only tracks settle/drain semantics here.
+      await expect(manager.awaitInflight()).resolves.toBeUndefined();
+      // Drain the rejection locally to avoid Vitest unhandled-rejection noise.
+      await hookCall.mock.results[0].value.catch(() => undefined);
+      expect(hookCall).toHaveBeenCalledOnce();
+    });
+
+    it("drains hook work fired across multiple polls", async () => {
+      let panes: PaneInfo[] = [];
+      let resolveFirst!: () => void;
+      const firstSettled = new Promise<void>((r) => { resolveFirst = r; });
+      let firstSeen = false;
+      const onPaneAdded = vi.fn(async (paneId: string) => {
+        if (!firstSeen && paneId === "workspace:pane-first") {
+          firstSeen = true;
+          await firstSettled;
+        }
+      });
+      const manager = new PaneManager({
+        getAgents: () => panes,
+        loadState: emptyState,
+        saveState: () => undefined,
+        agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+        hooks: { onPaneAdded },
+      });
+
+      panes = [
+        {
+          pane_id: "workspace:pane-first",
+          label: "First",
+          agent: "pi",
+          tab_id: "workspace:tab-first",
+          workspace_id: "workspace",
+          status: "idle",
+        },
+      ];
+      manager.poll();
+
+      // Poll again with a second pane while the first hook is still
+      // in-flight. awaitInflight() must drain BOTH.
+      panes = [
+        ...panes,
+        {
+          pane_id: "workspace:pane-second",
+          label: "Second",
+          agent: "pi",
+          tab_id: "workspace:tab-second",
+          workspace_id: "workspace",
+          status: "idle",
+        },
+      ];
+      manager.poll();
+
+      expect(onPaneAdded).toHaveBeenCalledTimes(2);
+
+      // Settle the first; awaitInflight must then resolve (the second
+      // hook was synchronous).
+      resolveFirst();
+      await firstSettled;
+      await manager.awaitInflight();
+    });
+  });
 });
