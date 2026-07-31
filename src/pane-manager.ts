@@ -66,7 +66,7 @@ export class PaneManager {
     string,
     { oldLabel: string; newLabel: string }
   >();
-  private readonly currentState: DaemonState;
+  private currentState: DaemonState;
   private stopRepeating?: () => void;
   private paneAgentsAvailable = true;
 
@@ -102,7 +102,20 @@ export class PaneManager {
     this.stopRepeating = undefined;
   }
 
-  private poll(): void {
+  /**
+   * Re-run the sync and emit lifecycle hooks once. Public so the daemon can
+   * trigger an on-demand reconcile (e.g. on `/reconcile` or after `/pair`)
+   * without depending on the periodic schedule.
+   *
+   * The recurring poll started by `start()` also goes through this method.
+   *
+   * Always reloads state from disk before syncing so concurrent daemon-side
+   * mutations (e.g. `/pair` flipping `authorized_chat_id`, `/bind` adding a
+   * manual mapping) are visible. Without this, the manager would overwrite
+   * those changes with its stale in-memory snapshot on the next save.
+   */
+  poll(): SyncResult {
+    this.currentState = this.deps.loadState();
     const result = this.sync();
     for (const paneId of result.added) {
       this.deps.hooks?.onPaneAdded?.(paneId);
@@ -120,6 +133,7 @@ export class PaneManager {
         );
       }
     }
+    return result;
   }
 
   sync(): SyncResult {
