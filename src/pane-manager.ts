@@ -25,11 +25,23 @@ export interface PaneManagerDeps {
   agentFactory: (paneId: string) => PaneAgent;
   hooks?: PaneManagerHooks;
   logger?: Logger;
+  intervalMs?: number;
+  scheduleRepeating?: (fn: () => void, intervalMs: number) => () => void;
 }
+
+const scheduleRepeating = (fn: () => void, intervalMs: number): (() => void) => {
+  const timer = setInterval(fn, intervalMs);
+  return () => clearInterval(timer);
+};
 
 export class PaneManager {
   private readonly paneAgents = new Map<string, PaneAgent>();
+  private readonly renamedLabels = new Map<
+    string,
+    { oldLabel: string; newLabel: string }
+  >();
   private readonly currentState: DaemonState;
+  private stopRepeating?: () => void;
 
   constructor(private readonly deps: PaneManagerDeps) {
     this.currentState = deps.loadState();
@@ -48,7 +60,41 @@ export class PaneManager {
     return this.currentState;
   }
 
+  start(): void {
+    this.poll();
+    this.stopRepeating = (this.deps.scheduleRepeating ?? scheduleRepeating)(
+      () => this.poll(),
+      this.deps.intervalMs ?? 15_000,
+    );
+  }
+
+  stop(): void {
+    this.stopRepeating?.();
+    this.stopRepeating = undefined;
+  }
+
+  private poll(): void {
+    const result = this.sync();
+    for (const paneId of result.added) {
+      this.deps.hooks?.onPaneAdded?.(paneId);
+    }
+    for (const paneId of result.removed) {
+      this.deps.hooks?.onPaneRemoved?.(paneId);
+    }
+    for (const paneId of result.renamed) {
+      const labels = this.renamedLabels.get(paneId);
+      if (labels) {
+        this.deps.hooks?.onPaneRenamed?.(
+          paneId,
+          labels.oldLabel,
+          labels.newLabel,
+        );
+      }
+    }
+  }
+
   sync(): SyncResult {
+    this.renamedLabels.clear();
     const panes = this.deps.getAgents();
     const knownTabs = this.currentState.known_tabs ?? {};
     this.currentState.known_tabs = knownTabs;
@@ -75,6 +121,10 @@ export class PaneManager {
       if (!existingEntry) added.push(pane.pane_id);
       if (oldLabel !== undefined && oldLabel !== pane.label) {
         renamed.push(pane.pane_id);
+        this.renamedLabels.set(pane.pane_id, {
+          oldLabel,
+          newLabel: pane.label,
+        });
       }
 
       if (threadId !== undefined) {

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { PaneManager } from "../src/pane-manager.js";
 import type { PaneAgent } from "../src/pane-agent.js";
-import type { DaemonState, ThreadMapping } from "../src/types.js";
+import type { DaemonState, PaneInfo, ThreadMapping } from "../src/types.js";
 
 const emptyState = (): DaemonState => ({
   authorized_chat_id: null,
@@ -156,6 +156,170 @@ describe("PaneManager", () => {
     expect(manager.mappings().get(42)?.created_at).toBe("created");
   });
 
+
+  it("start syncs immediately and schedules recurring syncs", () => {
+    const calls: string[] = [];
+    let scheduledSync: (() => void) | undefined;
+    const getAgents = vi.fn(() => {
+      calls.push("sync");
+      return [];
+    });
+    const scheduleRepeating = vi.fn(
+      (fn: () => void, intervalMs: number) => {
+        calls.push(`schedule:${intervalMs}`);
+        scheduledSync = fn;
+        return vi.fn();
+      },
+    );
+    const manager = new PaneManager({
+      getAgents,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      scheduleRepeating,
+    });
+
+    manager.start();
+
+    expect(calls).toEqual(["sync", "schedule:15000"]);
+    scheduledSync?.();
+    expect(getAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it("stop clears the recurring sync timer", () => {
+    const stopTimer = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      scheduleRepeating: () => stopTimer,
+    });
+    manager.start();
+
+    manager.stop();
+
+    expect(stopTimer).toHaveBeenCalledOnce();
+  });
+
+  it("calls onPaneAdded with the pane id when a new pane appears", () => {
+    let panes: PaneInfo[] = [];
+    let runScheduledSync: () => void = () => undefined;
+    const onPaneAdded = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded },
+      scheduleRepeating: (fn) => {
+        runScheduledSync = fn;
+        return vi.fn();
+      },
+    });
+    manager.start();
+    panes = [
+      {
+        pane_id: "workspace:pane-added",
+        label: "Added Pane",
+        agent: "pi",
+        tab_id: "workspace:tab-added",
+        workspace_id: "workspace",
+        status: "idle",
+      },
+    ];
+
+    runScheduledSync();
+
+    expect(onPaneAdded).toHaveBeenCalledOnce();
+    expect(onPaneAdded).toHaveBeenCalledWith("workspace:pane-added");
+  });
+
+  it("calls onPaneRemoved with the pane id when a pane disappears", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-removed",
+      label: "Removed Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-removed",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    let runScheduledSync: () => void = () => undefined;
+    const state = emptyState();
+    state.thread_mappings = {
+      42: {
+        pane_id: pane.pane_id,
+        label: pane.label,
+        agent: pane.agent,
+        created_at: "created",
+      },
+    };
+    const onPaneRemoved = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneRemoved },
+      scheduleRepeating: (fn) => {
+        runScheduledSync = fn;
+        return vi.fn();
+      },
+    });
+    manager.start();
+    panes = [];
+
+    runScheduledSync();
+
+    expect(onPaneRemoved).toHaveBeenCalledOnce();
+    expect(onPaneRemoved).toHaveBeenCalledWith("workspace:pane-removed");
+  });
+
+  it("calls onPaneRenamed with the pane id and preserved labels", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-renamed",
+      label: "Old Label",
+      agent: "pi",
+      tab_id: "workspace:tab-renamed",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    let runScheduledSync: () => void = () => undefined;
+    const state = emptyState();
+    state.thread_mappings = {
+      42: {
+        pane_id: pane.pane_id,
+        label: pane.label,
+        agent: pane.agent,
+        created_at: "created",
+      },
+    };
+    const onPaneRenamed = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneRenamed },
+      scheduleRepeating: (fn) => {
+        runScheduledSync = fn;
+        return vi.fn();
+      },
+    });
+    manager.start();
+    panes = [{ ...pane, label: "New Label" }];
+
+    runScheduledSync();
+
+    expect(onPaneRenamed).toHaveBeenCalledOnce();
+    expect(onPaneRenamed).toHaveBeenCalledWith(
+      "workspace:pane-renamed",
+      "Old Label",
+      "New Label",
+    );
+  });
 
   it("converts loaded thread mappings to a Map with numeric thread ids", () => {
     const firstMapping: ThreadMapping = {
