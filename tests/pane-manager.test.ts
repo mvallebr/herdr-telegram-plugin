@@ -85,25 +85,182 @@ describe("PaneManager", () => {
   });
 
   it("sync removes panes that are no longer present", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-1",
+      label: "Pane One",
+      agent: "pi",
+      tab_id: "workspace:tab-1",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
     const state = emptyState();
     state.thread_mappings = {
-      42: { pane_id: "workspace:pane-1", label: "Pane One", agent: "pi", created_at: "created" },
+      42: { pane_id: pane.pane_id, label: pane.label, agent: pane.agent, created_at: "created" },
     };
     state.known_tabs = {
-      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+      "workspace:tab-1": { label: pane.label, thread_id: 42 },
     };
     const manager = new PaneManager({
-      getAgents: () => [],
+      getAgents: () => panes,
       loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // Seed the seen set with the known pane so a subsequent disappearance
+    // is reported as `removed` (the seen set is the source of truth for
+    // dedup — a pane that was never observed cannot be "removed").
+    manager.sync();
+    panes = [];
+    const result = manager.sync();
+
+    expect(result.removed).toEqual(["workspace:pane-1"]);
+    expect(manager.mappings()).toEqual(new Map());
+    expect(manager.state().known_tabs).toEqual({});
+  });
+
+
+  it("sync reports every current pane as added on the first sync", () => {
+    const paneA: PaneInfo = {
+      pane_id: "workspace:pane-a",
+      label: "Pane A",
+      agent: "pi",
+      tab_id: "workspace:tab-a",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const paneB: PaneInfo = {
+      pane_id: "workspace:pane-b",
+      label: "Pane B",
+      agent: "pi",
+      tab_id: "workspace:tab-b",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const manager = new PaneManager({
+      getAgents: () => [paneA, paneB],
+      loadState: emptyState,
       saveState: () => undefined,
       agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
     });
 
     const result = manager.sync();
 
-    expect(result.removed).toEqual(["workspace:pane-1"]);
-    expect(manager.mappings()).toEqual(new Map());
-    expect(manager.state().known_tabs).toEqual({});
+    expect(result.added).toEqual(["workspace:pane-a", "workspace:pane-b"]);
+    expect(result.removed).toEqual([]);
+    expect(result.renamed).toEqual([]);
+  });
+
+
+  it("second sync returns empty added/removed/renamed when nothing changed", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-stable",
+      label: "Stable Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-stable",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // First sync discovers the pane; result.added must include it exactly
+    // once. This is the precondition for the seen-set dedup to matter.
+    const first = manager.sync();
+    expect(first.added).toEqual(["workspace:pane-stable"]);
+    expect(first.removed).toEqual([]);
+    expect(first.renamed).toEqual([]);
+
+    // Second sync with no pane churn must report zero of every kind of
+    // change — otherwise the daemon would re-fire onPaneAdded and mint a
+    // duplicate Telegram topic for the same pane.
+    const second = manager.sync();
+    expect(second.added).toEqual([]);
+    expect(second.removed).toEqual([]);
+    expect(second.renamed).toEqual([]);
+  });
+
+
+  it("a pane that disappeared is reported as removed and removed from the seen set", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-transient",
+      label: "Transient Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-transient",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // Seed the seen set with the transient pane.
+    manager.sync();
+
+    // Pane disappears between syncs.
+    panes = [];
+    const removalResult = manager.sync();
+    expect(removalResult.removed).toEqual(["workspace:pane-transient"]);
+    expect(removalResult.added).toEqual([]);
+    expect(removalResult.renamed).toEqual([]);
+
+    // Idempotence: with no current panes and the pane evicted from the
+    // seen set, a second empty sync must not re-emit the removal.
+    const idle = manager.sync();
+    expect(idle.added).toEqual([]);
+    expect(idle.removed).toEqual([]);
+    expect(idle.renamed).toEqual([]);
+  });
+
+
+  it("a pane that reappears after removal is reported as added again", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-flapping",
+      label: "Flapping Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-flapping",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // 1. Initial appearance.
+    const initial = manager.sync();
+    expect(initial.added).toEqual(["workspace:pane-flapping"]);
+
+    // 2. Pane leaves — must be reported as removed.
+    panes = [];
+    const gone = manager.sync();
+    expect(gone.removed).toEqual(["workspace:pane-flapping"]);
+
+    // 3. Pane comes back — must be reported as added again, proving that
+    //    the disappearance cleared it from the seen set.
+    panes = [pane];
+    const reappeared = manager.sync();
+    expect(reappeared.added).toEqual(["workspace:pane-flapping"]);
+    expect(reappeared.removed).toEqual([]);
+    expect(reappeared.renamed).toEqual([]);
+
+    // 4. Steady state — the re-added pane is once again ignored.
+    const stable = manager.sync();
+    expect(stable.added).toEqual([]);
+    expect(stable.removed).toEqual([]);
+    expect(stable.renamed).toEqual([]);
   });
 
 

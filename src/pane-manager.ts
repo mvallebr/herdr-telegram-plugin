@@ -65,7 +65,18 @@ export class PaneManager {
   private readonly renamedLabels = new Map<
     string,
     { oldLabel: string; newLabel: string }
-  >();
+  >;
+  /**
+   * Pane ids already observed by this manager instance. Decouples "added"
+   * detection from `thread_mappings`: on the first poll every pane is
+   * reported as added, but once observed the pane is only reported as added
+   * again after it has left and re-entered the seen set. Without this, a
+   * pane whose add triggered an async topic-create callback that has not
+   * yet written back its thread mapping would be re-reported as added on
+   * every subsequent poll, causing the daemon to mint duplicate Telegram
+   * topics.
+   */
+  private readonly seenPanes = new Set<string>();
   private currentState: DaemonState;
   private stopRepeating?: () => void;
   private paneAgentsAvailable = true;
@@ -161,7 +172,13 @@ export class PaneManager {
       const threadId = existingEntry?.[0] ?? knownTab?.thread_id;
       const oldLabel = existingEntry?.[1].label ?? knownTab?.label;
 
-      if (!existingEntry) added.push(pane.pane_id);
+      // First time this pane id is seen, emit `added` and remember it.
+      // Subsequent syncs are no-ops for `added` until the pane leaves and
+      // drops out of the seen set.
+      if (!this.seenPanes.has(pane.pane_id)) {
+        added.push(pane.pane_id);
+        this.seenPanes.add(pane.pane_id);
+      }
       if (oldLabel !== undefined && oldLabel !== pane.label) {
         renamed.push(pane.pane_id);
         this.renamedLabels.set(pane.pane_id, {
@@ -182,9 +199,20 @@ export class PaneManager {
       }
     }
 
-    for (const [threadId, mapping] of mappings) {
+    // Panes we previously saw but which are no longer present must be
+    // emitted as `removed` and evicted from the seen set so a later
+    // reappearance is reported as a fresh `added` again.
+    for (const paneId of [...this.seenPanes]) {
+      if (!currentPaneIds.has(paneId)) {
+        removed.push(paneId);
+        this.seenPanes.delete(paneId);
+      }
+    }
+
+    // Drop stale mappings whose pane has disappeared; this is independent
+    // of `removed` (driven by the seen set) so the two lists stay in sync.
+    for (const [threadId, mapping] of [...mappings]) {
       if (!currentPaneIds.has(mapping.pane_id)) {
-        removed.push(mapping.pane_id);
         mappings.delete(threadId);
       }
     }
@@ -273,6 +301,7 @@ export class PaneManager {
   markUnpaired(): void {
     this.paneAgents.clear();
     this.paneAgentsAvailable = false;
+    this.seenPanes.clear();
     this.currentState.authorized_chat_id = null;
     this.currentState.paired_at = null;
     this.currentState.thread_mappings = {};
