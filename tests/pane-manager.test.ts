@@ -927,6 +927,106 @@ describe("PaneManager", () => {
     expect(agentFactory).toHaveBeenCalledOnce();
   });
 
+  it("markPaired followed by getPaneAgent creates an agent", () => {
+    // Sanity: the fresh-from-constructor state already has
+    // `paneAgentsAvailable = true`, so this is mostly a regression guard
+    // for callers that build a manager then immediately
+    // markPaired + getPaneAgent (the daemon's /pair path is one such
+    // caller — it constructs the manager before pairing, so the flag is
+    // already true here, but we want the flag to stay true after the
+    // explicit call).
+    const agentFactory = vi.fn(
+      (paneId: string) => ({ paneId }) as unknown as PaneAgent,
+    );
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory,
+    });
+
+    manager.markPaired(1234);
+
+    const agent = manager.getPaneAgent("workspace:pane-1");
+    expect(agent).toBeDefined();
+    expect(agentFactory).toHaveBeenCalledOnce();
+    expect(agentFactory).toHaveBeenCalledWith("workspace:pane-1");
+    expect(manager.state().authorized_chat_id).toBe(1234);
+  });
+
+  it("markPaired stores the chatId and persists state", () => {
+    const saveState = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: emptyState,
+      saveState,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    manager.markPaired(9876);
+
+    expect(manager.state().authorized_chat_id).toBe(9876);
+    expect(saveState).toHaveBeenCalledOnce();
+    expect(saveState).toHaveBeenCalledWith(manager.state());
+  });
+
+  it("markPaired after markUnpaired restores getPaneAgent (regression for /pair after /unpair)", async () => {
+    // This is the actual bug repro. After /unpair, paneAgentsAvailable is
+    // false and getPaneAgent returns undefined. If markPaired does not
+    // flip the flag back, the next /pair would still return undefined and
+    // /last would silently break. The test exercises the exact sequence:
+    // unpair → markPaired → getPaneAgent.
+    const state = emptyState();
+    state.authorized_chat_id = 1234;
+    const agentFactory = vi.fn(
+      (paneId: string) => ({ paneId }) as unknown as PaneAgent,
+    );
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory,
+    });
+
+    // Healthy: a paired manager hands out agents.
+    expect(manager.getPaneAgent("workspace:pane-1")).toBeDefined();
+
+    // /unpair blocks new agent creation.
+    await manager.unpair({ deleteTopic: async () => undefined });
+    expect(manager.getPaneAgent("workspace:pane-1")).toBeUndefined();
+    expect(agentFactory).toHaveBeenCalledOnce();
+
+    // /pair must restore the ability to mint agents. The pane id is the
+    // same as before — we want a fresh agent from the factory, not a
+    // cached undefined.
+    manager.markPaired(1234);
+    const agent = manager.getPaneAgent("workspace:pane-1");
+    expect(agent).toBeDefined();
+    expect(agentFactory).toHaveBeenCalledTimes(2);
+    expect(agentFactory).toHaveBeenLastCalledWith("workspace:pane-1");
+    expect(manager.state().authorized_chat_id).toBe(1234);
+  });
+
+  it("markPaired is idempotent — calling it twice does not produce duplicate agents", () => {
+    const agentFactory = vi.fn(
+      (paneId: string) => ({ paneId }) as unknown as PaneAgent,
+    );
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory,
+    });
+
+    manager.markPaired(1234);
+    manager.markPaired(1234);
+
+    const first = manager.getPaneAgent("workspace:pane-1");
+    const second = manager.getPaneAgent("workspace:pane-1");
+    expect(first).toBe(second);
+    expect(agentFactory).toHaveBeenCalledOnce();
+  });
+
   it("unpair continues after an already-deleted topic and counts successful deletions", async () => {
     const state = emptyState();
     state.authorized_chat_id = 1234;

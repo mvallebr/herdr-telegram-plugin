@@ -384,6 +384,26 @@ export class PaneManager {
   }
 
   /**
+   * Inverse of `markUnpaired`: re-enable pane-agent creation and remember
+   * the chat that just authorized the bridge. The daemon's `/pair` handler
+   * MUST call this before `poll()` — otherwise the `paneAgentsAvailable`
+   * gate left behind by a previous `markUnpaired` would silently make
+   * `getPaneAgent()` return undefined, breaking every command that routes
+   * a thread back to its pane (e.g. `/last`).
+   *
+   * Does NOT touch `paired_at`: the daemon sets that via `updatePairing`
+   * before invoking this method, and the next `poll()` reloads state from
+   * disk so the paired-at timestamp survives. Does NOT pre-populate
+   * `paneAgents` either — that is the lazy job of `getPaneAgent()` so a
+   * fresh pairing only pays the cost for panes that are actually used.
+   */
+  markPaired(chatId: number): void {
+    this.paneAgentsAvailable = true;
+    this.currentState.authorized_chat_id = chatId;
+    this.deps.saveState(this.currentState);
+  }
+
+  /**
    * Explicitly mark a pane id as "added" in the seen-set. Idempotent: a no-op
    * if the pane is already in the set. The daemon's `onPaneAdded` hook calls
    * this after a successful topic-create so the next `sync()` does not

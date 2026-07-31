@@ -393,6 +393,13 @@ export async function startDaemon(
       deps.chatId = chatId;
       deps.knownTopics = state.known_topics;
       await ctx.reply("✅ Chat authorized. Reconciling tabs...");
+      // Re-enable pane-agent creation. After a previous /unpair, the
+      // manager's `paneAgentsAvailable` gate is `false`; without this call
+      // every subsequent `getPaneAgent()` would return undefined and
+      // commands like /last would silently fail. Must run BEFORE poll()
+      // because the onPaneAdded hook enqueues hooks that may call
+      // getPaneAgent via the daemon's emit path.
+      paneManager.markPaired(chatId);
       // The PaneManager handles topic creation via the `onPaneAdded` hook
       // (which also seeds the new topic with the last 5 lines). It reloads
       // state from disk on entry, so the just-persisted pairing change is
