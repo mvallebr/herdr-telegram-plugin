@@ -312,6 +312,32 @@ export class PaneManager {
   }
 
   /**
+   * Explicitly mark a pane id as "added" in the seen-set. Idempotent: a no-op
+   * if the pane is already in the set. The daemon's `onPaneAdded` hook calls
+   * this after a successful topic-create so the next `sync()` does not
+   * re-emit the pane — mirroring what `restoreTopic` already implies (the
+   * pane is now bound to a Telegram topic). Without this call, an external
+   * eviction (e.g. `markUnpaired`, future code paths) could leave the pane
+   * outside the seen-set and cause the daemon to mint a duplicate topic.
+   */
+  markAdded(paneId: string): void {
+    this.seenPanes.add(paneId);
+  }
+
+  /**
+   * Evict a pane id from the seen-set so the next `sync()` reports it as
+   * added again. Used by the daemon when its `onPaneAdded` hook fails to
+   * create the Telegram topic (e.g. transient Telegram error, invalid
+   * thread id, or a thrown exception inside `restoreTopic`). Without this,
+   * a pane whose first topic-create failed would be permanently stuck:
+   * `sync()` would not re-emit it (so no retry) but no `known_tabs` entry
+   * would exist either (so the user has no way to interact with it).
+   */
+  markFailedAdd(paneId: string): void {
+    this.seenPanes.delete(paneId);
+  }
+
+  /**
    * Record a freshly-created Telegram topic in both `known_tabs` and
    * `thread_mappings`. Called by the daemon after `createForumTopic` succeeds
    * for a tab reported as dead by `healthCheck`.

@@ -150,7 +150,20 @@ export async function startDaemon(
         if (!pane) return;
         try {
           const threadId = await tg.createForumTopic(state.authorized_chat_id, pane.label);
+          // Guard against malformed responses — Telegram occasionally
+          // returns an object with `ok:true` but a missing/zero thread id.
+          // Treat that as a hard failure: we must NOT call restoreTopic with
+          // an invalid id, and we must surface the pane for retry.
+          if (!Number.isFinite(threadId) || threadId <= 0) {
+            log.warn("onPaneAdded: createForumTopic returned invalid thread id", { paneId, threadId });
+            paneManager.markFailedAdd(paneId);
+            return;
+          }
           paneManager.restoreTopic(pane.tab_id, threadId, pane.label);
+          // restoreTopic persists the mapping. Confirm the pane stays in the
+          // seen-set so the next sync() does not re-emit it. (Sync already
+          // added it; this is defensive in case anything later evicts it.)
+          paneManager.markAdded(paneId);
           // Seed the new topic with the last 5 lines (best-effort).
           try {
             const comm = createAgentCommunicator({
@@ -185,6 +198,13 @@ export async function startDaemon(
           }
         } catch (err: any) {
           log.warn("onPaneAdded: failed to create topic", { paneId, error: err?.message ?? String(err) });
+          // The pane was already added to the seen-set by sync() before the
+          // hook ran. Without this call the pane would be permanently stuck:
+          // sync() would not re-emit it (so no retry) but restoreTopic never
+          // wrote a known_tabs entry either. Evicting from the seen-set
+          // causes the next sync() to report it as added again, giving us
+          // a retry path for transient Telegram errors.
+          paneManager.markFailedAdd(paneId);
         }
       },
       onPaneRemoved: async (paneId) => {

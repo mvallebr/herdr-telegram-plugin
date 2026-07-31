@@ -264,6 +264,138 @@ describe("PaneManager", () => {
   });
 
 
+  it("markFailedAdd evicts the pane from the seen-set so the next sync re-emits it", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-retry",
+      label: "Retry Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-retry",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // 1. Initial sync discovers the pane and adds it to the seen-set.
+    const initial = manager.sync();
+    expect(initial.added).toEqual(["workspace:pane-retry"]);
+
+    // 2. The daemon's onPaneAdded hook fails to create a Telegram topic
+    //    (e.g. transient network error) and calls markFailedAdd to undo
+    //    the seen-set entry. With no mapping persisted, the pane would
+    //    otherwise be stuck: not re-emitted by sync, not bound in
+    //    known_tabs. The eviction is what unblocks the retry.
+    manager.markFailedAdd("workspace:pane-retry");
+
+    // 3. Next sync must re-emit the pane as added. The earlier poll
+    //    flushed no mapping (hook threw before restoreTopic), so the
+    //    pane genuinely is new from the manager's point of view.
+    const retry = manager.sync();
+    expect(retry.added).toEqual(["workspace:pane-retry"]);
+    expect(retry.removed).toEqual([]);
+    expect(retry.renamed).toEqual([]);
+
+    // 4. After the retry the pane is once again in the seen-set; further
+    //    syncs are no-ops for `added` until the pane actually disappears.
+    const stable = manager.sync();
+    expect(stable.added).toEqual([]);
+    expect(stable.removed).toEqual([]);
+  });
+
+
+  it("markFailedAdd on a pane that never existed is a safe no-op", () => {
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // Calling markFailedAdd with an unknown id must not throw. The seen-
+    // set is the source of truth for which panes have been observed; an
+    // id that was never added cannot be evicted, and that's fine.
+    expect(() => manager.markFailedAdd("workspace:ghost")).not.toThrow();
+
+    // And a subsequent sync still finds nothing.
+    const result = manager.sync();
+    expect(result.added).toEqual([]);
+    expect(result.removed).toEqual([]);
+  });
+
+
+  it("markAdded is a no-op for subsequent syncs (does not double-add)", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-marked",
+      label: "Marked Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-marked",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // 1. Initial sync adds the pane to the seen-set.
+    const initial = manager.sync();
+    expect(initial.added).toEqual(["workspace:pane-marked"]);
+
+    // 2. Daemon's onPaneAdded hook succeeds and calls markAdded
+    //    (defensive — sync already put it in the seen-set).
+    manager.markAdded("workspace:pane-marked");
+
+    // 3. Calling markAdded twice more must NOT cause the pane to be
+    //    re-emitted. The seen-set is idempotent: duplicate `added`
+    //    events would mint duplicate Telegram topics.
+    manager.markAdded("workspace:pane-marked");
+    manager.markAdded("workspace:pane-marked");
+
+    const stable = manager.sync();
+    expect(stable.added).toEqual([]);
+    expect(stable.removed).toEqual([]);
+    expect(stable.renamed).toEqual([]);
+  });
+
+
+  it("markAdded after markFailedAdd still results in exactly one added event per sync", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-bounce",
+      label: "Bounce Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-bounce",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // Round 1: pane appears.
+    expect(manager.sync().added).toEqual(["workspace:pane-bounce"]);
+
+    // Hook fails → daemon evicts from the seen-set.
+    manager.markFailedAdd("workspace:pane-bounce");
+
+    // Hook re-runs (maybe a retry within the same poll tick) and
+    // succeeds this time. It calls markAdded to confirm the seen-set
+    // entry. From the manager's point of view the pane is now "added
+    // this round" — the next sync must NOT re-emit it.
+    manager.markAdded("workspace:pane-bounce");
+
+    expect(manager.sync().added).toEqual([]);
+  });
+
+
   it("sync updates a pane label when it is renamed", () => {
     const state = emptyState();
     state.thread_mappings = {
