@@ -18,6 +18,28 @@ export interface SyncResult {
   renamed: string[];
 }
 
+export interface DeadTopic {
+  tabId: string;
+  threadId: number;
+  label: string;
+}
+
+export interface HealthCheckResult {
+  dead: DeadTopic[];
+  /** Always false — `healthCheck` never persists. The daemon owns persistence. */
+  persisted: false;
+}
+
+export interface HealthCheckArgs {
+  chatId: number;
+  /**
+   * Caller-supplied Telegram ping. Resolves to a falsy value when the thread
+   * is alive and either throws or resolves to a truthy error value when the
+   * thread is dead (e.g. `TOPIC_ID_INVALID`).
+   */
+  sendChatAction: (chatId: number, threadId: number) => Promise<unknown>;
+}
+
 export interface PaneManagerDeps {
   getAgents: () => PaneInfo[];
   loadState: () => DaemonState;
@@ -163,5 +185,61 @@ export class PaneManager {
       mappings.set(Number(threadId), mapping);
     }
     return mappings;
+  }
+
+  /**
+   * Ping every known Telegram topic through the caller-supplied
+   * `sendChatAction`. Threads that throw or resolve to a truthy error are
+   * reported as dead so the daemon can recreate them.
+   *
+   * Does NOT touch Telegram directly and does NOT persist state — the daemon
+   * drives both side effects after deciding what to do with `dead`.
+   */
+  async healthCheck(args: HealthCheckArgs): Promise<HealthCheckResult> {
+    const knownTabs = this.currentState.known_tabs ?? {};
+    const entries = Object.entries(knownTabs);
+
+    const settled = await Promise.all(
+      entries.map(async ([tabId, entry]): Promise<DeadTopic | null> => {
+        try {
+          const result = await args.sendChatAction(args.chatId, entry.thread_id);
+          if (result) {
+            return { tabId, threadId: entry.thread_id, label: entry.label };
+          }
+          return null;
+        } catch {
+          return { tabId, threadId: entry.thread_id, label: entry.label };
+        }
+      }),
+    );
+
+    return {
+      dead: settled.filter((entry): entry is DeadTopic => entry !== null),
+      persisted: false,
+    };
+  }
+
+  /**
+   * Record a freshly-created Telegram topic in both `known_tabs` and
+   * `thread_mappings`. Called by the daemon after `createForumTopic` succeeds
+   * for a tab reported as dead by `healthCheck`.
+   *
+   * Persists state immediately so the new mapping survives a restart.
+   */
+  restoreTopic(tabId: string, threadId: number, label: string): void {
+    const knownTabs = this.currentState.known_tabs ?? {};
+    knownTabs[tabId] = { label, thread_id: threadId };
+    this.currentState.known_tabs = knownTabs;
+
+    const panes = this.deps.getAgents();
+    const pane = panes.find((candidate) => candidate.tab_id === tabId);
+    const mapping: ThreadMapping = {
+      pane_id: pane?.pane_id ?? tabId,
+      label,
+      agent: pane?.agent ?? "unknown",
+      created_at: new Date().toISOString(),
+    };
+    this.currentState.thread_mappings[threadId] = mapping;
+    this.deps.saveState(this.currentState);
   }
 }

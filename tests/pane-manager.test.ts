@@ -355,4 +355,125 @@ describe("PaneManager", () => {
       ]),
     );
   });
+
+  it("healthCheck returns dead entries for threads whose chat action throws", async () => {
+    const state = emptyState();
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+      "workspace:tab-2": { label: "Pane Two", thread_id: 43 },
+    };
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = await manager.healthCheck({
+      chatId: 1,
+      sendChatAction: async (chatId, threadId) => {
+        if (threadId === 42) {
+          throw new Error("400: TOPIC_ID_INVALID");
+        }
+      },
+    });
+
+    expect(result.persisted).toBe(false);
+    expect(result.dead).toEqual([
+      { tabId: "workspace:tab-1", threadId: 42, label: "Pane One" },
+    ]);
+  });
+
+  it("healthCheck treats a truthy error return as a dead entry", async () => {
+    const state = emptyState();
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+    };
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = await manager.healthCheck({
+      chatId: 7,
+      sendChatAction: async () => ({ error: "TOPIC_ID_INVALID" }),
+    });
+
+    expect(result.persisted).toBe(false);
+    expect(result.dead).toEqual([
+      { tabId: "workspace:tab-1", threadId: 42, label: "Pane One" },
+    ]);
+  });
+
+  it("healthCheck returns an empty dead list when every thread responds", async () => {
+    const state = emptyState();
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Pane One", thread_id: 42 },
+      "workspace:tab-2": { label: "Pane Two", thread_id: 43 },
+    };
+    const sendChatAction = vi.fn(async () => undefined);
+    const manager = new PaneManager({
+      getAgents: () => [],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    const result = await manager.healthCheck({
+      chatId: 99,
+      sendChatAction,
+    });
+
+    expect(result.persisted).toBe(false);
+    expect(result.dead).toEqual([]);
+    expect(sendChatAction).toHaveBeenCalledTimes(2);
+    expect(sendChatAction).toHaveBeenCalledWith(99, 42);
+    expect(sendChatAction).toHaveBeenCalledWith(99, 43);
+  });
+
+  it("restoreTopic updates known_tabs and thread_mappings", () => {
+    const state = emptyState();
+    state.known_tabs = {
+      "workspace:tab-1": { label: "Old Label", thread_id: 42 },
+    };
+    state.thread_mappings = {
+      42: {
+        pane_id: "workspace:pane-1",
+        label: "Old Label",
+        agent: "pi",
+        created_at: "2026-07-30T12:00:00.000Z",
+      },
+    };
+    const saveState = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [
+        {
+          pane_id: "workspace:pane-1",
+          label: "Pane One",
+          agent: "pi",
+          tab_id: "workspace:tab-1",
+          workspace_id: "workspace",
+          status: "idle",
+        },
+      ],
+      loadState: () => state,
+      saveState,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    manager.restoreTopic("workspace:tab-1", 84, "Pane One");
+
+    expect(manager.state().known_tabs?.["workspace:tab-1"]).toEqual({
+      label: "Pane One",
+      thread_id: 84,
+    });
+    expect(manager.state().thread_mappings[84]).toMatchObject({
+      pane_id: "workspace:pane-1",
+      label: "Pane One",
+      agent: "pi",
+    });
+    expect(saveState).toHaveBeenCalledOnce();
+  });
 });
