@@ -20,6 +20,7 @@ import type { Update } from "grammy";
 import { startDaemon } from "../../src/daemon.js";
 import { resetHerdrBinCache } from "../../src/herdr-client.js";
 import { TelegramClient } from "../../src/telegram-client.js";
+import { PaneManager } from "../../src/pane-manager.js";
 import { MockHerdr } from "./herdr-mock.js";
 
 const PANE_ID = "w1:p1";
@@ -186,8 +187,8 @@ interface TestRig {
   stop: () => Promise<void>;
   dispatch: (update: Update) => Promise<void>;
   tick: (ms?: number) => Promise<void>;
-  /** Direct access to the daemon's PaneAgent (test-only). */
-  paneAgents: Map<string, import("../../src/pane-agent.js").PaneAgent>;
+  /** Direct access to the daemon's PaneManager (test-only). */
+  paneManager: PaneManager;
 }
 
 async function setupRig(): Promise<TestRig> {
@@ -272,15 +273,15 @@ async function setupRig(): Promise<TestRig> {
   // need a microtask to settle).
   await new Promise((r) => setTimeout(r, 10));
 
-  const paneAgents = (daemon as unknown as { paneAgents: Map<string, import("../../src/pane-agent.js").PaneAgent> }).paneAgents;
-  if (!paneAgents) throw new Error("daemon.paneAgents was not exposed (skipTelegramStart: true required)");
+  const paneManager = (daemon as unknown as { paneManager: PaneManager }).paneManager;
+  if (!paneManager) throw new Error("daemon.paneManager was not exposed (skipTelegramStart: true required)");
 
   return {
     herdr,
     configDir,
     stateDir,
     paneId: PANE_ID,
-    paneAgents,
+    paneManager,
     stop: daemon.stop,
     async dispatch(update: Update) {
       await tg.bot.handleUpdate(update);
@@ -374,7 +375,7 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
     // returning early for commands). The test is about the
     // callback_query:data handler behaviour, not the /follow command
     // itself.
-    rig.paneAgents.get(PANE_ID)?.enableFollow(Date.now() + 5 * 60_000);
+    rig.paneManager.getPaneAgent(PANE_ID)?.enableFollow(Date.now() + 5 * 60_000);
     for (let i = 0; i < 4; i++) await rig.tick(50);
 
     // The follow subscription is active. Now simulate a click on Follow 5m

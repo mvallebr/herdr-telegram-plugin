@@ -10,7 +10,7 @@ import { cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
-import { startWatcher } from "./watcher.js";
+import { PaneManager } from "./pane-manager.js";
 import { parseActionCallback } from "./keyboards.js";
 import type { DaemonState } from "./types.js";
 import * as path from "node:path";
@@ -32,6 +32,16 @@ export interface StartDaemonOptions {
    * grammy from hitting api.telegram.org. Production leaves this unset.
    */
   customFetch?: typeof fetch;
+}
+
+/** Look up the Telegram thread id currently bound to a given pane id. Returns
+ *  undefined when no binding exists. Reads the in-memory state snapshot so
+ *  callers do not need to know the underlying storage format. */
+function findThreadIdForPane(snapshot: DaemonState, paneId: string): number | undefined {
+  for (const [threadId, mapping] of Object.entries(snapshot.thread_mappings)) {
+    if (mapping.pane_id === paneId) return Number(threadId);
+  }
+  return undefined;
 }
 
 export async function startDaemon(
@@ -109,22 +119,113 @@ export async function startDaemon(
     thread_mappings: rawMappings,
   });
 
-  const paneAgents = new Map<string, PaneAgent>();
-  const getPaneAgent = (paneId: string): PaneAgent | undefined => {
-    let agent = paneAgents.get(paneId);
-    if (!agent) {
-      const mapping = Array.from(map.values()).find((m) => m.pane_id === paneId);
-      if (!mapping) return undefined;
-      const communicator = createAgentCommunicator({ paneId, getAgentInfo, readPane, agentPaths: cfg.agentPaths, opencodeReadOptions: { includeTools: cfg.opencodeIncludeTools, includeThoughts: cfg.opencodeIncludeThoughts }, logger: log });
-      agent = new PaneAgent({ paneId, communicator, config: cfg, emit: (event) => emitPaneEvent(paneId, event) });
-      paneAgents.set(paneId, agent);
-    }
-    return agent;
-  };
+  // The PaneManager owns the PaneAgent cache and the polling loop. The
+  // daemon supplies the factory (so it can inject the per-pane event
+  // emitter) and the Telegram hooks (so the daemon owns all Telegram
+  // side effects).
+  const paneManager = new PaneManager({
+    getAgents,
+    loadState: () => loadState(statePath),
+    saveState: (nextState) => {
+      state = nextState;
+      saveState(statePath, nextState);
+    },
+    agentFactory: (paneId: string) => {
+      const communicator = createAgentCommunicator({
+        paneId,
+        getAgentInfo,
+        readPane,
+        agentPaths: cfg.agentPaths,
+        opencodeReadOptions: {
+          includeTools: cfg.opencodeIncludeTools,
+          includeThoughts: cfg.opencodeIncludeThoughts,
+        },
+        logger: log,
+      });
+      return new PaneAgent({
+        paneId,
+        communicator,
+        config: cfg,
+        emit: (event) => emitPaneEvent(paneId, event),
+      });
+    },
+    intervalMs: 15_000,
+    logger: log,
+    hooks: {
+      onPaneAdded: async (paneId) => {
+        if (!isPaired(state) || !state.authorized_chat_id) return;
+        const panes = getAgents();
+        const pane = panes.find((p) => p.pane_id === paneId);
+        if (!pane) return;
+        try {
+          const threadId = await tg.createForumTopic(state.authorized_chat_id, pane.label);
+          paneManager.restoreTopic(pane.tab_id, threadId, pane.label);
+          // Seed the new topic with the last 5 lines (best-effort).
+          try {
+            const comm = createAgentCommunicator({
+              paneId,
+              getAgentInfo,
+              readPane,
+              agentPaths: cfg.agentPaths,
+              opencodeReadOptions: {
+                includeTools: cfg.opencodeIncludeTools,
+                includeThoughts: cfg.opencodeIncludeThoughts,
+              },
+              logger: log,
+            });
+            const seed = comm.getAgentOutput(5);
+            const trimmed = seed
+              .split("\n")
+              .filter((l) =>
+                !l.includes("context-mode active") &&
+                !l.startsWith("<session_") &&
+                !l.startsWith("</session_") &&
+                !l.match(/^ctx_\w+ >/) &&
+                !l.match(/^[─━═]{20,}/) &&
+                l.length < 300
+              )
+              .join("\n")
+              .trim();
+            if (trimmed) {
+              await tg.sendMessage(state.authorized_chat_id, threadId, `📝 Last output:\n\n${trimmed}`);
+            }
+          } catch {
+            // best-effort seeding
+          }
+        } catch (err: any) {
+          log.warn("onPaneAdded: failed to create topic", { paneId, error: err?.message ?? String(err) });
+        }
+      },
+      onPaneRemoved: async (paneId) => {
+        if (!isPaired(state) || !state.authorized_chat_id) return;
+        const threadId = findThreadIdForPane(state, paneId);
+        if (threadId === undefined) return;
+        try {
+          await tg.deleteForumTopic(state.authorized_chat_id, threadId);
+        } catch (err: any) {
+          log.warn("onPaneRemoved: failed to delete topic", { paneId, threadId, error: err?.message ?? String(err) });
+        }
+      },
+      onPaneRenamed: async (paneId, _oldLabel, newLabel) => {
+        if (!isPaired(state) || !state.authorized_chat_id) return;
+        const threadId = findThreadIdForPane(state, paneId);
+        if (threadId === undefined) return;
+        try {
+          await tg.editForumTopic(state.authorized_chat_id, threadId, newLabel);
+        } catch (err: any) {
+          log.warn("onPaneRenamed: failed to edit topic", { paneId, threadId, error: err?.message ?? String(err) });
+        }
+      },
+    },
+  });
+
+  // Daemon's view of mappings (post-initial-reconcile). Updated by the
+  // manager's poll via the PaneManager.mappings() snapshot.
+  const getPaneAgent = (paneId: string): PaneAgent | undefined => paneManager.getPaneAgent(paneId);
   const emitPaneEvent = (paneId: string, event: OutputEvent): void => {
-    const mappingEntry = Array.from(map.entries()).find(([, m]) => m.pane_id === paneId);
-    if (!mappingEntry || !state.authorized_chat_id) return;
-    const [threadId] = mappingEntry;
+    if (!isPaired(state) || !state.authorized_chat_id) return;
+    const threadId = findThreadIdForPane(state, paneId);
+    if (threadId === undefined) return;
     const text = event.type === "working" ? event.text
       : event.type === "delta" ? event.text
       : event.reason === "aborted" ? `🛑 Stopped.\n\n${event.text}` : `✅ ${event.text}`;
@@ -141,7 +242,7 @@ export async function startDaemon(
     follows_default_minutes: cfg.followTimeoutMinutes,
     saveMappings: () => {
       const raw: DaemonState["thread_mappings"] = {};
-      for (const [tid, m] of deps.map.entries()) raw[tid] = m;
+      for (const [tid, m] of paneManager.mappings().entries()) raw[tid] = m;
       saveState(statePath, { ...state, thread_mappings: raw });
     },
   };
@@ -205,36 +306,15 @@ export async function startDaemon(
     }
   }
 
-  // Lazy-start the watcher: handlers like /pair may need to start it
+  // Lazy-start the PaneManager: handlers like /pair may need to start it
   // after the daemon initially launched unpaired.
-  let watcherStarted = false;
-  let watcherController = new AbortController();
-  const saveStateCallback = () => {
-    const raw: DaemonState["thread_mappings"] = {};
-    for (const [tid, m] of deps.map.entries()) raw[tid] = m;
-    saveState(statePath, { ...state, thread_mappings: raw });
-  };
-  function maybeStartWatcher() {
-    if (watcherStarted) return;
+  let paneManagerStarted = false;
+  function maybeStartPaneManager() {
+    if (paneManagerStarted) return;
     if (!isPaired(state) || !state.authorized_chat_id) return;
-    watcherStarted = true;
-    startWatcher(
-      state.authorized_chat_id,
-      tg,
-      state,
-      saveStateCallback,
-      15_000,
-      watcherController.signal,
-      {
-        ...deps,
-        agentPaths: cfg.agentPaths,
-        opencodeReadOptions: {
-          includeTools: cfg.opencodeIncludeTools,
-          includeThoughts: cfg.opencodeIncludeThoughts,
-        },
-      }
-    );
-    log.info("watcher: lazily started after pair/reconcile");
+    paneManagerStarted = true;
+    paneManager.start();
+    log.info("paneManager: lazily started after pair/reconcile");
   }
 
   // Catch-all message handler (highest priority) for commands that must always work
@@ -275,9 +355,9 @@ export async function startDaemon(
         deps.map.clear();
         deps.chatId = 0;
         deps.knownTopics = state.known_topics;
-        deps.stopWatcher?.();
-        watcherStarted = false;
-        watcherController = new AbortController();
+        paneManager.stop();
+        paneManager.markUnpaired();
+        paneManagerStarted = false;
         await ctx.reply(`Unpaired. Deleted ${deleted} topic(s). Send /pair to re-authorize.`);
       } catch (err: any) {
         log.error("unpair failed", { error: err.message });
@@ -317,7 +397,7 @@ export async function startDaemon(
       if (result?.created.length) parts.push(`Auto-created: ${result.created.join(", ")}`);
       if (result?.failed.length) parts.push(`Could not create (bind manually with /bind): ${result.failed.join(", ")}`);
       await ctx.reply(parts.join("\n"));
-      maybeStartWatcher();
+      maybeStartPaneManager();
       return;
     }
     if (text.startsWith("/reconcile")) {
@@ -648,18 +728,21 @@ export async function startDaemon(
   }
   log.info("Daemon started", { paired: isPaired(state), panes: map.size });
 
-  maybeStartWatcher();
-  deps.stopWatcher = () => watcherController.abort();
+  maybeStartPaneManager();
+  deps.stopWatcher = () => paneManager.stop();
 
   const result: { stop: () => Promise<void> } & Record<string, unknown> = {
-    stop: () => tg.stop(),
+    stop: async () => {
+      paneManager.stop();
+      await tg.stop();
+    },
   };
   // Tests using skipTelegramStart: true need to dispatch updates to the
   // daemon's bot instance. Expose it under a non-standard key so the
   // production return type stays { stop }.
   if (opts.skipTelegramStart) {
     result.tg = tg;
-    result.paneAgents = paneAgents;
+    result.paneManager = paneManager;
   }
   return result;
 }
