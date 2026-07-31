@@ -112,7 +112,23 @@ if (cmd === "agent") {
   const sub = args[1];
   if (sub === "list") {
     const s = readState();
-    const agents = Object.entries(s.agents).map(([pane_id, a]) => ({ pane_id, agent_status: a.status, agent: "pi" }));
+    // Match the real herdr 'agent list' shape: each agent entry carries
+    // its tab_id, workspace_id, foreground_cwd so getAgents() can resolve
+    // labels via the tab list and PaneManager gets the right tab_id.
+    // The previous version omitted these fields, which forced getAgents()
+    // to fall back to '?' for every label and 'undefined' for tab_id,
+    // hiding the wrong-tab/empty-label regression in onPaneAdded tests.
+    const agents = Object.entries(s.agents).map(([pane_id, a]) => {
+      const tab = s.tabs.find((t) => t.pane_id === pane_id);
+      return {
+        pane_id,
+        agent_status: a.status,
+        agent: "pi",
+        tab_id: tab?.tab_id ?? "t1",
+        workspace_id: tab?.workspace_id ?? "w1",
+        foreground_cwd: "/tmp",
+      };
+    });
     process.stdout.write(JSON.stringify({ result: { agents }, type: "agent_list" }));
     process.exit(0);
   }
@@ -232,6 +248,14 @@ export class MockHerdr {
 
   addTab(tab: TabSpec): void {
     this.state.tabs.push(tab);
+    this.persist();
+  }
+
+  /** Register a new agent. Mirrors `addTab` so tests can simulate a new
+   *  pane appearing mid-session (pane + tab + agent must all show up for
+   *  the daemon to discover it on the next poll). */
+  addAgent(paneId: string, status: AgentState["status"] = "idle"): void {
+    this.state.agents[paneId] = { status };
     this.persist();
   }
 

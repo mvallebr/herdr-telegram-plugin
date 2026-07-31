@@ -1,12 +1,17 @@
 import { Bot, type Context } from "grammy";
 import type { PaneInfo, ThreadMapping } from "./types.js";
 import { getAgents, sendText, sendEscape } from "./herdr-client.js";
-import { findMapping } from "./mapping.js";
 import { isPaired } from "./pairing.js";
 import { loadState, saveState } from "./state.js";
 import { stripStatusBar, cleanPaneOutput } from "./output-format.js";
 import type { PaneAgent } from "./pane-agent.js";
 import type { AgentCommunicator } from "./agent-sessions.js";
+
+/** Look up the ThreadMapping for a Telegram thread id. Pure local read; the
+ *  watcher/reconcile logic that used to live in `mapping.ts` is now owned
+ *  by `PaneManager`. */
+const findMapping = (threadId: number, map: Map<number, ThreadMapping>): ThreadMapping | undefined =>
+  map.get(threadId);
 
 export function formatAgentList(panes: PaneInfo[], map: Map<number, ThreadMapping>): string {
   if (panes.length === 0) return "No agents active.";
