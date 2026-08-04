@@ -194,6 +194,13 @@ export class ObserveLoopController {
   }
 
   /**
+   * Whether the deadline gate is currently armed.
+   */
+  hasDeadline(): boolean {
+    return this.deadline !== null;
+  }
+
+  /**
    * A user message arrived during this turn. Toggles the idle gate on
    * so the loop drains once the agent settles — even if a follow
    * deadline is armed. Idempotent: calling twice is the same as once.

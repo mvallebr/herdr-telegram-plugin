@@ -21,6 +21,7 @@ import { startDaemon } from "../../src/daemon.js";
 import { resetHerdrBinCache } from "../../src/herdr-client.js";
 import { TelegramClient } from "../../src/telegram-client.js";
 import { PaneManager } from "../../src/pane-manager.js";
+import { finalKeyboard, workingKeyboard } from "../../src/keyboards.js";
 import { MockHerdr } from "./herdr-mock.js";
 
 const PANE_ID = "w1:p1";
@@ -338,6 +339,17 @@ describe("E2E: turn flow (mocked herdr, real grammy)", () => {
 
     const finals = capture.sent.filter((m) => m.text.startsWith("✅"));
     expect(finals).toHaveLength(1);
+    // Working and delta events use the working-phase controls; the final
+    // event switches to the follow controls.
+    const progressMessages = capture.sent.filter((m) =>
+      m.text.startsWith("⏳ Working") ||
+      (m.text.includes("agent response") && !m.text.startsWith("✅")),
+    );
+    expect(progressMessages.length).toBeGreaterThan(0);
+    for (const message of progressMessages) {
+      expect(message.reply_markup).toEqual(workingKeyboard(THREAD_ID, false));
+    }
+    expect(finals[0].reply_markup).toEqual(finalKeyboard(THREAD_ID, false));
     // The Final must contain the agent's last delta, not the raw pane.
     expect(finals[0].text).toContain("agent response part 2");
   });

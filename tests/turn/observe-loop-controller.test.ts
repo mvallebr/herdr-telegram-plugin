@@ -143,6 +143,20 @@ function makeEnv(opts: {
   };
 }
 
+describe("ObserveLoopController — deadline state", () => {
+  it("reports whether a deadline is currently armed", () => {
+    const env = makeEnv({ snapshots: ["stable"] });
+
+    expect(env.controller.hasDeadline()).toBe(false);
+
+    env.controller.updateDeadline(500);
+    expect(env.controller.hasDeadline()).toBe(true);
+
+    env.controller.updateDeadline(null);
+    expect(env.controller.hasDeadline()).toBe(false);
+  });
+});
+
 describe("ObserveLoopController — baseline seeding", () => {
   it("does not emit a delta on the first poll (baseline seeds silently)", async () => {
     // Pane already has content when the loop starts. The first poll seeds
