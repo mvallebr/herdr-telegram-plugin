@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -36,6 +36,47 @@ describe("ScrapeReader", () => {
       logger,
     });
     expect(reader.read(100)).toBe("real output");
+  });
+});
+
+describe("Codex reader selection", () => {
+  it("selects codex-jsonl for an id session when its rollout file exists", () => {
+    const home = mkdtempSync(join(tmpdir(), "codex-home-"));
+    const sessions = join(home, ".codex", "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const sessionId = `registry-${Date.now()}`;
+    const rolloutPath = join(sessions, `rollout-${sessionId}.jsonl`);
+    writeFileSync(
+      rolloutPath,
+      JSON.stringify({
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "from rollout" }],
+        },
+      }) + "\n",
+      "utf8",
+    );
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      const reader = createAgentOutputReader({
+        paneId: "w1:p1",
+        agentName: "codex",
+        session: { kind: "id", id: sessionId },
+        readPane: () => "SHOULD NOT BE CALLED",
+        logger,
+      });
+      expect(reader.kind).toBe("codex-jsonl");
+      expect(reader.kind).not.toBe("scrape");
+      expect(reader.read(100)).toContain("from rollout");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
