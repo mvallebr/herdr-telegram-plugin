@@ -96,6 +96,18 @@ the response continues`;
     expect(out).toContain("more response");
   });
 
+  it("removes ANSI escape sequences from retained output", () => {
+    const input = "\x1b[?25l\x1b[32mvisible response\x1b[0m\x1b[?25h";
+    const out = cleanPaneOutput(input);
+    expect(out).toBe("visible response");
+    expect(out).not.toContain("\x1b");
+  });
+
+  it("removes vertical borders at the right edge of lines", () => {
+    const input = "┃ useful response │\n┃ another response▕";
+    expect(cleanPaneOutput(input)).toBe("useful response\nanother response");
+  });
+
   it("preserves lines with common emoji (🚀, ✅, 🎉)", () => {
     const input = "Recebido com sucesso! 🚀 O teste chegou perfeitamente.\nplain line";
     const out = cleanPaneOutput(input);

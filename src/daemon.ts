@@ -10,7 +10,7 @@ import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PaneManager } from "./pane-manager.js";
-import { parseActionCallback } from "./keyboards.js";
+import { finalKeyboard, parseActionCallback, workingKeyboard } from "./keyboards.js";
 import type { DaemonState, ThreadMapping } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -240,7 +240,13 @@ export async function startDaemon(
     const text = event.type === "working" ? event.text
       : event.type === "delta" ? event.text
       : event.reason === "aborted" ? `🛑 Stopped.\n\n${event.text}` : `✅ ${event.text}`;
-    void tg.sendMessage(state.authorized_chat_id, threadId, text).catch((err) => log.error("Pane event delivery failed", { paneId, message: String(err) }));
+    const hasFollow = getPaneAgent(paneId)?.isFollowing() ?? false;
+    // A deadline final may still report follow until the loop clears; this is
+    // an acceptable edge case.
+    const reply_markup = event.type === "final"
+      ? finalKeyboard(threadId, hasFollow)
+      : workingKeyboard(threadId, hasFollow);
+    void tg.sendMessage(state.authorized_chat_id, threadId, text, { reply_markup }).catch((err) => log.error("Pane event delivery failed", { paneId, message: String(err) }));
   };
 
   const deps: CommandDeps = {
