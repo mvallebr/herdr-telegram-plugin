@@ -317,6 +317,11 @@ describe("E2E: /unpair deletes the union of known_topics + thread_mappings", () 
 
     rig.paneManager.poll();
     await rig.paneManager.awaitInflight();
+    // The first empty herdr snapshot is treated as transient/unavailable;
+    // confirm the disappearance with the next poll before pruning mappings.
+    rig.paneManager.poll();
+    rig.paneManager.poll();
+    await rig.paneManager.awaitInflight();
 
     // sync() has already evicted ORPHAN_THREAD_ID from thread_mappings by
     // the time onPaneRemoved runs; the hook must use the captured id instead.

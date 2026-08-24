@@ -852,6 +852,119 @@ describe("PaneManager", () => {
     expect(saveState).toHaveBeenCalledOnce();
   });
 
+  it("queues a replaced mapping for deletion before deduplicating it", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 7;
+    state.thread_mappings = {
+      42: { pane_id: "workspace:pane-1", label: "Old", agent: "pi", created_at: "created" },
+    };
+    const deleted = vi.fn(async (_threadId: number) => undefined);
+    const manager = new PaneManager({
+      getAgents: () => [{ pane_id: "workspace:pane-1", label: "Pane", agent: "pi", tab_id: "tab", workspace_id: "w", status: "idle" }],
+      loadState: () => state, saveState: (next) => Object.assign(state, structuredClone(next)),
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPendingTopicDeletion: async (id, deletion) => { await deleted(id); manager.completeTopicDeletion(id, deletion.chat_id); } },
+    });
+
+    manager.restoreTopic("tab", 84, "Pane");
+    expect(manager.state().pending_topic_deletions?.[42]).toEqual({ pane_id: "workspace:pane-1", chat_id: 7 });
+    manager.poll();
+    await manager.awaitInflight();
+    expect(deleted).toHaveBeenCalledWith(42);
+    expect(manager.state().pending_topic_deletions).toBeUndefined();
+  });
+
+  it("preserves dedup deletion when each load returns a fresh state snapshot", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 7;
+    state.thread_mappings = {
+      42: { pane_id: "workspace:pane-1", label: "Old", agent: "pi", created_at: "created" },
+    };
+    let persisted = structuredClone(state);
+    const deleteTopic = vi.fn(async () => { throw new Error("temporary Telegram failure"); });
+    const manager = new PaneManager({
+      getAgents: () => [{ pane_id: "workspace:pane-1", label: "Pane", agent: "pi", tab_id: "tab", workspace_id: "w", status: "idle" }],
+      loadState: () => structuredClone(persisted),
+      saveState: (next) => { persisted = structuredClone(next); },
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPendingTopicDeletion: async (id, deletion) => {
+        try { await deleteTopic(id); } catch { /* remains retryable */ }
+        // The next poll is the retry; this hook deliberately does not confirm.
+        expect(deletion.chat_id).toBe(7);
+      } },
+    });
+
+    manager.restoreTopic("tab", 84, "Pane");
+    expect(persisted.pending_topic_deletions?.[42]).toEqual({ pane_id: "workspace:pane-1", chat_id: 7 });
+
+    manager.poll();
+    await manager.awaitInflight();
+    manager.poll();
+    await manager.awaitInflight();
+    expect(deleteTopic).toHaveBeenCalledTimes(2);
+    expect(persisted.pending_topic_deletions?.[42]).toBeDefined();
+  });
+
+  it("removes legacy and composite pending keys without confusing same thread ids across chats", () => {
+    const state = emptyState();
+    state.pending_topic_deletions = {
+      "7:42": { pane_id: "pane-a", chat_id: 7 },
+      "8:42": { pane_id: "pane-b", chat_id: 8 },
+    };
+    const manager = new PaneManager({ getAgents: () => [], loadState: () => state, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent });
+
+    manager.completeTopicDeletion(42, 7);
+    expect(manager.state().pending_topic_deletions).toEqual({ "8:42": { pane_id: "pane-b", chat_id: 8 } });
+    manager.completeTopicDeletion(42, 8);
+    expect(manager.state().pending_topic_deletions).toBeUndefined();
+  });
+
+  it("serializes removal behind an in-flight add and a re-add", async () => {
+    const pane: PaneInfo = { pane_id: "pane-lock", label: "Lock", agent: "pi", tab_id: "tab-lock", workspace_id: "w", status: "idle" };
+    let panes: PaneInfo[] = [pane];
+    let release!: () => void;
+    const addGate = new Promise<void>((resolve) => { release = resolve; });
+    const events: string[] = [];
+    const manager = new PaneManager({ getAgents: () => panes, loadState: emptyState, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded: async () => { events.push("add-start"); await addGate; events.push("add-end"); }, onPaneRemoved: () => { events.push("remove"); } },
+    });
+    manager.poll();
+    panes = [];
+    manager.poll();
+    panes = [pane];
+    manager.poll();
+    expect(events).toEqual(["add-start"]);
+    release();
+    await manager.awaitInflight();
+    expect(events).toEqual(["add-start", "add-end", "remove", "add-start", "add-end"]);
+  });
+
+  it("invalidates every observed pane generation when unpaired", () => {
+    const pane: PaneInfo = { pane_id: "pane-unpair-generation", label: "Pane", agent: "pi", tab_id: "tab", workspace_id: "w", status: "idle" };
+    const manager = new PaneManager({ getAgents: () => [pane], loadState: emptyState, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent });
+    manager.poll();
+    const generation = manager.paneAddGeneration(pane.pane_id);
+    expect(manager.isPaneAddCurrent(pane.pane_id, generation)).toBe(true);
+    manager.markUnpaired();
+    expect(manager.isPaneAddCurrent(pane.pane_id, generation)).toBe(false);
+  });
+
+  it("invalidates a cached pane agent generation before clearing the cache", () => {
+    const state = emptyState();
+    const manager = new PaneManager({
+      getAgents: () => [], loadState: () => state, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+    const paneId = "pane-cached-only";
+    manager.getPaneAgent(paneId);
+    const generation = manager.paneAddGeneration(paneId);
+    manager.markUnpaired();
+    expect(manager.isPaneAddCurrent(paneId, generation)).toBe(false);
+  });
+
   it("unpair deletes every bot-owned topic exactly once", async () => {
     const state = emptyState();
     state.authorized_chat_id = 1234;
@@ -1054,6 +1167,76 @@ describe("PaneManager", () => {
     expect(manager.state().authorized_chat_id).toBe(9876);
     expect(saveState).toHaveBeenCalledOnce();
     expect(saveState).toHaveBeenCalledWith(manager.state());
+  });
+
+  it("markPaired reloads paired_at written by the pairing transaction", () => {
+    let persisted = emptyState();
+    const pairingTimestamp = "2026-08-24T22:00:00.000Z";
+    let saved!: DaemonState;
+    const manager = new PaneManager({
+      getAgents: () => [],
+      // Return independent snapshots: a shared object would make this a
+      // false positive even if markPaired saved its stale constructor state.
+      loadState: () => structuredClone(persisted),
+      saveState: (next) => { saved = structuredClone(next); persisted = structuredClone(next); },
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    // Model updatePairing's separate transaction after construction.
+    persisted = { ...structuredClone(persisted), authorized_chat_id: 42, paired_at: pairingTimestamp };
+    manager.markPaired(42);
+    expect(saved.paired_at).toBe(pairingTimestamp);
+    expect(saved.paired_at).not.toBeNull();
+  });
+
+  it("rejects a stale add after unpair and allows only one topic on reentry", async () => {
+    const pane: PaneInfo = { pane_id: "pane-reentry", label: "Reentry", agent: "pi", tab_id: "tab-reentry", workspace_id: "w", status: "idle" };
+    let panes: PaneInfo[] = [pane];
+    let release!: () => void;
+    const pendingAdd = new Promise<void>((resolve) => { release = resolve; });
+    const createdTopics: number[] = [];
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: {
+        onPaneAdded: async (paneId) => {
+          const generation = manager.paneAddGeneration(paneId);
+          await pendingAdd;
+          if (!manager.isPaneAddCurrent(paneId, generation)) return;
+          createdTopics.push(createdTopics.length + 1);
+          manager.restoreTopic(pane.tab_id, createdTopics.at(-1)!, pane.label);
+        },
+      },
+    });
+
+    manager.poll();
+    manager.markUnpaired();
+    manager.markPaired(7);
+    panes = [pane];
+    manager.poll();
+    release();
+    await manager.awaitInflight();
+
+    expect(createdTopics).toHaveLength(1);
+    expect(manager.mappings()).toEqual(new Map([[1, expect.objectContaining({ pane_id: pane.pane_id })]]));
+  });
+
+  it("bounds confirmed deletion memory and allows evicted keys to retry", async () => {
+    const manager = new PaneManager({
+      getAgents: () => [], loadState: emptyState, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+    const deleteTopic = vi.fn(async () => undefined);
+
+    for (let threadId = 1; threadId <= 256; threadId++) {
+      expect(await manager.deleteTopicOnce(threadId, deleteTopic, 9)).toBe(true);
+    }
+    // The bounded cache retains recent confirmations but cannot grow forever.
+    expect(await manager.deleteTopicOnce(256, deleteTopic, 9)).toBe(false);
+    expect(await manager.deleteTopicOnce(1, deleteTopic, 9)).toBe(true);
+    expect(deleteTopic).toHaveBeenCalledTimes(257);
   });
 
   it("markPaired after markUnpaired restores getPaneAgent (regression for /pair after /unpair)", async () => {
@@ -1396,5 +1579,20 @@ describe("PaneManager", () => {
     panes = [{ pane_id: "workspace:persisted", label: "Persisted", agent: "pi", tab_id: "workspace:t", workspace_id: "workspace", status: "idle" }];
     expect(manager.poll().added).toEqual([]);
     expect(manager.mappings().get(42)?.pane_id).toBe("workspace:persisted");
+  });
+
+  it("prunes on the second confirmed empty snapshot when configured for two", () => {
+    const state = emptyState();
+    state.thread_mappings = { 42: { pane_id: "persisted", label: "Persisted", agent: "pi", created_at: "created" } };
+    let panes: PaneInfo[] = [];
+    const manager = new PaneManager({
+      getAgents: () => panes, loadState: () => structuredClone(state), saveState: (next) => Object.assign(state, structuredClone(next)),
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      emptySnapshotConfirmations: 2,
+    });
+    manager.poll();
+    expect(manager.mappings().get(42)).toBeDefined();
+    manager.poll();
+    expect(manager.mappings()).toEqual(new Map());
   });
 });
