@@ -84,6 +84,60 @@ describe("PaneManager", () => {
     });
   });
 
+  it("adopts persisted mappings on the first sync without reporting them as added", () => {
+    const state = emptyState();
+    state.thread_mappings = {
+      42: {
+        pane_id: "workspace:persisted",
+        label: "Old Persisted Label",
+        agent: "pi",
+        created_at: "created",
+      },
+    };
+    state.known_tabs = {
+      "workspace:tab-persisted": { label: "Old Persisted Label", thread_id: 42 },
+    };
+    const persisted: PaneInfo = {
+      pane_id: "workspace:persisted",
+      label: "Persisted Label",
+      agent: "pi",
+      tab_id: "workspace:tab-persisted",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const fresh: PaneInfo = {
+      pane_id: "workspace:fresh",
+      label: "Fresh Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-fresh",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const onPaneAdded = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [persisted, fresh],
+      loadState: () => state,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded },
+    });
+
+    const result = manager.poll();
+
+    expect(result.added).toEqual([fresh.pane_id]);
+    expect(onPaneAdded).toHaveBeenCalledOnce();
+    expect(onPaneAdded).toHaveBeenCalledWith(fresh.pane_id);
+    expect(manager.mappings().get(42)).toMatchObject({
+      pane_id: persisted.pane_id,
+      label: persisted.label,
+      agent: persisted.agent,
+    });
+    expect(manager.state().known_tabs?.[persisted.tab_id]).toEqual({
+      label: persisted.label,
+      thread_id: 42,
+    });
+  });
+
   it("sync removes panes that are no longer present", () => {
     const pane: PaneInfo = {
       pane_id: "workspace:pane-1",
@@ -543,6 +597,12 @@ describe("PaneManager", () => {
         agent: pane.agent,
         created_at: "created",
       },
+      84: {
+        pane_id: pane.pane_id,
+        label: pane.label,
+        agent: pane.agent,
+        created_at: "created",
+      },
     };
     const onPaneRemoved = vi.fn();
     const manager = new PaneManager({
@@ -562,7 +622,33 @@ describe("PaneManager", () => {
     runScheduledSync();
 
     expect(onPaneRemoved).toHaveBeenCalledOnce();
-    expect(onPaneRemoved).toHaveBeenCalledWith("workspace:pane-removed");
+    expect(onPaneRemoved).toHaveBeenCalledWith("workspace:pane-removed", [42, 84]);
+  });
+
+  it("calls onPaneRemoved without a thread id when the pane has no mapping", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-unmapped",
+      label: "Unmapped Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-unmapped",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    const onPaneRemoved = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => panes,
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneRemoved },
+    });
+
+    manager.poll();
+    panes = [];
+    manager.poll();
+
+    expect(onPaneRemoved).toHaveBeenCalledWith("workspace:pane-unmapped", undefined);
   });
 
   it("calls onPaneRenamed with the pane id and preserved labels", () => {
@@ -1007,6 +1093,33 @@ describe("PaneManager", () => {
     expect(manager.state().authorized_chat_id).toBe(1234);
   });
 
+  it("reports each pane once when pairing again after unpair cleared state", () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-repair",
+      label: "Repair Pane",
+      agent: "pi",
+      tab_id: "workspace:tab-repair",
+      workspace_id: "workspace",
+      status: "idle",
+    };
+    const onPaneAdded = vi.fn();
+    const manager = new PaneManager({
+      getAgents: () => [pane],
+      loadState: emptyState,
+      saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded },
+    });
+
+    manager.markUnpaired();
+    manager.markPaired(1234);
+    const result = manager.poll();
+
+    expect(result.added).toEqual([pane.pane_id]);
+    expect(onPaneAdded).toHaveBeenCalledOnce();
+    expect(onPaneAdded).toHaveBeenCalledWith(pane.pane_id);
+  });
+
   it("markPaired is idempotent — calling it twice does not produce duplicate agents", () => {
     const agentFactory = vi.fn(
       (paneId: string) => ({ paneId }) as unknown as PaneAgent,
@@ -1198,5 +1311,90 @@ describe("PaneManager", () => {
       await firstSettled;
       await manager.awaitInflight();
     });
+  });
+
+  it("persists removed topic ids until deletion is confirmed and retries them", async () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:p-durable", label: "Durable", agent: "pi",
+      tab_id: "workspace:t-durable", workspace_id: "workspace", status: "idle",
+    };
+    const state = emptyState();
+    state.authorized_chat_id = 7;
+    state.thread_mappings = { 42: { pane_id: pane.pane_id, label: pane.label, agent: pane.agent, created_at: "created" } };
+    let panes: PaneInfo[] = [pane];
+    const deleteTopic = vi.fn(async () => { throw new Error("temporary Telegram failure"); });
+    const manager = new PaneManager({
+      getAgents: () => panes, loadState: () => state, saveState: (next) => Object.assign(state, structuredClone(next)),
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneRemoved: async (_id, ids) => { for (const id of ids ?? []) await deleteTopic(7, id); } },
+    });
+
+    manager.poll();
+    panes = [];
+    manager.poll();
+    await manager.awaitInflight();
+    expect(manager.state().pending_topic_deletions?.[42]).toMatchObject({ pane_id: pane.pane_id, chat_id: 7 });
+
+    await manager.unpair({ deleteTopic });
+    expect(deleteTopic).toHaveBeenCalledWith(7, 42);
+  });
+
+  it("keeps a known topic in the durable deletion queue when unpair deletion fails", async () => {
+    const state = emptyState();
+    state.authorized_chat_id = 7;
+    state.known_topics = { 99: { name: "orphan", created_at: "created" } };
+    let persisted: DaemonState | undefined;
+    const manager = new PaneManager({
+      getAgents: () => [], loadState: () => state,
+      saveState: (next) => { persisted = structuredClone(next); },
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+    });
+
+    await manager.unpair({ deleteTopic: async () => { throw new Error("temporary failure"); } });
+
+    expect(persisted?.pending_topic_deletions?.[99]).toEqual({ pane_id: "unknown", chat_id: 7 });
+    expect(manager.state().pending_topic_deletions?.[99]).toEqual({ pane_id: "unknown", chat_id: 7 });
+  });
+
+  it("invalidates an add generation when a pane disappears before its hook settles", async () => {
+    const pane: PaneInfo = {
+      pane_id: "workspace:pane-generation", label: "Generation", agent: "pi",
+      tab_id: "workspace:tab-generation", workspace_id: "workspace", status: "idle",
+    };
+    let panes: PaneInfo[] = [pane];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let generation = -1;
+    const manager = new PaneManager({
+      getAgents: () => panes, loadState: emptyState, saveState: () => undefined,
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded: async (paneId) => {
+        generation = manager.paneAddGeneration(paneId);
+        await blocked;
+      } },
+    });
+
+    manager.poll();
+    panes = [];
+    manager.poll();
+    expect(manager.isPaneAddCurrent(pane.pane_id, generation)).toBe(false);
+    release();
+    await manager.awaitInflight();
+  });
+
+  it("does not discard persisted mappings on an empty first snapshot", () => {
+    const state = emptyState();
+    state.thread_mappings = { 42: { pane_id: "workspace:persisted", label: "Persisted", agent: "pi", created_at: "created" } };
+    let panes: PaneInfo[] = [];
+    const manager = new PaneManager({
+      getAgents: () => panes, loadState: () => state, saveState: (next) => Object.assign(state, structuredClone(next)),
+      agentFactory: (paneId) => ({ paneId }) as unknown as PaneAgent,
+      hooks: { onPaneAdded: vi.fn() },
+    });
+
+    expect(manager.poll()).toEqual({ added: [], removed: [], renamed: [] });
+    panes = [{ pane_id: "workspace:persisted", label: "Persisted", agent: "pi", tab_id: "workspace:t", workspace_id: "workspace", status: "idle" }];
+    expect(manager.poll().added).toEqual([]);
+    expect(manager.mappings().get(42)?.pane_id).toBe("workspace:persisted");
   });
 });

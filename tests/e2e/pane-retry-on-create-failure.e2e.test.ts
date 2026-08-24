@@ -26,6 +26,7 @@
  *      re-emitted the pane and the daemon successfully retried.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { Update } from "grammy";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -135,6 +136,7 @@ interface TestRig {
   paneManager: PaneManager;
   stop: () => Promise<void>;
   tick: (ms?: number) => Promise<void>;
+  bot: { handleUpdate: (update: Update) => Promise<unknown> };
 }
 
 async function setupRig(failureState: FailureState): Promise<TestRig> {
@@ -217,6 +219,7 @@ async function setupRig(failureState: FailureState): Promise<TestRig> {
     configDir,
     stateDir,
     paneManager,
+    bot: tg.bot,
     stop: daemon.stop,
     async tick(ms = 60) {
       await new Promise((r) => setTimeout(r, ms));
@@ -310,5 +313,53 @@ describe("E2E: pane retry when createForumTopic fails transiently", () => {
     rig.paneManager.poll();
     for (let i = 0; i < 4; i++) await rig.tick(50);
     expect(failureState.attempts.get(NEW_LABEL)).toBe(callsBefore);
+  });
+
+  it("refreshes command routing when a removed pane re-enters with a new topic", async () => {
+    // The lifecycle hook deletes the old topic and creates a replacement. The
+    // replacement must be copied into the command-side map, not merely state.
+    rig.herdr.setState({
+      panes: {},
+      agents: {},
+      tabs: [],
+      read_counts: {},
+      list_count: 0,
+    });
+    rig.paneManager.poll();
+    await rig.paneManager.awaitInflight();
+
+    rig.herdr.addTab({
+      tab_id: "w1:t1",
+      workspace_id: "w1",
+      pane_id: PANE_ID,
+      label: "Echo Re-entered",
+      agent: "pi",
+    });
+    rig.herdr.addAgent(PANE_ID, "idle");
+    rig.paneManager.poll();
+    await rig.paneManager.awaitInflight();
+
+    const replacement = [...rig.paneManager.mappings().entries()].find(
+      ([, mapping]) => mapping.pane_id === PANE_ID,
+    );
+    expect(replacement).toBeDefined();
+    const [newThreadId] = replacement!;
+
+    await rig.bot.handleUpdate({
+      update_id: 9001,
+      message: {
+        message_id: 9001,
+        message_thread_id: newThreadId,
+        chat: { id: CHAT_ID, type: "private" },
+        from: { id: CHAT_ID, is_bot: false, first_name: "Test" },
+        text: "/last",
+        entities: [{ offset: 0, length: 5, type: "bot_command" }],
+        date: Math.floor(Date.now() / 1000),
+      },
+    } as Update);
+
+    expect(sends).toEqual(expect.arrayContaining([
+      expect.objectContaining({ text: expect.stringContaining("Echo Re-entered") }),
+    ]));
   });
 });

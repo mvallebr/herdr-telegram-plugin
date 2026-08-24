@@ -19,6 +19,11 @@ export interface TopicInfo {
   name: string;
 }
 
+export interface PendingTopicDeletion {
+  pane_id: string;
+  chat_id: number;
+}
+
 export interface DaemonState {
   authorized_chat_id: number | null;
   paired_at: string | null;
@@ -29,6 +34,8 @@ export interface DaemonState {
   /** Tabs the bot has observed. Maps tab_id -> { label, thread_id }.
    *  Used by the watcher to detect new/closed/renamed tabs. */
   known_tabs?: Record<string, { label: string; thread_id: number }>;
+  /** Bot-owned topics whose deletion has not yet been confirmed by Telegram. */
+  pending_topic_deletions?: Record<number, PendingTopicDeletion>;
   /** Recently handled Telegram update ids, retained to prevent replay after restart. */
   processed_update_ids?: number[];
 }
