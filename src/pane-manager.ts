@@ -1,6 +1,6 @@
 import type { Logger } from "./logger.js";
 import type { PaneAgent } from "./pane-agent.js";
-import type { DaemonState, PaneInfo, ThreadMapping } from "./types.js";
+import type { DaemonState, PaneInfo, PendingTopicDeletion, ThreadMapping } from "./types.js";
 
 /**
  * Lifecycle hooks fired by `poll()` after `sync()` classifies each pane as
@@ -13,13 +13,15 @@ import type { DaemonState, PaneInfo, ThreadMapping } from "./types.js";
  * Returning `void` is allowed for hooks that complete synchronously.
  */
 export interface PaneManagerHooks {
-  onPaneAdded?: (paneId: string) => Promise<unknown> | void;
-  onPaneRemoved?: (paneId: string) => Promise<unknown> | void;
+  onPaneAdded?: (paneId: string, generation?: number) => Promise<unknown> | void;
+  /** The second argument contains every topic mapping removed during this sync, when any existed. */
+  onPaneRemoved?: (paneId: string, threadIds?: number[]) => Promise<unknown> | void;
   onPaneRenamed?: (
     paneId: string,
     oldLabel: string,
     newLabel: string,
   ) => Promise<unknown> | void;
+  onPendingTopicDeletion?: (threadId: number, deletion: PendingTopicDeletion) => Promise<unknown> | void;
 }
 
 export interface SyncResult {
@@ -63,6 +65,7 @@ export interface PaneManagerDeps {
   logger?: Logger;
   intervalMs?: number;
   scheduleRepeating?: (fn: () => void, intervalMs: number) => () => void;
+  onStateChanged?: () => void;
 }
 
 const scheduleRepeating = (fn: () => void, intervalMs: number): (() => void) => {
@@ -98,9 +101,14 @@ export class PaneManager {
    * and read as zero.
    */
   private readonly inFlightHooks = new Set<Promise<unknown>>();
+  /** Thread mappings evicted by the most recent sync, retained for removal hooks. */
+  private readonly removedThreadIds = new Map<string, number[]>();
+  private readonly paneGenerations = new Map<string, number>();
+  private readonly inFlightDeletions = new Set<number>();
   private currentState: DaemonState;
   private stopRepeating?: () => void;
   private paneAgentsAvailable = true;
+  private hasPolled = false;
 
   constructor(private readonly deps: PaneManagerDeps) {
     this.currentState = deps.loadState();
@@ -153,12 +161,20 @@ export class PaneManager {
    */
   poll(): SyncResult {
     this.currentState = this.deps.loadState();
+    const pendingBeforeSync = new Set(Object.keys(this.currentState.pending_topic_deletions ?? {}));
     const result = this.sync();
+    for (const threadId of pendingBeforeSync) {
+      const deletion = this.currentState.pending_topic_deletions?.[Number(threadId)];
+      if (deletion) {
+        this.track(this.deps.hooks?.onPendingTopicDeletion?.(Number(threadId), deletion));
+      }
+    }
     for (const paneId of result.added) {
       this.track(this.deps.hooks?.onPaneAdded?.(paneId));
     }
     for (const paneId of result.removed) {
-      this.track(this.deps.hooks?.onPaneRemoved?.(paneId));
+      const threadIds = this.removedThreadIds.get(paneId);
+      this.track(this.deps.hooks?.onPaneRemoved?.(paneId, threadIds));
     }
     for (const paneId of result.renamed) {
       const labels = this.renamedLabels.get(paneId);
@@ -221,6 +237,7 @@ export class PaneManager {
 
   sync(): SyncResult {
     this.renamedLabels.clear();
+    this.removedThreadIds.clear();
     const panes = this.deps.getAgents();
     const knownTabs = this.currentState.known_tabs ?? {};
     this.currentState.known_tabs = knownTabs;
@@ -231,6 +248,18 @@ export class PaneManager {
         mapping,
       ]),
     );
+    const pending = this.currentState.pending_topic_deletions ?? {};
+    // An empty first snapshot is also what herdr exposes during a transient
+    // restart/unavailability. Never turn that unconfirmed snapshot into data
+    // loss; a later non-empty snapshot can adopt these mappings normally.
+    const preserveUnconfirmedEmpty = !this.hasPolled && panes.length === 0 && mappings.size > 0;
+    const preserveKnownTabsEmpty = !this.hasPolled && panes.length === 0 &&
+      (mappings.size > 0 || Object.keys(knownTabs).length > 0);
+    if (preserveUnconfirmedEmpty || preserveKnownTabsEmpty) {
+      for (const mapping of mappings.values()) this.seenPanes.add(mapping.pane_id);
+      this.hasPolled = true;
+      return { added: [], removed: [], renamed: [] };
+    }
     const currentPaneIds = new Set(panes.map((pane) => pane.pane_id));
     const added: string[] = [];
     const removed: string[] = [];
@@ -244,11 +273,15 @@ export class PaneManager {
       const threadId = existingEntry?.[0] ?? knownTab?.thread_id;
       const oldLabel = existingEntry?.[1].label ?? knownTab?.label;
 
-      // First time this pane id is seen, emit `added` and remember it.
-      // Subsequent syncs are no-ops for `added` until the pane leaves and
+      // A mapping loaded from state means this pane was already paired before
+      // this manager instance started. Adopt it into the in-memory seen set,
+      // but do not emit `added`: doing so would make the daemon create a
+      // duplicate Telegram topic after every restart. Panes without a
+      // persisted mapping are genuinely new and still go through the add
+      // hook. Subsequent syncs are no-ops for `added` until a pane leaves and
       // drops out of the seen set.
       if (!this.seenPanes.has(pane.pane_id)) {
-        added.push(pane.pane_id);
+        if (threadId === undefined) added.push(pane.pane_id);
         this.seenPanes.add(pane.pane_id);
       }
       if (oldLabel !== undefined && oldLabel !== pane.label) {
@@ -276,6 +309,7 @@ export class PaneManager {
     // reappearance is reported as a fresh `added` again.
     for (const paneId of [...this.seenPanes]) {
       if (!currentPaneIds.has(paneId)) {
+        this.paneGenerations.set(paneId, (this.paneGenerations.get(paneId) ?? 0) + 1);
         removed.push(paneId);
         this.seenPanes.delete(paneId);
       }
@@ -285,6 +319,17 @@ export class PaneManager {
     // of `removed` (driven by the seen set) so the two lists stay in sync.
     for (const [threadId, mapping] of [...mappings]) {
       if (!currentPaneIds.has(mapping.pane_id)) {
+        // Capture the id before evicting the mapping. poll() emits the hook
+        // after this cleanup, so looking in currentState from the hook would
+        // otherwise lose the only reference to the Telegram topic.
+        const removedThreadIds = this.removedThreadIds.get(mapping.pane_id) ?? [];
+        removedThreadIds.push(threadId);
+        this.removedThreadIds.set(mapping.pane_id, removedThreadIds);
+        pending[threadId] ??= {
+          pane_id: mapping.pane_id,
+          chat_id: this.currentState.authorized_chat_id ?? 0,
+        };
+        this.currentState.pending_topic_deletions = pending;
         mappings.delete(threadId);
       }
     }
@@ -295,6 +340,8 @@ export class PaneManager {
 
     this.currentState.thread_mappings = Object.fromEntries(mappings);
     this.deps.saveState(this.currentState);
+    this.deps.onStateChanged?.();
+    this.hasPolled = true;
     return { added, removed, renamed };
   }
 
@@ -351,14 +398,37 @@ export class PaneManager {
     for (const threadId of Object.keys(this.currentState.thread_mappings)) {
       threadIds.add(Number(threadId));
     }
+    for (const threadId of Object.keys(this.currentState.pending_topic_deletions ?? {})) {
+      threadIds.add(Number(threadId));
+    }
 
     let deleted = 0;
     if (chatId !== null) {
       for (const threadId of threadIds) {
         try {
-          await args.deleteTopic(chatId, threadId);
+          const pending = this.currentState.pending_topic_deletions?.[threadId];
+          if (!pending) {
+            const mapping = this.currentState.thread_mappings[threadId];
+            this.currentState.pending_topic_deletions ??= {};
+            this.currentState.pending_topic_deletions[threadId] = {
+              pane_id: mapping?.pane_id ?? "unknown",
+              chat_id: chatId,
+            };
+          }
+          await args.deleteTopic(pending?.chat_id ?? chatId, threadId);
           deleted += 1;
-        } catch {
+          this.removePendingDeletion(threadId);
+        } catch (err) {
+          // Telegram reports an already removed topic as an error. It is
+          // nevertheless a successful end state for our durable queue.
+          if (this.isMissingTopicError(err)) {
+            this.removePendingDeletion(threadId);
+          } else {
+            // The id was not previously in the durable queue (for example it
+            // came only from known_topics). Persist the materialized entry so
+            // a failed unpair cannot lose the topic after markUnpaired.
+            this.deps.saveState(this.currentState);
+          }
           this.deps.logger?.warn("topic deletion failed during unpair", {
             threadId,
           });
@@ -370,6 +440,10 @@ export class PaneManager {
     return { deleted };
   }
 
+  private isMissingTopicError(err: unknown): boolean {
+    return /TOPIC_ID_INVALID|message thread.*not found|topic.*not found/i.test(String(err));
+  }
+
   markUnpaired(): void {
     this.paneAgents.clear();
     this.paneAgentsAvailable = false;
@@ -379,6 +453,9 @@ export class PaneManager {
     this.currentState.thread_mappings = {};
     this.currentState.known_topics = {};
     this.currentState.known_tabs = {};
+    if (Object.keys(this.currentState.pending_topic_deletions ?? {}).length === 0) {
+      delete this.currentState.pending_topic_deletions;
+    }
     delete this.currentState.processed_update_ids;
     this.deps.saveState(this.currentState);
   }
@@ -429,6 +506,46 @@ export class PaneManager {
     this.seenPanes.delete(paneId);
   }
 
+  isPaneAddCurrent(paneId: string, generation: number): boolean {
+    return (this.paneGenerations.get(paneId) ?? 0) === generation && this.seenPanes.has(paneId);
+  }
+
+  paneAddGeneration(paneId: string): number {
+    return this.paneGenerations.get(paneId) ?? 0;
+  }
+
+  async deleteTopicOnce(threadId: number, deleteTopic: (threadId: number) => Promise<void>): Promise<boolean> {
+    if (this.inFlightDeletions.has(threadId)) return false;
+    this.inFlightDeletions.add(threadId);
+    try { await deleteTopic(threadId); return true; } finally { this.inFlightDeletions.delete(threadId); }
+  }
+
+  pendingDeletionsForPane(paneId: string): Array<[number, PendingTopicDeletion]> {
+    return Object.entries(this.currentState.pending_topic_deletions ?? {})
+      .filter(([, deletion]) => deletion.pane_id === paneId)
+      .map(([threadId, deletion]) => [Number(threadId), deletion]);
+  }
+
+  completeTopicDeletion(threadId: number): void {
+    const latest = this.deps.loadState();
+    if (!latest.pending_topic_deletions?.[threadId]) return;
+    delete latest.pending_topic_deletions[threadId];
+    if (Object.keys(latest.pending_topic_deletions).length === 0) {
+      delete latest.pending_topic_deletions;
+    }
+    this.currentState = latest;
+    this.deps.saveState(latest);
+    this.deps.onStateChanged?.();
+  }
+
+  private removePendingDeletion(threadId: number): void {
+    delete this.currentState.pending_topic_deletions?.[threadId];
+    if (this.currentState.pending_topic_deletions &&
+      Object.keys(this.currentState.pending_topic_deletions).length === 0) {
+      delete this.currentState.pending_topic_deletions;
+    }
+  }
+
   /**
    * Record a freshly-created Telegram topic in both `known_tabs` and
    * `thread_mappings`. Called by the daemon after `createForumTopic` succeeds
@@ -437,9 +554,10 @@ export class PaneManager {
    * Persists state immediately so the new mapping survives a restart.
    */
   restoreTopic(tabId: string, threadId: number, label: string): void {
-    const knownTabs = this.currentState.known_tabs ?? {};
+    const latest = this.deps.loadState();
+    const knownTabs = latest.known_tabs ?? {};
     knownTabs[tabId] = { label, thread_id: threadId };
-    this.currentState.known_tabs = knownTabs;
+    latest.known_tabs = knownTabs;
 
     const panes = this.deps.getAgents();
     const pane = panes.find((candidate) => candidate.tab_id === tabId);
@@ -449,7 +567,8 @@ export class PaneManager {
       agent: pane?.agent ?? "unknown",
       created_at: new Date().toISOString(),
     };
-    this.currentState.thread_mappings[threadId] = mapping;
-    this.deps.saveState(this.currentState);
+    latest.thread_mappings[threadId] = mapping;
+    this.currentState = latest;
+    this.deps.saveState(latest);
   }
 }

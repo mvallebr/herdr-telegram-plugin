@@ -122,6 +122,13 @@ export class PaneAgent {
   }
 
   /**
+   * Whether a follow is active (the loop has a deadline armed).
+   */
+  isFollowing(): boolean {
+    return this.loop !== null && this.loop.hasDeadline();
+  }
+
+  /**
    * A user message arrived. Always forwards the input to the pane.
    * If no loop is active, starts one with deadline=null and
    * waitUntilIdle=true (idle-based stop). If a loop is already active

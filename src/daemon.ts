@@ -10,7 +10,7 @@ import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
 import { PaneManager } from "./pane-manager.js";
-import { parseActionCallback } from "./keyboards.js";
+import { finalKeyboard, parseActionCallback, workingKeyboard } from "./keyboards.js";
 import type { DaemonState, ThreadMapping } from "./types.js";
 import * as path from "node:path";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -105,16 +105,27 @@ export async function startDaemon(
   // side effects).
   //
   // We seed the in-memory `deps.map` from the manager's initial snapshot of
-  // thread_mappings. Any new pane discovered on the next `poll()` will be
-  // routed through the `onPaneAdded` hook, which creates the Telegram topic
-  // and writes the mapping back via `paneManager.restoreTopic`. No startup
-  // reconcile is needed: the manager runs `poll()` immediately on `start()`.
+  // thread_mappings. On its first `poll()`, PaneManager adopts panes that
+  // already have persisted mappings without firing `onPaneAdded`; genuinely
+  // new panes are routed through that hook, which creates the Telegram topic
+  // and writes the mapping back via `paneManager.restoreTopic`.
   const initialMappings = new Map<number, ThreadMapping>(
     Object.entries(state.thread_mappings).map(([threadId, mapping]) => [Number(threadId), mapping]),
   );
   const map = initialMappings;
+  // Commands keep a mutable in-memory index for fast routing. Keep it as a
+  // snapshot of PaneManager rather than incrementally patching it: lifecycle
+  // sync can remove one or more old topics before an async hook runs.
+  let paneManager!: PaneManager;
+  const refreshCommandMappings = (): void => {
+    if (!paneManager) return;
+    map.clear();
+    for (const [threadId, mapping] of paneManager.mappings()) {
+      map.set(threadId, mapping);
+    }
+  };
 
-  const paneManager = new PaneManager({
+  paneManager = new PaneManager({
     getAgents,
     loadState: () => loadState(statePath),
     saveState: (nextState) => {
@@ -142,13 +153,22 @@ export async function startDaemon(
     },
     intervalMs: 15_000,
     logger: log,
+    onStateChanged: refreshCommandMappings,
     hooks: {
       onPaneAdded: async (paneId) => {
         if (!isPaired(state) || !state.authorized_chat_id) return;
-        const panes = getAgents();
-        const pane = panes.find((p) => p.pane_id === paneId);
-        if (!pane) return;
+        if (paneManager.pendingDeletionsForPane(paneId).length > 0) {
+          paneManager.markFailedAdd(paneId);
+          return;
+        }
+        const generation = paneManager.paneAddGeneration(paneId);
         try {
+          const panes = getAgents();
+          const pane = panes.find((p) => p.pane_id === paneId);
+          if (!pane) {
+            paneManager.markFailedAdd(paneId);
+            return;
+          }
           const threadId = await tg.createForumTopic(state.authorized_chat_id, pane.label);
           // Guard against malformed responses — Telegram occasionally
           // returns an object with `ok:true` but a missing/zero thread id.
@@ -159,7 +179,17 @@ export async function startDaemon(
             paneManager.markFailedAdd(paneId);
             return;
           }
+          if (!paneManager.isPaneAddCurrent(paneId, generation)) {
+            // Telegram may complete a request after the pane has disappeared.
+            // Never bind an obsolete topic; remove it immediately instead.
+            await tg.deleteForumTopic(state.authorized_chat_id, threadId);
+            return;
+          }
           paneManager.restoreTopic(pane.tab_id, threadId, pane.label);
+          // restoreTopic is the lifecycle write which makes this topic
+          // routable. Refresh before seeding/awaitInflight so commands cannot
+          // observe state.json with a stale command-side map.
+          refreshCommandMappings();
           // restoreTopic persists the mapping. Confirm the pane stays in the
           // seen-set so the next sync() does not re-emit it. (Sync already
           // added it; this is defensive in case anything later evicts it.)
@@ -206,15 +236,32 @@ export async function startDaemon(
           // a retry path for transient Telegram errors.
           paneManager.markFailedAdd(paneId);
         }
+        // Also clear stale entries after failed/invalid adds. The manager's
+        // snapshot is authoritative even when no replacement was created.
+        refreshCommandMappings();
       },
-      onPaneRemoved: async (paneId) => {
+      onPaneRemoved: async (paneId, removedThreadIds) => {
         if (!isPaired(state) || !state.authorized_chat_id) return;
-        const threadId = findThreadIdForPane(state, paneId);
-        if (threadId === undefined) return;
+        if (!removedThreadIds?.length) return;
         try {
-          await tg.deleteForumTopic(state.authorized_chat_id, threadId);
-        } catch (err: any) {
-          log.warn("onPaneRemoved: failed to delete topic", { paneId, threadId, error: err?.message ?? String(err) });
+          for (const threadId of removedThreadIds) {
+            try {
+              const deleted = await paneManager.deleteTopicOnce(threadId, async () => {
+                await tg.deleteForumTopic(state.authorized_chat_id!, threadId);
+              });
+              if (deleted) paneManager.completeTopicDeletion(threadId);
+            } catch (err: any) {
+              if (/TOPIC_ID_INVALID|message thread.*not found|topic.*not found/i.test(String(err))) {
+                paneManager.completeTopicDeletion(threadId);
+                continue;
+              }
+              log.warn("onPaneRemoved: failed to delete topic", { paneId, threadId, error: err?.message ?? String(err) });
+            }
+          }
+        } finally {
+          // Deletion hooks can be async; only publish the post-hook snapshot
+          // after all topic deletions have settled.
+          refreshCommandMappings();
         }
       },
       onPaneRenamed: async (paneId, _oldLabel, newLabel) => {
@@ -225,6 +272,20 @@ export async function startDaemon(
           await tg.editForumTopic(state.authorized_chat_id, threadId, newLabel);
         } catch (err: any) {
           log.warn("onPaneRenamed: failed to edit topic", { paneId, threadId, error: err?.message ?? String(err) });
+        }
+      },
+      onPendingTopicDeletion: async (threadId, deletion) => {
+        try {
+          const deleted = await paneManager.deleteTopicOnce(threadId, async () => {
+            await tg.deleteForumTopic(deletion.chat_id, threadId);
+          });
+          if (deleted) paneManager.completeTopicDeletion(threadId);
+        } catch (err: any) {
+          if (/TOPIC_ID_INVALID|message thread.*not found|topic.*not found/i.test(String(err))) {
+            paneManager.completeTopicDeletion(threadId);
+          } else {
+            log.warn("pending topic deletion failed", { threadId, error: err?.message ?? String(err) });
+          }
         }
       },
     },
@@ -240,7 +301,13 @@ export async function startDaemon(
     const text = event.type === "working" ? event.text
       : event.type === "delta" ? event.text
       : event.reason === "aborted" ? `🛑 Stopped.\n\n${event.text}` : `✅ ${event.text}`;
-    void tg.sendMessage(state.authorized_chat_id, threadId, text).catch((err) => log.error("Pane event delivery failed", { paneId, message: String(err) }));
+    const hasFollow = getPaneAgent(paneId)?.isFollowing() ?? false;
+    // A deadline final may still report follow until the loop clears; this is
+    // an acceptable edge case.
+    const reply_markup = event.type === "final"
+      ? finalKeyboard(threadId, hasFollow)
+      : workingKeyboard(threadId, hasFollow);
+    void tg.sendMessage(state.authorized_chat_id, threadId, text, { reply_markup }).catch((err) => log.error("Pane event delivery failed", { paneId, message: String(err) }));
   };
 
   const deps: CommandDeps = {
@@ -341,32 +408,20 @@ export async function startDaemon(
         }
         // Reply before deleting topics (deleting the current topic would break ctx.reply)
         await ctx.reply(`Unpairing...`);
-        // Delete every bot-owned topic before resetting state. We must use
-        // the union of known_topics + thread_mappings keys: known_topics is
-        // a denormalised cache ("topics the bot has ever created in this
-        // chat") and its invariant with thread_mappings is not strictly
-        // enforced — a topic bound via /reconcile may live only in
-        // thread_mappings. Iterating known_topics alone would leave orphans.
-        const tids = new Set<number>();
-        for (const k of Object.keys(state.known_topics ?? {})) tids.add(Number(k));
-        for (const k of Object.keys(state.thread_mappings ?? {})) tids.add(Number(k));
-        let deleted = 0;
-        for (const tid of tids) {
-          try {
-            await ctx.api.deleteForumTopic(ctx.chat.id, tid);
-            deleted++;
-          } catch {
-            // skip — topic may already be gone
-          }
-        }
-        saveState(statePath, { authorized_chat_id: null, paired_at: null, thread_mappings: {}, known_topics: {}, known_tabs: {} });
+        // Stop future polls and drain hooks already started by the manager
+        // before taking the topic snapshot. An onPaneAdded hook may be
+        // suspended in createForumTopic; if we reset state first, it can
+        // resume afterwards and restore a mapping into the newly-unpaired
+        // state (and leave its topic orphaned).
+        paneManager.stop();
+        await paneManager.awaitInflight();
+        const { deleted } = await paneManager.unpair({
+          deleteTopic: async (chatId, threadId) => { await ctx.api.deleteForumTopic(chatId, threadId); },
+        });
         state = loadState(statePath);
-        state.known_topics = {};
-        state.known_tabs = {};
         deps.map.clear();
         deps.chatId = 0;
         deps.knownTopics = state.known_topics;
-        paneManager.stop();
         paneManager.markUnpaired();
         paneManagerStarted = false;
         await ctx.reply(`Unpaired. Deleted ${deleted} topic(s). Send /pair to re-authorize.`);
@@ -413,8 +468,7 @@ export async function startDaemon(
       // and read as zero even though topics were about to be created.
       // `awaitInflight()` resolves once every in-flight hook settles.
       await paneManager.awaitInflight();
-      deps.map.clear();
-      for (const [tid, m] of paneManager.mappings()) deps.map.set(tid, m);
+      refreshCommandMappings();
       await ctx.reply(`Reconciled: ${deps.map.size} panes mapped.`);
       maybeStartPaneManager();
       return;
@@ -434,8 +488,7 @@ export async function startDaemon(
         // the freshly created Telegram topics. See the `/pair` handler for
         // the same race-condition rationale.
         await paneManager.awaitInflight();
-        deps.map.clear();
-        for (const [tid, m] of paneManager.mappings()) deps.map.set(tid, m);
+        refreshCommandMappings();
         await ctx.reply(`Reconciled: ${deps.map.size} panes mapped.`);
       } catch (err: any) {
         log.error("reconcile failed", { chatId: ctx.chat.id, message: err?.message ?? String(err) });

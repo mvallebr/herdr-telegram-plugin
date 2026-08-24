@@ -22,15 +22,24 @@ import type { Update } from "grammy";
 import { startDaemon } from "../../src/daemon.js";
 import { resetHerdrBinCache } from "../../src/herdr-client.js";
 import { TelegramClient } from "../../src/telegram-client.js";
+import type { PaneManager } from "../../src/pane-manager.js";
 import { MockHerdr } from "./herdr-mock.js";
 
 const CHAT_ID = 8911510807;
 const PANE_ID = "w1:p1";
+const NEW_PANE_ID = "w1:p-new";
 const ORPHAN_THREAD_ID = 142;   // in thread_mappings but NOT in known_topics
+const SECOND_ORPHAN_THREAD_ID = 143; // same pane as ORPHAN_THREAD_ID
 const REGISTERED_THREAD_ID = 150; // in BOTH thread_mappings and known_topics
 
 interface DeleteCall { chatId: number; threadId: number }
 const deletes: DeleteCall[] = [];
+
+interface CreateGate {
+  started: Promise<void>;
+  signalStarted: () => void;
+  released: Promise<void>;
+}
 
 /** Patch sendMessage so we don't reach the network through that path. */
 function patchTelegramClientPrototype(): void {
@@ -45,7 +54,7 @@ function patchTelegramClientPrototype(): void {
 
 /** Custom fetch that records every deleteForumTopic call. Other Telegram
  *  methods return ok:true so the daemon doesn't crash. */
-function makeTelegramFetch(): typeof fetch {
+function makeTelegramFetch(createGate?: CreateGate): typeof fetch {
   return async function patchedFetch(
     url: string | URL | Request,
     init?: RequestInit,
@@ -77,6 +86,16 @@ function makeTelegramFetch(): typeof fetch {
     }
     if (method === "getForumTopics") {
       return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (method === "createForumTopic" && createGate) {
+      // Keep the onPaneAdded hook suspended after the Telegram request has
+      // started. The concurrent /unpair must wait at awaitInflight() before
+      // it snapshots or clears state.
+      createGate.signalStarted();
+      await createGate.released;
+    }
+    if (method === "createForumTopic") {
+      return new Response(JSON.stringify({ ok: true, result: { message_thread_id: 200001, name: String(payload.name ?? "topic") } }), { status: 200, headers: { "content-type": "application/json" } });
     }
     return new Response(JSON.stringify({ ok: true, result: true }), {
       status: 200,
@@ -113,11 +132,12 @@ interface TestRig {
   herdr: MockHerdr;
   configDir: string;
   stateDir: string;
+  paneManager: PaneManager;
   stop: () => Promise<void>;
   dispatch: (update: Update) => Promise<void>;
 }
 
-async function setupRig(): Promise<TestRig> {
+async function setupRig(createGate?: CreateGate): Promise<TestRig> {
   patchTelegramClientPrototype();
 
   const herdr = new MockHerdr();
@@ -128,10 +148,19 @@ async function setupRig(): Promise<TestRig> {
   herdr.setState({
     panes: {
       [PANE_ID]: { reads: ["baseline\n"], text_history: [], key_history: [] },
+      ...(createGate ? {
+        [NEW_PANE_ID]: { reads: ["baseline\n"], text_history: [], key_history: [] },
+      } : {}),
     },
-    agents: { [PANE_ID]: { status: "idle" } },
+    agents: {
+      [PANE_ID]: { status: "idle" },
+      ...(createGate ? { [NEW_PANE_ID]: { status: "idle" } } : {}),
+    },
     tabs: [
       { tab_id: "w1:t1", workspace_id: "w1", pane_id: PANE_ID, label: "Echo", agent: "pi" },
+      ...(createGate ? [
+        { tab_id: "w1:t-new", workspace_id: "w1", pane_id: NEW_PANE_ID, label: "New", agent: "pi" },
+      ] : []),
     ],
     read_counts: {},
     list_count: 0,
@@ -176,6 +205,12 @@ async function setupRig(): Promise<TestRig> {
           label: "Echo",
           agent: "pi",
           created_at: new Date().toISOString(),
+          },
+        [SECOND_ORPHAN_THREAD_ID]: {
+          pane_id: PANE_ID,
+          label: "Echo",
+          agent: "pi",
+          created_at: new Date().toISOString(),
         },
         [REGISTERED_THREAD_ID]: {
           pane_id: `${PANE_ID}:secondary`,
@@ -198,7 +233,7 @@ async function setupRig(): Promise<TestRig> {
     configDir,
     stateDir,
     skipTelegramStart: true,
-    customFetch: makeTelegramFetch(),
+    customFetch: makeTelegramFetch(createGate),
   });
   const tg = (daemon as unknown as { tg: TelegramClient }).tg;
   if (!tg) throw new Error("daemon.tg was not exposed (skipTelegramStart: true required)");
@@ -207,10 +242,14 @@ async function setupRig(): Promise<TestRig> {
   // Let grammy settle handlers.
   await new Promise((r) => setTimeout(r, 10));
 
+  const paneManager = (daemon as unknown as { paneManager: PaneManager }).paneManager;
+  if (!paneManager) throw new Error("daemon.paneManager was not exposed (skipTelegramStart: true required)");
+
   return {
     herdr,
     configDir,
     stateDir,
+    paneManager,
     stop: daemon.stop,
     async dispatch(update: Update) {
       await tg.bot.handleUpdate(update);
@@ -242,12 +281,95 @@ describe("E2E: /unpair deletes the union of known_topics + thread_mappings", () 
     const deletedThreadIds = deletes.map((d) => d.threadId);
     // The orphan thread id (only in thread_mappings, not in known_topics)
     // must have been deleted. This is the regression assertion.
-    expect(deletedThreadIds).toContain(ORPHAN_THREAD_ID);
-    // The thread id present in both must also be deleted.
-    expect(deletedThreadIds).toContain(REGISTERED_THREAD_ID);
+    const expectedSeededIds = deletedThreadIds.filter((threadId) => [
+      ORPHAN_THREAD_ID,
+      SECOND_ORPHAN_THREAD_ID,
+      REGISTERED_THREAD_ID,
+    ].includes(threadId));
+    expect(expectedSeededIds).toEqual([
+      REGISTERED_THREAD_ID,
+      ORPHAN_THREAD_ID,
+      SECOND_ORPHAN_THREAD_ID,
+    ]);
+    expect(expectedSeededIds).toHaveLength(3);
     // All delete calls must target the paired chat.
     for (const d of deletes) expect(d.chatId).toBe(CHAT_ID);
     // No duplicates — the union must deduplicate.
     expect(deletedThreadIds).toEqual([...new Set(deletedThreadIds)]);
+  });
+
+  it("deletes a pane topic after PaneManager has cleaned its mapping", async () => {
+    // Startup may remove the deliberately stale secondary mapping. Ignore
+    // that unrelated cleanup and exercise the pane that is still present.
+    deletes.length = 0;
+    // The test fetch intentionally does not create topics. Startup therefore
+    // evicts the pane from the seen set after its add hook sees the malformed
+    // create response. Re-seed that lifecycle state so the next poll models a
+    // pane disappearing from a previously observed, mapped session.
+    rig.paneManager.markAdded(PANE_ID);
+    rig.herdr.setState({
+      panes: {},
+      agents: {},
+      tabs: [],
+      read_counts: {},
+      list_count: 0,
+    });
+
+    rig.paneManager.poll();
+    await rig.paneManager.awaitInflight();
+
+    // sync() has already evicted ORPHAN_THREAD_ID from thread_mappings by
+    // the time onPaneRemoved runs; the hook must use the captured id instead.
+    const deletedThreadIds = deletes.map((call) => call.threadId);
+    const deletedPaneThreadIds = deletedThreadIds.filter((threadId) => [
+      ORPHAN_THREAD_ID,
+      SECOND_ORPHAN_THREAD_ID,
+    ].includes(threadId));
+    expect(deletedPaneThreadIds).toEqual([ORPHAN_THREAD_ID, SECOND_ORPHAN_THREAD_ID]);
+    expect(deletedPaneThreadIds).toHaveLength(2);
+  });
+});
+
+describe("E2E: /unpair drains pending pane hooks", () => {
+  let rig: TestRig;
+
+  afterEach(async () => {
+    await rig.stop();
+    rig.herdr.cleanup();
+    rmSync(rig.configDir, { recursive: true, force: true });
+    rmSync(rig.stateDir, { recursive: true, force: true });
+    delete process.env.HERDR_BIN_PATH;
+    delete process.env.MOCK_HERDR_STATE;
+    resetHerdrBinCache();
+  });
+
+  it("waits for onPaneAdded before snapshotting and resetting state", async () => {
+    deletes.length = 0;
+    let signalStarted!: () => void;
+    let release!: () => void;
+    const gate: CreateGate = {
+      started: new Promise<void>((resolve) => { signalStarted = resolve; }),
+      signalStarted: () => signalStarted(),
+      released: new Promise<void>((resolve) => { release = resolve; }),
+    };
+
+    rig = await setupRig(gate);
+    const unpair = rig.dispatch(buildUnpairUpdate(2));
+    await gate.started;
+
+    // The initial reply may be sent, but deletion/reset must still be
+    // blocked while createForumTopic (and therefore onPaneAdded) is in flight.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(deletes).toEqual([]);
+    expect(rig.paneManager.state().authorized_chat_id).toBe(CHAT_ID);
+
+    release();
+    await unpair;
+
+    // The topic created by the hook is included in the deletion snapshot and
+    // no mapping survives after markUnpaired.
+    expect(deletes.map((call) => call.threadId)).toContain(200001);
+    expect(rig.paneManager.mappings()).toEqual(new Map());
+    expect(rig.paneManager.state().authorized_chat_id).toBeNull();
   });
 });

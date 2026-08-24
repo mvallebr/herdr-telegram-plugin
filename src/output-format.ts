@@ -18,10 +18,14 @@ export function isNaturalLanguageLine(line: string): boolean {
 /** Strip context-mode banners and terminal chrome from scraped output. */
 export function cleanPaneOutput(content: string): string {
   let clean = content.replace(/<session_state[\s\S]*?<\/session_state>/g, "");
+  // Remove terminal control sequences before line filtering so useful text
+  // wrapped in colour/cursor escapes is retained without the escapes.
+  clean = clean.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
   // Terminal UIs (notably OpenCode) prefix otherwise useful prompt/output
   // lines with a vertical border. Remove that chrome before line filtering so
   // the submitted-prompt anchor remains available for extraction.
   clean = clean.replace(/^[\s┃│▏▕]+/gm, "");
+  clean = clean.replace(/[\s┃│▏▕]+$/gm, "");
   clean = clean.split("\n").filter((line) => !line.includes("context-mode active")).join("\n");
   return clean.split("\n").filter(isNaturalLanguageLine).join("\n").trim();
 }

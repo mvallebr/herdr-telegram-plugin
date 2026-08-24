@@ -263,6 +263,23 @@ describe("PaneAgent — enableFollow", () => {
   });
 });
 
+describe("PaneAgent — isFollowing", () => {
+  it("reports a follow only while the active loop has a deadline", () => {
+    const env = makeEnv({ snapshots: ["stable", "stable"] });
+
+    expect(env.agent.isFollowing()).toBe(false);
+
+    env.agent.handleMessage("message turn");
+    expect(env.agent.isFollowing()).toBe(false);
+
+    env.agent.enableFollow(env.clock.now() + 500);
+    expect(env.agent.isFollowing()).toBe(true);
+
+    env.agent.disableFollow();
+    expect(env.agent.isFollowing()).toBe(false);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 3. disableFollow — clears deadline, keeps loop
 // ---------------------------------------------------------------------------
