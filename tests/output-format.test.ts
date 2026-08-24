@@ -1,12 +1,42 @@
 import { describe, it, expect } from "vitest";
 import {
   cleanPaneOutput,
+  cleanPaneDelta,
   extractResponseSince,
   extractScreenResponse,
   extractScreenDelta,
 } from "../src/output-format.js";
 
 describe("cleanPaneOutput", () => {
+  it("keeps useful long and punctuation-heavy streamed deltas", () => {
+    const line = `${"A useful streamed answer ".repeat(20)}|~$%`;
+    expect(cleanPaneDelta(`${line}\n🛑 Stopped.`)).toBe(`${line}\n🛑 Stopped.`);
+  });
+
+  it("preserves long natural lines and shell-like prose in snapshots", () => {
+    const line = `A natural answer with symbols $ | ~ ${"and useful words ".repeat(30)}`.trimEnd();
+    expect(cleanPaneOutput(line)).toBe(line);
+  });
+
+  it("preserves natural CJK text even when a long line has few word boundaries", () => {
+    const line = "这是自然中文内容，用于验证快照清理不会误删正常文本。".repeat(20);
+    expect(cleanPaneOutput(line)).toBe(line);
+  });
+
+  it("still removes tool/thought chrome from streamed deltas", () => {
+    expect(cleanPaneDelta("<tool_call>secret</tool_call>\n<tool_result>secret</tool_result>\nvalid delta"))
+      .toBe("valid delta");
+  });
+  it("removes OpenCode tool-call envelopes while preserving the final answer", () => {
+    const input = `assistant to=functions.read
+parameter=filePath
+/home/mvallebr/git/herdr-telegram-plugin/src/daemon.ts
+<tool_call>{"name":"read","arguments":{"filePath":"src/daemon.ts"}}</tool_call>
+The pane is paired and ready for your next message.`;
+    const out = cleanPaneOutput(input);
+    expect(out).toBe("The pane is paired and ready for your next message.");
+    expect(out).not.toMatch(/functions\.read|parameter=|tool_call|daemon\.ts/);
+  });
   it("removes multiline context-mode banner block", () => {
     const input = `some agent output
 context-mode active. Hierarchy: ctx_batch_execute > ctx_execute

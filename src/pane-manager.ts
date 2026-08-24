@@ -66,12 +66,17 @@ export interface PaneManagerDeps {
   intervalMs?: number;
   scheduleRepeating?: (fn: () => void, intervalMs: number) => () => void;
   onStateChanged?: () => void;
+  /** Number of consecutive empty herdr snapshots required before pruning. */
+  emptySnapshotConfirmations?: number;
 }
 
 const scheduleRepeating = (fn: () => void, intervalMs: number): (() => void) => {
   const timer = setInterval(fn, intervalMs);
   return () => clearInterval(timer);
 };
+
+/** Keep duplicate-delete suppression bounded; thread ids are untrusted history. */
+const MAX_CONFIRMED_DELETIONS = 200;
 
 export class PaneManager {
   private readonly paneAgents = new Map<string, PaneAgent>();
@@ -104,11 +109,14 @@ export class PaneManager {
   /** Thread mappings evicted by the most recent sync, retained for removal hooks. */
   private readonly removedThreadIds = new Map<string, number[]>();
   private readonly paneGenerations = new Map<string, number>();
-  private readonly inFlightDeletions = new Set<number>();
+  private readonly inFlightDeletions = new Set<string | number>();
+  private readonly confirmedDeletions = new Set<string | number>();
+  private readonly paneLocks = new Map<string, Promise<void>>();
   private currentState: DaemonState;
   private stopRepeating?: () => void;
   private paneAgentsAvailable = true;
   private hasPolled = false;
+  private emptySnapshotStreak = 0;
 
   constructor(private readonly deps: PaneManagerDeps) {
     this.currentState = deps.loadState();
@@ -164,17 +172,26 @@ export class PaneManager {
     const pendingBeforeSync = new Set(Object.keys(this.currentState.pending_topic_deletions ?? {}));
     const result = this.sync();
     for (const threadId of pendingBeforeSync) {
-      const deletion = this.currentState.pending_topic_deletions?.[Number(threadId)];
+      // If this poll also discovered the mapping as removed, the removal
+      // hook owns the first deletion attempt. Avoid racing it with the
+      // durable-queue hook (a successful delete would otherwise be sent
+      // twice); a failed attempt leaves the queue for the next poll.
+      if ([...this.removedThreadIds.values()].some((ids) => ids.includes(this.pendingThreadId(threadId)))) continue;
+      const deletion = this.currentState.pending_topic_deletions?.[threadId];
       if (deletion) {
-        this.track(this.deps.hooks?.onPendingTopicDeletion?.(Number(threadId), deletion));
+        this.track(this.deps.hooks?.onPendingTopicDeletion?.(this.pendingThreadId(threadId), deletion));
       }
     }
     for (const paneId of result.added) {
-      this.track(this.deps.hooks?.onPaneAdded?.(paneId));
+      this.track(this.withPaneLock(paneId, () =>
+        // Keep the original one-argument hook contract; hooks can obtain the
+        // generation atomically through paneAddGeneration before awaiting.
+        this.deps.hooks?.onPaneAdded?.(paneId)));
     }
     for (const paneId of result.removed) {
       const threadIds = this.removedThreadIds.get(paneId);
-      this.track(this.deps.hooks?.onPaneRemoved?.(paneId, threadIds));
+      this.track(this.withPaneLock(paneId, () =>
+        this.deps.hooks?.onPaneRemoved?.(paneId, threadIds)));
     }
     for (const paneId of result.renamed) {
       const labels = this.renamedLabels.get(paneId);
@@ -189,6 +206,41 @@ export class PaneManager {
       }
     }
     return result;
+  }
+
+  /** Serialize add/remove work for one pane. A pane may disappear and be
+   * recreated while Telegram is still creating its old topic. */
+  private withPaneLock(paneId: string, work: () => Promise<unknown> | void): Promise<void> {
+    const previous = this.paneLocks.get(paneId);
+    let next: Promise<void>;
+    if (previous) {
+      next = previous.catch(() => undefined).then(() => work()).then(() => undefined);
+      this.paneLocks.set(paneId, next);
+      void next.then(() => {
+        if (this.paneLocks.get(paneId) === next) this.paneLocks.delete(paneId);
+      }, () => {
+        if (this.paneLocks.get(paneId) === next) this.paneLocks.delete(paneId);
+      });
+      return next;
+    } else {
+      try {
+        const result = work();
+        // Do not retain an already-completed synchronous hook as a lock. This
+        // keeps lifecycle callbacks observable synchronously while async add /
+        // remove work still forms a real queue.
+        if (!result || typeof (result as Promise<unknown>).then !== "function") return Promise.resolve();
+        next = Promise.resolve(result).then(() => undefined);
+      } catch (error) {
+        next = Promise.reject(error);
+      }
+    }
+    this.paneLocks.set(paneId, next);
+    void next.then(() => {
+      if (this.paneLocks.get(paneId) === next) this.paneLocks.delete(paneId);
+    }, () => {
+      if (this.paneLocks.get(paneId) === next) this.paneLocks.delete(paneId);
+    });
+    return next;
   }
 
   /**
@@ -248,14 +300,19 @@ export class PaneManager {
         mapping,
       ]),
     );
-    const pending = this.currentState.pending_topic_deletions ?? {};
     // An empty first snapshot is also what herdr exposes during a transient
     // restart/unavailability. Never turn that unconfirmed snapshot into data
     // loss; a later non-empty snapshot can adopt these mappings normally.
-    const preserveUnconfirmedEmpty = !this.hasPolled && panes.length === 0 && mappings.size > 0;
-    const preserveKnownTabsEmpty = !this.hasPolled && panes.length === 0 &&
+    const emptyConfirmations = this.deps.emptySnapshotConfirmations ?? 1;
+    if (panes.length === 0 && (mappings.size > 0 || Object.keys(knownTabs).length > 0)) {
+      this.emptySnapshotStreak += 1;
+    } else if (panes.length > 0) {
+      this.emptySnapshotStreak = 0;
+    }
+    const preserveUnconfirmedEmpty = panes.length === 0 &&
+      (!this.hasPolled || (emptyConfirmations > 1 && this.emptySnapshotStreak < emptyConfirmations)) &&
       (mappings.size > 0 || Object.keys(knownTabs).length > 0);
-    if (preserveUnconfirmedEmpty || preserveKnownTabsEmpty) {
+    if (preserveUnconfirmedEmpty) {
       for (const mapping of mappings.values()) this.seenPanes.add(mapping.pane_id);
       this.hasPolled = true;
       return { added: [], removed: [], renamed: [] };
@@ -325,11 +382,10 @@ export class PaneManager {
         const removedThreadIds = this.removedThreadIds.get(mapping.pane_id) ?? [];
         removedThreadIds.push(threadId);
         this.removedThreadIds.set(mapping.pane_id, removedThreadIds);
-        pending[threadId] ??= {
+        this.setPendingDeletion(threadId, {
           pane_id: mapping.pane_id,
           chat_id: this.currentState.authorized_chat_id ?? 0,
-        };
-        this.currentState.pending_topic_deletions = pending;
+        });
         mappings.delete(threadId);
       }
     }
@@ -398,31 +454,33 @@ export class PaneManager {
     for (const threadId of Object.keys(this.currentState.thread_mappings)) {
       threadIds.add(Number(threadId));
     }
-    for (const threadId of Object.keys(this.currentState.pending_topic_deletions ?? {})) {
-      threadIds.add(Number(threadId));
+    for (const [key, deletion] of Object.entries(this.currentState.pending_topic_deletions ?? {})) {
+      if (deletion.chat_id === chatId || chatId === null) {
+        threadIds.add(this.pendingThreadId(key));
+      }
     }
 
     let deleted = 0;
     if (chatId !== null) {
       for (const threadId of threadIds) {
         try {
-          const pending = this.currentState.pending_topic_deletions?.[threadId];
+          const pending = this.findPendingDeletion(threadId, chatId);
           if (!pending) {
             const mapping = this.currentState.thread_mappings[threadId];
             this.currentState.pending_topic_deletions ??= {};
-            this.currentState.pending_topic_deletions[threadId] = {
+            this.setPendingDeletion(threadId, {
               pane_id: mapping?.pane_id ?? "unknown",
               chat_id: chatId,
-            };
+            });
           }
           await args.deleteTopic(pending?.chat_id ?? chatId, threadId);
           deleted += 1;
-          this.removePendingDeletion(threadId);
+          this.removePendingDeletion(threadId, chatId);
         } catch (err) {
           // Telegram reports an already removed topic as an error. It is
           // nevertheless a successful end state for our durable queue.
           if (this.isMissingTopicError(err)) {
-            this.removePendingDeletion(threadId);
+            this.removePendingDeletion(threadId, chatId);
           } else {
             // The id was not previously in the durable queue (for example it
             // came only from known_topics). Persist the materialized entry so
@@ -445,9 +503,19 @@ export class PaneManager {
   }
 
   markUnpaired(): void {
+    // Capture cached agents before clearing them: their pane ids are part of
+    // the generation invalidation boundary for in-flight add hooks.
+    const invalidatedPanes = new Set([
+      ...this.paneGenerations.keys(),
+      ...this.seenPanes,
+      ...this.paneAgents.keys(),
+    ]);
     this.paneAgents.clear();
     this.paneAgentsAvailable = false;
     this.seenPanes.clear();
+    for (const paneId of invalidatedPanes) {
+      this.paneGenerations.set(paneId, (this.paneGenerations.get(paneId) ?? 0) + 1);
+    }
     this.currentState.authorized_chat_id = null;
     this.currentState.paired_at = null;
     this.currentState.thread_mappings = {};
@@ -475,6 +543,9 @@ export class PaneManager {
    * fresh pairing only pays the cost for panes that are actually used.
    */
   markPaired(chatId: number): void {
+    // The daemon persists paired_at before calling this method. Reloading is
+    // essential: saving the constructor snapshot here used to erase it.
+    this.currentState = this.deps.loadState();
     this.paneAgentsAvailable = true;
     this.currentState.authorized_chat_id = chatId;
     this.deps.saveState(this.currentState);
@@ -514,23 +585,54 @@ export class PaneManager {
     return this.paneGenerations.get(paneId) ?? 0;
   }
 
-  async deleteTopicOnce(threadId: number, deleteTopic: (threadId: number) => Promise<void>): Promise<boolean> {
-    if (this.inFlightDeletions.has(threadId)) return false;
-    this.inFlightDeletions.add(threadId);
-    try { await deleteTopic(threadId); return true; } finally { this.inFlightDeletions.delete(threadId); }
+  async deleteTopicOnce(threadId: number, deleteTopic: (threadId: number) => Promise<void>, chatId?: number): Promise<boolean> {
+    const key = chatId === undefined ? threadId : `${chatId}:${threadId}`;
+    if (this.confirmedDeletions.has(key)) return false;
+    if (this.inFlightDeletions.has(key)) return false;
+    this.inFlightDeletions.add(key);
+    try {
+      await deleteTopic(threadId);
+      this.rememberConfirmedDeletion(key);
+      return true;
+    } finally { this.inFlightDeletions.delete(key); }
   }
 
-  pendingDeletionsForPane(paneId: string): Array<[number, PendingTopicDeletion]> {
+  pendingDeletionsForPane(paneId: string, chatId?: number): Array<[number, PendingTopicDeletion]> {
     return Object.entries(this.currentState.pending_topic_deletions ?? {})
-      .filter(([, deletion]) => deletion.pane_id === paneId)
-      .map(([threadId, deletion]) => [Number(threadId), deletion]);
+      .filter(([, deletion]) => deletion.pane_id === paneId && (chatId === undefined || deletion.chat_id === chatId))
+      .map(([threadId, deletion]) => [this.pendingThreadId(threadId), deletion]);
   }
 
-  completeTopicDeletion(threadId: number): void {
+  private pendingKey(threadId: number, chatId: number): string | number {
+    const queue = this.currentState.pending_topic_deletions ?? {};
+    const legacy = queue[threadId];
+    if (!legacy || legacy.chat_id === chatId) return threadId;
+    return `${chatId}:${threadId}`;
+  }
+  private pendingThreadId(key: string): number {
+    const match = key.match(/:(\d+)$/);
+    return match ? Number(match[1]) : Number(key);
+  }
+  private findPendingDeletion(threadId: number, chatId: number): PendingTopicDeletion | undefined {
+    const queue = this.currentState.pending_topic_deletions ?? {};
+    return queue[`${chatId}:${threadId}`] ?? (queue[threadId]?.chat_id === chatId ? queue[threadId] : undefined);
+  }
+  private setPendingDeletion(threadId: number, deletion: PendingTopicDeletion): void {
+    this.currentState.pending_topic_deletions ??= {};
+    this.currentState.pending_topic_deletions[this.pendingKey(threadId, deletion.chat_id)] = deletion;
+  }
+
+  completeTopicDeletion(threadId: number, chatId?: number): void {
     const latest = this.deps.loadState();
-    if (!latest.pending_topic_deletions?.[threadId]) return;
-    delete latest.pending_topic_deletions[threadId];
-    if (Object.keys(latest.pending_topic_deletions).length === 0) {
+    const queue = latest.pending_topic_deletions;
+    if (!queue) return;
+    const keys = Object.keys(queue).filter((candidate) =>
+      this.pendingThreadId(candidate) === threadId &&
+      (chatId === undefined || queue[candidate].chat_id === chatId));
+    if (keys.length === 0) return;
+    for (const key of keys) delete queue[key];
+    for (const key of keys) this.rememberConfirmedDeletion(chatId === undefined ? threadId : `${chatId}:${threadId}`);
+    if (Object.keys(queue).length === 0) {
       delete latest.pending_topic_deletions;
     }
     this.currentState = latest;
@@ -538,11 +640,37 @@ export class PaneManager {
     this.deps.onStateChanged?.();
   }
 
-  private removePendingDeletion(threadId: number): void {
-    delete this.currentState.pending_topic_deletions?.[threadId];
+  /** Persist an orphaned topic for retry even when the bridge is unpaired. */
+  queueTopicDeletion(threadId: number, paneId: string, chatId: number): void {
+    const latest = this.deps.loadState();
+    this.currentState = latest;
+    this.confirmedDeletions.delete(`${chatId}:${threadId}`);
+    this.setPendingDeletion(threadId, { pane_id: paneId, chat_id: chatId });
+    this.deps.saveState(this.currentState);
+    this.deps.onStateChanged?.();
+  }
+
+  private removePendingDeletion(threadId: number, chatId?: number): void {
+    const queue = this.currentState.pending_topic_deletions;
+    if (!queue) return;
+    for (const key of Object.keys(queue)) {
+      if (this.pendingThreadId(key) === threadId && (chatId === undefined || queue[key].chat_id === chatId)) {
+        delete queue[key];
+        this.rememberConfirmedDeletion(chatId === undefined ? threadId : `${chatId}:${threadId}`);
+      }
+    }
     if (this.currentState.pending_topic_deletions &&
       Object.keys(this.currentState.pending_topic_deletions).length === 0) {
       delete this.currentState.pending_topic_deletions;
+    }
+  }
+
+  private rememberConfirmedDeletion(key: string | number): void {
+    this.confirmedDeletions.add(key);
+    while (this.confirmedDeletions.size > MAX_CONFIRMED_DELETIONS) {
+      const oldest = this.confirmedDeletions.values().next().value as string | number | undefined;
+      if (oldest === undefined) break;
+      this.confirmedDeletions.delete(oldest);
     }
   }
 
@@ -567,6 +695,23 @@ export class PaneManager {
       agent: pane?.agent ?? "unknown",
       created_at: new Date().toISOString(),
     };
+    latest.thread_mappings ??= {};
+    // Work exclusively on the freshly loaded state. `setPendingDeletion`
+    // writes through currentState, and writing it before assigning `latest`
+    // loses the queue when loadState returns a new object (as production does).
+    this.currentState = latest;
+    // A duplicate mapping is never valid: remove older bindings for this pane
+    // before installing the replacement. Keep their Telegram topics durable
+    // until deletion is confirmed; otherwise dedup silently leaks them.
+    for (const [id, existing] of Object.entries(latest.thread_mappings)) {
+      if (existing.pane_id === mapping.pane_id && Number(id) !== threadId) {
+        this.setPendingDeletion(Number(id), {
+          pane_id: existing.pane_id,
+          chat_id: latest.authorized_chat_id ?? 0,
+        });
+        delete latest.thread_mappings[Number(id)];
+      }
+    }
     latest.thread_mappings[threadId] = mapping;
     this.currentState = latest;
     this.deps.saveState(latest);

@@ -5,7 +5,7 @@ import { PaneAgent } from "./pane-agent.js";
 import type { OutputEvent } from "./turn/observe-loop-controller.js";
 import { getAgents, readPane, getAgentInfo, sendEscape } from "./herdr-client.js";
 import { createAgentCommunicator } from "./agent-sessions.js";
-import { cleanPaneOutput, stripStatusBar } from "./output-format.js";
+import { cleanPaneDelta, cleanPaneOutput, stripStatusBar } from "./output-format.js";
 import { loadConfig } from "./config.js";
 import { loadState, saveState, rememberUpdateId } from "./state.js";
 import { createLogger, type Logger } from "./logger.js";
@@ -152,16 +152,20 @@ export async function startDaemon(
       });
     },
     intervalMs: 15_000,
+    // herdr can transiently return [] while it restarts. Require a second
+    // empty snapshot before lifecycle pruning can remove valid mappings.
+    emptySnapshotConfirmations: 2,
     logger: log,
     onStateChanged: refreshCommandMappings,
     hooks: {
-      onPaneAdded: async (paneId) => {
+      onPaneAdded: async (paneId, generation = paneManager.paneAddGeneration(paneId)) => {
         if (!isPaired(state) || !state.authorized_chat_id) return;
-        if (paneManager.pendingDeletionsForPane(paneId).length > 0) {
+        if (paneManager.pendingDeletionsForPane(paneId, state.authorized_chat_id).length > 0) {
           paneManager.markFailedAdd(paneId);
           return;
         }
-        const generation = paneManager.paneAddGeneration(paneId);
+        const chatId = state.authorized_chat_id;
+        let createdThreadId: number | undefined;
         try {
           const panes = getAgents();
           const pane = panes.find((p) => p.pane_id === paneId);
@@ -169,7 +173,8 @@ export async function startDaemon(
             paneManager.markFailedAdd(paneId);
             return;
           }
-          const threadId = await tg.createForumTopic(state.authorized_chat_id, pane.label);
+          const threadId = await tg.createForumTopic(chatId, pane.label);
+          createdThreadId = threadId;
           // Guard against malformed responses — Telegram occasionally
           // returns an object with `ok:true` but a missing/zero thread id.
           // Treat that as a hard failure: we must NOT call restoreTopic with
@@ -182,10 +187,18 @@ export async function startDaemon(
           if (!paneManager.isPaneAddCurrent(paneId, generation)) {
             // Telegram may complete a request after the pane has disappeared.
             // Never bind an obsolete topic; remove it immediately instead.
-            await tg.deleteForumTopic(state.authorized_chat_id, threadId);
+            try { await tg.deleteForumTopic(chatId, threadId); }
+            catch { paneManager.queueTopicDeletion(threadId, paneId, chatId); }
             return;
           }
           paneManager.restoreTopic(pane.tab_id, threadId, pane.label);
+          const persisted = paneManager.mappings().get(threadId);
+          if (!persisted || persisted.pane_id !== paneId || !paneManager.isPaneAddCurrent(paneId, generation)) {
+            try { await tg.deleteForumTopic(chatId, threadId); }
+            catch { paneManager.queueTopicDeletion(threadId, paneId, chatId); }
+            paneManager.markFailedAdd(paneId);
+            return;
+          }
           // restoreTopic is the lifecycle write which makes this topic
           // routable. Refresh before seeding/awaitInflight so commands cannot
           // observe state.json with a stale command-side map.
@@ -221,12 +234,16 @@ export async function startDaemon(
               .join("\n")
               .trim();
             if (trimmed) {
-              await tg.sendMessage(state.authorized_chat_id, threadId, `📝 Last output:\n\n${trimmed}`);
+               await tg.sendMessage(chatId, threadId, `📝 Last output:\n\n${trimmed}`);
             }
           } catch {
             // best-effort seeding
           }
         } catch (err: any) {
+          if (createdThreadId !== undefined) {
+            try { await tg.deleteForumTopic(chatId, createdThreadId); }
+            catch { paneManager.queueTopicDeletion(createdThreadId, paneId, chatId); }
+          }
           log.warn("onPaneAdded: failed to create topic", { paneId, error: err?.message ?? String(err) });
           // The pane was already added to the seen-set by sync() before the
           // hook ran. Without this call the pane would be permanently stuck:
@@ -248,11 +265,11 @@ export async function startDaemon(
             try {
               const deleted = await paneManager.deleteTopicOnce(threadId, async () => {
                 await tg.deleteForumTopic(state.authorized_chat_id!, threadId);
-              });
-              if (deleted) paneManager.completeTopicDeletion(threadId);
+              }, state.authorized_chat_id ?? undefined);
+              if (deleted) paneManager.completeTopicDeletion(threadId, state.authorized_chat_id ?? undefined);
             } catch (err: any) {
               if (/TOPIC_ID_INVALID|message thread.*not found|topic.*not found/i.test(String(err))) {
-                paneManager.completeTopicDeletion(threadId);
+                paneManager.completeTopicDeletion(threadId, state.authorized_chat_id ?? undefined);
                 continue;
               }
               log.warn("onPaneRemoved: failed to delete topic", { paneId, threadId, error: err?.message ?? String(err) });
@@ -278,11 +295,11 @@ export async function startDaemon(
         try {
           const deleted = await paneManager.deleteTopicOnce(threadId, async () => {
             await tg.deleteForumTopic(deletion.chat_id, threadId);
-          });
-          if (deleted) paneManager.completeTopicDeletion(threadId);
+          }, deletion.chat_id);
+           if (deleted) paneManager.completeTopicDeletion(threadId, deletion.chat_id);
         } catch (err: any) {
           if (/TOPIC_ID_INVALID|message thread.*not found|topic.*not found/i.test(String(err))) {
-            paneManager.completeTopicDeletion(threadId);
+             paneManager.completeTopicDeletion(threadId, deletion.chat_id);
           } else {
             log.warn("pending topic deletion failed", { threadId, error: err?.message ?? String(err) });
           }
@@ -298,9 +315,16 @@ export async function startDaemon(
     if (!isPaired(state) || !state.authorized_chat_id) return;
     const threadId = findThreadIdForPane(state, paneId);
     if (threadId === undefined) return;
-    const text = event.type === "working" ? event.text
-      : event.type === "delta" ? event.text
-      : event.reason === "aborted" ? `🛑 Stopped.\n\n${event.text}` : `✅ ${event.text}`;
+      const safeText = event.type === "delta" ? cleanPaneDelta(event.text) : cleanPaneOutput(event.text);
+    // A terminal event is meaningful even when filtering removed all pane
+    // output (for example an aborted turn with no assistant text). Do not
+    // silently drop the lifecycle status.
+    if (!safeText.trim() && event.type !== "final") return;
+    const text = event.type === "working" ? safeText
+      : event.type === "delta" ? safeText
+      : event.reason === "aborted"
+        ? safeText.trim() ? `🛑 Stopped.\n\n${safeText}` : "🛑 Stopped."
+        : safeText.trim() ? `✅ ${safeText}` : "✅";
     const hasFollow = getPaneAgent(paneId)?.isFollowing() ?? false;
     // A deadline final may still report follow until the loop clears; this is
     // an acceptable edge case.

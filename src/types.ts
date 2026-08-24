@@ -35,7 +35,11 @@ export interface DaemonState {
    *  Used by the watcher to detect new/closed/renamed tabs. */
   known_tabs?: Record<string, { label: string; thread_id: number }>;
   /** Bot-owned topics whose deletion has not yet been confirmed by Telegram. */
-  pending_topic_deletions?: Record<number, PendingTopicDeletion>;
+  /**
+   * Pending deletes.  Numeric keys are retained for backwards compatibility
+   * with state written before chat isolation; new keys are `${chatId}:${id}`.
+   */
+  pending_topic_deletions?: Record<string | number, PendingTopicDeletion>;
   /** Recently handled Telegram update ids, retained to prevent replay after restart. */
   processed_update_ids?: number[];
 }
