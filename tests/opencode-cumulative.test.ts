@@ -286,6 +286,23 @@ describe("readOpenCodeCumulative — type filtering", () => {
     expect(out).toContain("final visible answer");
   });
 
+  it("excludes OpenCode commentary text and keeps final-answer text", () => {
+    fixture = makeOpenCodeDb({
+      messages: [
+        {
+          role: "assistant",
+          parts: [
+            { type: "text", text: "internal tool narration", metadata: { openai: { phase: "commentary" } } },
+            { type: "text", text: "clean final answer", metadata: { openai: { phase: "final_answer" } } },
+          ],
+        },
+      ],
+    });
+    const out = readOpenCodeCumulative(fixture.dbPath, fixture.sessionId, driver);
+    expect(out).toBe("clean final answer");
+    expect(out).not.toContain("internal tool narration");
+  });
+
   it("includes 💭 reasoning summary when includeThoughts=true", () => {
     fixture = makeOpenCodeDb({
       messages: [

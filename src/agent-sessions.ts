@@ -502,6 +502,11 @@ export function readOpenCodeCumulative(
       catch { data = null; }
       const type = typeof data?.type === "string" ? data.type : "";
       if (type === "text") {
+        // OpenCode stores both user-visible final answers and the assistant's
+        // internal commentary as text parts. Provider metadata is the only
+        // reliable distinction in the native session database.
+        const phase = data?.metadata?.openai?.phase;
+        if (typeof phase === "string" && phase !== "final_answer") continue;
         const text = typeof data?.text === "string" ? data.text : "";
         if (text) lines.push(text);
         continue;
