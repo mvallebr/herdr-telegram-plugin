@@ -4,6 +4,9 @@
   "private": false,
   "description": "Telegram bot companion for herdr — remote control agents via forum topics",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "type": "module",
   "scripts": {
     "build": "tsc",

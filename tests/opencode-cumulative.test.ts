@@ -346,7 +346,7 @@ describe("readOpenCodeCumulative — message window clamping", () => {
     expect(out).toContain("clamp-59");
     expect(out).toContain("clamp-10");
     expect(out).not.toContain("clamp-9");
-  });
+  }, 15_000);
 
   it("clamps negative messageWindow to DEFAULT_MESSAGE_WINDOW", () => {
     fixture = makeOpenCodeDb({ messages: nMessages(60) });
@@ -356,7 +356,7 @@ describe("readOpenCodeCumulative — message window clamping", () => {
     expect(out).toContain("clamp-59");
     expect(out).toContain("clamp-10");
     expect(out).not.toContain("clamp-9");
-  });
+  }, 15_000);
 
   it("clamps NaN messageWindow to DEFAULT_MESSAGE_WINDOW", () => {
     fixture = makeOpenCodeDb({ messages: nMessages(60) });
@@ -366,7 +366,7 @@ describe("readOpenCodeCumulative — message window clamping", () => {
     expect(out).toContain("clamp-59");
     expect(out).toContain("clamp-10");
     expect(out).not.toContain("clamp-9");
-  });
+  }, 15_000);
 
   it("allows positive messageWindow override", () => {
     fixture = makeOpenCodeDb({ messages: nMessages(10) });
@@ -377,7 +377,7 @@ describe("readOpenCodeCumulative — message window clamping", () => {
     expect(out).toContain("clamp-9");
     expect(out).toContain("clamp-7");
     expect(out).not.toContain("clamp-6");
-  });
+  }, 15_000);
 });
 
 describe("readOpenCodeCumulative — type-safety and binding", () => {

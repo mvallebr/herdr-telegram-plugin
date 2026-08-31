@@ -6,6 +6,52 @@ Control your [herdr](https://herdr.dev) agents from Telegram via forum topics â€
 
 Each herdr agent pane maps 1:1 to a Telegram forum topic. Messages in a topic are forwarded to the pane as keyboard input. Agent output is sent back to Telegram.
 
+## Prerequisites
+
+- Herdr `>= 0.7.0`;
+- Node.js `>= 22.5.0` and npm from the same Node installation;
+- A Telegram bot token and a Telegram chat where the bot can operate.
+
+Node 22.5.0 or newer is required because the OpenCode structured-output reader
+uses the built-in `node:sqlite` module. Without it, the bridge falls back to
+screen scraping instead of reading OpenCode's session database.
+
+Verify the runtime before installing or starting the bridge:
+
+```bash
+node --version
+node -e "require('node:sqlite'); console.log('node:sqlite: ok')"
+```
+
+Both commands must use Node 22.5.0 or newer. The second command must print
+`node:sqlite: ok`.
+
+### Important: Herdr's Node runtime
+
+The plugin actions in `herdr-plugin.toml` invoke `node` by name. Herdr runs as
+a long-lived process and resolves that command using its own `PATH`; it does
+not necessarily inherit the Node selected by an interactive shell or `nvm`.
+If Herdr was started without your NVM environment, it may find an older
+`/usr/bin/node` even when `node --version` in your terminal reports Node 22.
+
+Make Node 22.5.0+ available in the environment that starts Herdr, or start the
+daemon manually with the verified binary:
+
+```bash
+NODE_BIN="$(command -v node)"
+"$NODE_BIN" --version
+"$NODE_BIN" -e "require('node:sqlite'); console.log('node:sqlite: ok')"
+"$NODE_BIN" dist/index.js --daemon
+```
+
+To verify an already-running daemon, inspect the executable used by its PID:
+
+```bash
+PID="$(tr -d '[:space:]' < ~/.local/state/herdr-telegram/daemon.pid)"
+readlink "/proc/$PID/exe"
+"$(readlink "/proc/$PID/exe")" --version
+```
+
 ## Quick install
 
 ### Option A: install from GitHub via the herdr CLI (recommended)
@@ -41,7 +87,8 @@ From the herdr-managed install (`~/.config/herdr/plugins/github/herdr-telegram-p
 
 ```bash
 cd ~/.config/herdr/plugins/github/herdr-telegram-plugin-*
-node dist/index.js --daemon
+NODE_BIN="$(command -v node)"
+"$NODE_BIN" dist/index.js --daemon
 ```
 
 Or, equivalently, the daemon auto-launches when needed by Telegram activity
