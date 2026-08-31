@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { removePidFileIfOwned } from "./daemon-pid.js";
+import { assertRuntimeRequirements } from "./runtime.js";
 
 // Always chdir to the script's own directory so paths like `./dist/` resolve
 // correctly even when invoked from a different cwd (e.g. via `herdr plugin`).
@@ -79,6 +80,12 @@ if (args.includes("--daemon")) {
 }
 
 async function runDaemon(): Promise<void> {
+  try {
+    assertRuntimeRequirements();
+  } catch (err: any) {
+    process.stderr.write(`Daemon failed to start: ${err.message}\n`);
+    process.exit(1);
+  }
   // Refuse to double-start
   const pidFile = join(stateDir, "daemon.pid");
   if (existsSync(pidFile)) {

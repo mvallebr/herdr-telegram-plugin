@@ -51,3 +51,51 @@ describe("TelegramClient polling lifecycle", () => {
     expect(client.getPollingStatus().state).toBe("stopped");
   });
 });
+
+describe("TelegramClient message delivery", () => {
+  it("retries transient send failures with exponential backoff", async () => {
+    const delays: number[] = [];
+    let now = 0;
+    let calls = 0;
+    const client = new TelegramClient("test", undefined, {
+      api: {
+        sendMessage: async () => {
+          calls += 1;
+          if (calls < 3) throw new Error("network unavailable");
+          return { message_id: 42 };
+        },
+      },
+    } as any, undefined, {
+      now: () => now,
+      sleep: async (ms) => { delays.push(ms); now += ms; },
+    });
+
+    await expect(client.sendMessage(1, 2, "hello")).resolves.toBe(42);
+    expect(delays).toEqual([1_000, 2_000]);
+  });
+
+  it("stops retrying after ten minutes", async () => {
+    const delays: number[] = [];
+    let now = 0;
+    const client = new TelegramClient("test", undefined, {
+      api: { sendMessage: async () => { throw new Error("network unavailable"); } },
+    } as any, undefined, {
+      now: () => now,
+      sleep: async (ms) => { delays.push(ms); now += ms; },
+    });
+
+    await expect(client.sendMessage(1, 2, "hello")).rejects.toThrow("network unavailable");
+    expect(delays.reduce((sum, delay) => sum + delay, 0)).toBe(10 * 60_000);
+    expect(delays.at(-1)).toBe(89_000);
+  });
+
+  it("does not retry permanent Telegram errors", async () => {
+    let calls = 0;
+    const client = new TelegramClient("test", undefined, {
+      api: { sendMessage: async () => { calls += 1; throw { error_code: 400, message: "Bad Request" }; } },
+    } as any);
+
+    await expect(client.sendMessage(1, 2, "hello")).rejects.toMatchObject({ error_code: 400 });
+    expect(calls).toBe(1);
+  });
+});

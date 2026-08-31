@@ -13,6 +13,12 @@ export interface PollingStatus {
 type PollingObserver = (status: PollingStatus) => void;
 
 const RETRYABLE_HTTP_CODES = new Set([409, 429, 500, 502, 503, 504]);
+const SEND_RETRY_WINDOW_MS = 10 * 60_000;
+
+export interface TelegramClientOptions {
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
 
 function errorCode(err: unknown): number | undefined {
   const e = err as { error_code?: unknown; error?: { error_code?: unknown } };
@@ -63,6 +69,7 @@ export class TelegramClient {
     /** Custom fetch implementation. Test rigs pass a mocked fetch to keep
      *  grammy from hitting the real Telegram network. */
     customFetch?: typeof fetch,
+    private readonly retryOptions: TelegramClientOptions = {},
   ) {
     this.bot = bot ?? (customFetch
       ? new Bot(token, { client: { fetch: customFetch as never } })
@@ -165,12 +172,27 @@ export class TelegramClient {
     text: string,
     opts?: { disable_notification?: boolean; reply_markup?: unknown }
   ): Promise<number> {
-    const msg = await this.bot.api.sendMessage(chatId, text, {
-      message_thread_id: threadId,
-      disable_notification: opts?.disable_notification ?? false,
-      reply_markup: opts?.reply_markup as any,
-    });
-    return msg.message_id;
+    const now = this.retryOptions.now ?? Date.now;
+    const sleep = this.retryOptions.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const startedAt = now();
+    let attempt = 0;
+    while (true) {
+      try {
+        const msg = await this.bot.api.sendMessage(chatId, text, {
+          message_thread_id: threadId,
+          disable_notification: opts?.disable_notification ?? false,
+          reply_markup: opts?.reply_markup as any,
+        });
+        return msg.message_id;
+      } catch (err) {
+        const elapsed = now() - startedAt;
+        if (!isRetryable(err) || elapsed >= SEND_RETRY_WINDOW_MS) throw err;
+        const remaining = SEND_RETRY_WINDOW_MS - elapsed;
+        const delay = Math.min(remaining, 1_000 * 2 ** Math.min(attempt, 9));
+        attempt += 1;
+        await sleep(delay);
+      }
+    }
   }
 
   async validatePermissions(chatId: number): Promise<string[]> {

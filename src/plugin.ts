@@ -4,6 +4,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveBridgeNode, runtimeRequirement } from "./node-runtime.js";
 import { homedir } from "node:os";
 
 const stateDir = join(
@@ -25,10 +26,15 @@ function isRunning(): boolean {
 }
 
 if (!isRunning()) {
-  // Spawn daemon
-  spawn(
-    process.execPath,
-    [join(process.env.HERDR_PLUGIN_ROOT ?? __dirname, "dist", "index.js"), "--daemon"],
-    { detached: true, stdio: "ignore" }
-  ).unref();
+  const node = resolveBridgeNode();
+  if (!node) {
+    process.stderr.write(`Cannot start Telegram Bridge: ${runtimeRequirement} is required. Set HERDR_NODE_BIN to a compatible executable.\n`);
+    process.exitCode = 1;
+  } else {
+    spawn(
+      node,
+      [join(process.env.HERDR_PLUGIN_ROOT ?? __dirname, "dist", "index.js"), "--daemon"],
+      { detached: true, stdio: "ignore" }
+    ).unref();
+  }
 }
